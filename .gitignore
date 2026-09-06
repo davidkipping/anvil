@@ -1,0 +1,17 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# docs build
+docs/_build/
+
+# run outputs
+*_chain.npy
+*_log_prob.npy
