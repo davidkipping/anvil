@@ -112,16 +112,35 @@ class ChunkedGaussianLogLike:
 
         return chunked_sum(term_fn, self.n_data, self.policy)
 
+    #: chain-block size for the float64 path; bounds peak memory, since the
+    #: fp64 CPU graph can hold dozens of (block, chunk)-sized intermediates
+    hi_chain_block: int = 64
+
     def hi(self, v: mx.array) -> mx.array:
-        """Full-float64 CPU-stream evaluation of the same likelihood."""
+        """Full-float64 CPU-stream evaluation of the same likelihood.
+
+        Processed in (chain-block x data-chunk) tiles with an eval per
+        tile: an expensive model's fp64 graph over all chains x all data
+        at once can transiently allocate tens of GB.
+        """
+        n_chains = v.shape[0]
+        c = self.policy.chunk_size
+        out = np.zeros(n_chains, dtype=np.float64)
         with mx.stream(mx.cpu):
             v64 = v.astype(mx.float64)
-            x = mx.array(self._x64)
-            y = mx.array(self._y64)
-            w = mx.array(1.0 / self._yerr64)
-            m = self.model_fn(v64, x)
-            r = (y - m) * w
-            return -0.5 * mx.sum(r * r, axis=-1)
+            for cb in range(0, n_chains, self.hi_chain_block):
+                vb = v64[cb : cb + self.hi_chain_block]
+                acc = mx.zeros(vb.shape[:1], dtype=mx.float64)
+                for s in range(0, self.n_data, c):
+                    e = min(s + c, self.n_data)
+                    x = mx.array(self._x64[..., s:e])
+                    y = mx.array(self._y64[s:e])
+                    w = mx.array(1.0 / self._yerr64[s:e])
+                    r = (y - self.model_fn(vb, x)) * w
+                    acc = acc - 0.5 * mx.sum(r * r, axis=-1)
+                    mx.eval(acc)  # free this tile's graph before the next
+                out[cb : cb + vb.shape[0]] = np.array(acc)
+            return mx.array(out)
 
 
 @dataclass
