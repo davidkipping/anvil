@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7", "emcee>=3.1"]
+docs = ["sphinx>=7", "furo", "myst-parser", "numpy"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["anvil"]

@@ -110,7 +110,8 @@ class Transform:
         return out
 
     def log_det_jac(self, u: mx.array) -> mx.array:
-        """(n, dim) -> (n,) log |d(model)/du| summed over dimensions."""
+        """(n, dim) -> (n,) log-abs-determinant of d(model)/du, summed
+        over dimensions."""
         sig = mx.sigmoid(u)
         # d/du [lo + w*sigmoid(u)] = w * sig * (1 - sig)
         lj_bounded = mx.log(self._width32) + mx.log(sig) + mx.log1p(-sig)
