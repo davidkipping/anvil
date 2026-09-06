@@ -7,6 +7,7 @@ acceptance bookkeeping. One loop serves every kernel.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,7 +51,7 @@ def run(
     seed: int = 0,
     storage: MemoryBackend | None = None,
     compile_step: bool = True,
-    progress: bool = False,
+    progress: bool | int = False,
     reanchor_every: int = 0,
     archive=None,
 ) -> Results:
@@ -65,7 +66,12 @@ def run(
 
     ``archive`` (a :class:`~anvil.surrogate.TrainingArchive`) records
     every stored (u, log_prob) frame as future emulator training data —
-    this happens on already-evaluated host copies, off the hot path."""
+    this happens on already-evaluated host copies, off the hot path.
+
+    ``progress``: False for silence; True for ticks every 10% of each
+    phase; an int N for a tick every N iterations. Ticks are flushed
+    (safe to ``tail -f`` through a redirected log) and report rate, ETA,
+    mean acceptance, and the running divergence count."""
     u0 = u0.astype(mx.float32) if u0.dtype != mx.float32 else u0
     n_chains, dim = u0.shape
     keys = KeyStream(seed)
@@ -88,7 +94,18 @@ def run(
         lp = target.log_prob_hi(st["u"]).astype(mx.float32, stream=mx.cpu)
         return {**st, "log_prob": lp}
 
+    def _tick_every(n_total):
+        if progress is True:
+            return max(1, n_total // 10)
+        return max(1, int(progress))
+
+    def _fmt_eta(seconds):
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:d}:{m:02d}:{s:02d}"
+
     # -- warmup: adapt every iteration ------------------------------------
+    t_phase = time.perf_counter()
     for t in range(n_warmup):
         state, info = step(keys.key(t), state, params)
         adapt_state = kernel.adapt(adapt_state, state, info, t + 1)
@@ -96,8 +113,13 @@ def run(
         if reanchor_every and (t + 1) % reanchor_every == 0:
             state = reanchor(state)
         mx.eval(*state.values(), *params.values())
-        if progress and (t + 1) % max(1, n_warmup // 10) == 0:
-            print(f"warmup {t + 1}/{n_warmup}")
+        if progress and (t + 1) % _tick_every(n_warmup) == 0:
+            el = time.perf_counter() - t_phase
+            rate = (t + 1) / el
+            acc = float(np.array(info["accept_prob"]).mean())
+            print(f"[warmup] {t + 1}/{n_warmup} | {rate:.2f} it/s | "
+                  f"accept {acc:.2f} | elapsed {_fmt_eta(el)} | "
+                  f"eta {_fmt_eta((n_warmup - t - 1) / rate)}", flush=True)
 
     params = kernel.make_params(adapt_state, warmup=False)
     mx.eval(*params.values())
@@ -109,6 +131,7 @@ def run(
     accept_sum = mx.zeros((n_chains,))
     divergent_sum = mx.zeros((n_chains,))
     total_iters = n_samples * thin
+    t_phase = time.perf_counter()
     for t in range(total_iters):
         state, info = step(keys.key(n_warmup + t), state, params)
         accept_sum = accept_sum + info["accept_prob"]
@@ -124,8 +147,15 @@ def run(
             storage.append(u_np, lp_np)
             if archive is not None:
                 archive.record(u_np, lp_np)
-        if progress and (t + 1) % max(1, total_iters // 10) == 0:
-            print(f"sample {t + 1}/{total_iters}")
+        if progress and (t + 1) % _tick_every(total_iters) == 0:
+            el = time.perf_counter() - t_phase
+            rate = (t + 1) / el
+            acc = float(np.array(accept_sum).mean()) / (t + 1)
+            ndiv = int(np.array(divergent_sum).sum())
+            print(f"[sample] {t + 1}/{total_iters} | {rate:.2f} it/s | "
+                  f"accept {acc:.2f} | divergences {ndiv} | "
+                  f"elapsed {_fmt_eta(el)} | "
+                  f"eta {_fmt_eta((total_iters - t - 1) / rate)}", flush=True)
 
     return Results(
         backend=storage,
