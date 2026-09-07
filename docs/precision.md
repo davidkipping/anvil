@@ -36,7 +36,9 @@ posterior.
    (`t0 − t0_ref`, `P − P_ref`, `f0 − 1`). Set
    `ParamSpec(report_offset=...)` and the reporting layer reinstates
    absolute units in float64 on output. After applying rules 1–2, the
-   transit model's error dropped from ~12 to ~0.2 log-likelihood units.
+   transit model's median error dropped from ~1.3 to ~0.09
+   log-likelihood units at the posterior typical set (and from ~10 to
+   ~0.4 over a wider parameter ball).
 3. **Fit the deviation, not the signal-plus-baseline.** Predict `f − 1`
    against baseline-subtracted data so the ordinate is O(depth).
 4. **Reduce with structure.** {class}`anvil.precision.ChunkedGaussianLogLike`

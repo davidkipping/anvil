@@ -133,14 +133,17 @@ class ChunkedGaussianLogLike:
                 acc = mx.zeros(vb.shape[:1], dtype=mx.float64)
                 for s in range(0, self.n_data, c):
                     e = min(s + c, self.n_data)
-                    x = mx.array(self._x64[..., s:e])
-                    y = mx.array(self._y64[s:e])
-                    w = mx.array(1.0 / self._yerr64[s:e])
+                    # dtype= is REQUIRED: mx.array() of a float64 numpy
+                    # array silently yields float32, which would make this
+                    # "float64 path" a second float32 path.
+                    x = mx.array(self._x64[..., s:e], dtype=mx.float64)
+                    y = mx.array(self._y64[s:e], dtype=mx.float64)
+                    w = mx.array(1.0 / self._yerr64[s:e], dtype=mx.float64)
                     r = (y - self.model_fn(vb, x)) * w
                     acc = acc - 0.5 * mx.sum(r * r, axis=-1)
                     mx.eval(acc)  # free this tile's graph before the next
                 out[cb : cb + vb.shape[0]] = np.array(acc)
-            return mx.array(out)
+            return mx.array(out, dtype=mx.float64)
 
 
 @dataclass

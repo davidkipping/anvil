@@ -218,7 +218,10 @@ class TransformedLogDensity(LogDensity):
             )
         u_np = np.array(u, dtype=np.float64)
         with mx.stream(mx.cpu):
-            v64 = mx.array(self.transform.model_np(u_np))
+            # dtype= is REQUIRED (see precision.py): without it the
+            # float64 parameters and Jacobian silently round to float32.
+            v64 = mx.array(self.transform.model_np(u_np), dtype=mx.float64)
             lp = self._fn_hi(v64)
-            jac = mx.array(self.transform.log_det_jac_np(u_np))
+            jac = mx.array(self.transform.log_det_jac_np(u_np),
+                           dtype=mx.float64)
             return lp + jac

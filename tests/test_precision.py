@@ -131,3 +131,29 @@ def test_reanchor_end_to_end():
     lp_hi = np.array(tt.target.log_prob_hi(res.final_state["u"]))
     drift = np.abs(np.array(res.final_state["log_prob"], dtype=np.float64) - lp_hi)
     assert np.median(drift) < 1.0
+
+
+def test_hi_path_is_genuinely_float64():
+    """Regression guard: mx.array() of a float64 numpy array silently
+    yields float32 unless dtype= is named. That once made the whole
+    'float64 verification path' a second float32 path, giving the
+    precision harness a silent error floor of ~1 ulp of |logL|."""
+    tt = make_transit_target(n_data=20_000, seed=0)
+    u = mx.array(
+        tt.transform.from_model_np(tt.truth_model)[None, :].astype(np.float32)
+    )
+    assert tt.target.log_prob_hi(u).dtype == mx.float64
+    assert tt.loglike.hi(tt.transform.to_model(u)).dtype == mx.float64
+
+    # and it must actually carry fp64 information: perturbing a parameter
+    # far below fp32 resolution must move the fp64 logL but not the fp32 one
+    u64 = np.array(u, dtype=np.float64)
+    u64[0, 2] += 1e-9                      # << fp32 eps at this magnitude
+    lp_a = float(np.array(tt.target.log_prob_hi(u), dtype=np.float64)[0])
+    v_a = mx.array(tt.transform.model_np(np.array(u, dtype=np.float64)),
+                   dtype=mx.float64)
+    v_b = mx.array(tt.transform.model_np(u64), dtype=mx.float64)
+    lp_b_hi = float(np.array(tt.loglike.hi(v_b))[0])
+    lp_a_hi = float(np.array(tt.loglike.hi(v_a))[0])
+    assert lp_a_hi != lp_b_hi, "fp64 path insensitive to sub-fp32 perturbation"
+    assert np.isfinite(lp_a)

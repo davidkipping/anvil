@@ -211,10 +211,12 @@ def make_transit_target(
         1.0,      # baseline flux (normalized)
     ])
 
-    v64 = mx.array(truth[None, :])
-    flux_true = np.array(
-        trapezoid_flux(v64, mx.array(t_model))[0], dtype=np.float64
-    )
+    with mx.stream(mx.cpu):  # float64 synthesis: explicit dtype, CPU stream
+        v64 = mx.array(truth[None, :], dtype=mx.float64)
+        flux_true = np.array(
+            trapezoid_flux(v64, mx.array(t_model, dtype=mx.float64))[0],
+            dtype=np.float64,
+        )
     y = flux_true + yerr * rng.standard_normal(n_data)
 
     yerr_arr = np.full(n_data, yerr)

@@ -76,9 +76,9 @@ Metal GPUs have no float64. Sampling correctness in float32 is a
 
    ```
    PrecisionReport over 32 states
-     |logL| typical magnitude : 5.2e+04
-     |fp32 - fp64| median     : 0.18
-     |fp32 - fp64| max        : 0.62
+     |logL| typical magnitude : 5.1e+04
+     |fp32 - fp64| median     : 0.085
+     |fp32 - fp64| max        : 0.77
      ACCEPTABLE: fp32 error is below the ~1-unit scale of Metropolis ...
    ```
 5. **Re-anchor.** `run(..., reanchor_every=100)` recomputes the cached
