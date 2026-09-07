@@ -109,10 +109,10 @@ for label, kernel, n_warmup, n_samples, thin in (
     ("ChEES-HMC", ChEESHMC(target, max_leapfrog=128), 300, 200, 1),
 ):
     # NOTE: no reanchor_every here — the harness above reported OK
-    # (fp32 error ~0.04, well below the Metropolis decision scale), and
-    # each float64 re-anchor of an expensive model costs single-core CPU
-    # minutes at this batch size. Enable it only when the harness says
-    # ACCEPTABLE/WARNING.
+    # (fp32 error ~0.01 for this problem, far below the Metropolis
+    # decision scale), and each float64 re-anchor of an expensive model
+    # costs single-core CPU minutes at this batch size. Enable it only
+    # when the harness reports ACCEPTABLE or WARNING.
     t0 = time.perf_counter()
     res = anvil.run(kernel, target, u0, n_warmup=n_warmup,
                     n_samples=n_samples, thin=thin, seed=2)

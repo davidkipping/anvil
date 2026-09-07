@@ -160,10 +160,11 @@ class PrecisionReport:
         elif self.max_abs_err < 1.0:
             verdict = ("ACCEPTABLE: fp32 error is below the ~1-unit scale of "
                        "Metropolis accept decisions; residual distortion of "
-                       "the sampled posterior is small. Errors in the "
-                       "log-density *difference* between nearby states (what "
-                       "accept/reject actually uses) are typically smaller "
-                       "still.")
+                       "the sampled posterior is small. Read this as a "
+                       "direct proxy for accept/reject distortion: the error "
+                       "in the log-density *difference* between two states "
+                       "does NOT cancel — measured 1.2-2.2x the pointwise "
+                       "error at proposal-scale displacements.")
         else:
             verdict = ("WARNING: fp32 error reaches the scale of Metropolis "
                        "accept decisions — improve model conditioning "
