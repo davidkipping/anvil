@@ -6,6 +6,7 @@ under gradient-based (ChEES-HMC) and gradient-free (ensemble) kernels.
 """
 
 from . import diagnostics
+from .diagnostics import Diagnostics, diagnose
 from .emcee_api import EnsembleSampler, HMCSampler
 from .engine import Results, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
@@ -26,11 +27,13 @@ __all__ = [
     "LogDensity",
     "ParamSpec",
     "Certificate",
+    "Diagnostics",
     "PrecisionPolicy",
     "Results",
     "StretchMove",
     "Transform",
     "TransformedLogDensity",
+    "diagnose",
     "diagnostics",
     "certify",
     "run",

@@ -58,3 +58,44 @@ def test_summary_runs():
     rng = np.random.default_rng(4)
     text = summary(rng.normal(size=(200, 8, 2)), names=["a", "b"])
     assert "a" in text and "rhat" in text
+
+
+def test_diagnose_matches_separate_calls_and_shares_work():
+    from anvil.diagnostics import diagnose
+    rng = np.random.default_rng(11)
+    chain = rng.normal(size=(120, 256, 4))
+    chain[:, :5, 0] += 0.5                      # a genuinely non-trivial case
+    d = diagnose(chain, names=list("abcd"))
+    np.testing.assert_allclose(d.rhat, split_rhat(chain), rtol=1e-12)
+    np.testing.assert_allclose(d.ess_bulk, ess_bulk(chain), rtol=1e-12)
+    assert d.names == list("abcd") and "rhat" in str(d)
+
+
+def test_batched_and_gpu_paths_match_the_per_parameter_reference():
+    """The shared/batched implementation must reproduce the original
+    per-parameter numpy computation, including across the size threshold
+    where the autocovariance switches to the GPU."""
+    import anvil.diagnostics as D
+    rng = np.random.default_rng(12)
+    # big enough to cross the x.size >= 2**18 GPU threshold
+    chain = rng.normal(size=(160, 512, 6))
+    chain[:, :7, 1] += 0.3
+    ref_rhat = np.array([
+        D._rhat_single(D._split_chains(D._rank_normalize(chain[..., d])))
+        for d in range(6)])
+    ref_ess = np.array([
+        D._ess_single(D._split_chains(D._rank_normalize(chain[..., d])))
+        for d in range(6)])
+    d = D.diagnose(chain)
+    assert np.abs(d.rhat - ref_rhat).max() < 1e-6
+    assert np.abs(d.ess_bulk - ref_ess).max() / ref_ess.max() < 1e-5
+
+
+def test_autocov_batches_over_parameters():
+    from anvil.diagnostics import _autocov
+    rng = np.random.default_rng(13)
+    x = rng.normal(size=(64, 32, 3))
+    batched = _autocov(x)
+    for d in range(3):
+        np.testing.assert_allclose(batched[..., d], _autocov(x[..., d]),
+                                   rtol=1e-10, atol=1e-12)

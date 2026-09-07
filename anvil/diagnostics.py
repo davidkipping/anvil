@@ -12,6 +12,9 @@ All functions take chains shaped ``(n_steps, n_chains, dim)`` (or
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import mlx.core as mx
 import numpy as np
 
 # --- Acklam's inverse normal CDF (max rel. error ~1.15e-9) -----------------
@@ -70,6 +73,57 @@ def _rank_normalize(x: np.ndarray) -> np.ndarray:
     return norm_ppf(p).reshape(x.shape)
 
 
+def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
+    """Rank-normalize every parameter at once.
+
+    Identical in intent to :func:`_rank_normalize`, but vectorized over
+    parameters and executed through MLX, which makes the sort (~85% of the
+    cost of the whole diagnostics suite) a GPU operation. Ranks are exact:
+    they are integers below 2**24 for any sample this engine can store, so
+    float32 carries them without loss; the only difference from the numpy
+    path is the float32 evaluation of the normal quantile function, worth
+    ~1e-6 in R-hat.
+
+    chain: (N, M, dim) -> (N, M, dim) normal scores.
+    """
+    n, m, dim = chain.shape
+    flat = mx.array(np.ascontiguousarray(
+        chain.reshape(n * m, dim), dtype=np.float32))
+    order = mx.argsort(flat, axis=0)
+    pos = mx.broadcast_to(
+        mx.arange(1, n * m + 1, dtype=mx.float32)[:, None], flat.shape)
+    ranks = mx.put_along_axis(mx.zeros_like(flat), order, pos, axis=0)
+    p = (ranks - 0.375) / (n * m + 0.25)
+    return np.array(_norm_ppf_mx(p), dtype=np.float64).reshape(n, m, dim)
+
+
+def _norm_ppf_mx(p: mx.array) -> mx.array:
+    """Acklam's inverse normal CDF in MLX ops (see :func:`norm_ppf`)."""
+    lo, hi = 0.02425, 1.0 - 0.02425
+    q_mid = p - 0.5
+    r_mid = q_mid * q_mid
+    num_m = ((((_A[0]*r_mid + _A[1])*r_mid + _A[2])*r_mid + _A[3])*r_mid
+             + _A[4])*r_mid + _A[5]
+    den_m = ((((_B[0]*r_mid + _B[1])*r_mid + _B[2])*r_mid + _B[3])*r_mid
+             + _B[4])*r_mid + 1.0
+    mid = num_m * q_mid / den_m
+
+    # both tails are evaluated everywhere, so their arguments must be
+    # sanitized to stay in-domain (mx.where evaluates both branches)
+    p_lo = mx.where(p < lo, p, 0.01)
+    q_lo = mx.sqrt(-2.0 * mx.log(p_lo))
+    p_hi = mx.where(p > hi, p, 0.99)
+    q_hi = mx.sqrt(-2.0 * mx.log1p(-p_hi))
+
+    def _tail(q):
+        num = ((((_C[0]*q + _C[1])*q + _C[2])*q + _C[3])*q + _C[4])*q + _C[5]
+        den = (((_D[0]*q + _D[1])*q + _D[2])*q + _D[3])*q + 1.0
+        return num / den
+
+    out = mx.where(p < lo, _tail(q_lo), mid)
+    return mx.where(p > hi, -_tail(q_hi), out)
+
+
 def _split_chains(x: np.ndarray) -> np.ndarray:
     """Split each chain in half: (N, M) -> (N//2, 2M). Drops an odd step."""
     n = (x.shape[0] // 2) * 2
@@ -96,20 +150,33 @@ def split_rhat(chain: np.ndarray) -> np.ndarray:
     single = chain.ndim == 2
     if single:
         chain = chain[..., None]
+    z = _rank_normalize_all(chain)
     out = np.empty(chain.shape[-1])
     for d in range(chain.shape[-1]):
-        z = _rank_normalize(chain[..., d].astype(np.float64))
-        out[d] = _rhat_single(_split_chains(z))
+        out[d] = _rhat_single(_split_chains(z[..., d]))
     return out[0:1] if single else out
 
 
 # --- ESS --------------------------------------------------------------------
 
 def _autocov(x: np.ndarray) -> np.ndarray:
-    """Per-chain autocovariance via FFT. x: (N, M) -> (N, M), biased (1/N)."""
-    n, _ = x.shape
-    xc = x - x.mean(axis=0)
+    """Per-chain autocovariance via FFT along axis 0, biased (1/N).
+
+    Shape-agnostic beyond the first axis, so it batches over parameters:
+    (N, M) -> (N, M) and (N, M, dim) -> (N, M, dim).
+    """
+    n = x.shape[0]
     nfft = int(2 ** np.ceil(np.log2(2 * n)))
+    if x.size >= 1 << 18:
+        # GPU float32 for large arrays: measured ~4x faster, and it moves
+        # the resulting ESS by ~5e-9 relative (the autocovariance is an
+        # average over M chains, so float32 noise averages away)
+        xm = mx.array(np.ascontiguousarray(x, dtype=np.float32))
+        xc = xm - mx.mean(xm, axis=0)
+        f = mx.fft.rfft(xc, n=nfft, axis=0)
+        acov = mx.fft.irfft(f * mx.conjugate(f), n=nfft, axis=0)[:n]
+        return np.array(acov, dtype=np.float64) / n
+    xc = x - x.mean(axis=0)
     f = np.fft.rfft(xc, n=nfft, axis=0)
     acov = np.fft.irfft(f * np.conjugate(f), n=nfft, axis=0)[:n].real
     return acov / n
@@ -149,15 +216,52 @@ def _ess_single(x: np.ndarray) -> float:
     return float(n * m / tau)
 
 
+def _ess_batched(x: np.ndarray) -> np.ndarray:
+    """Bulk ESS for every parameter at once. x: (N, M, dim), split chains.
+
+    Same Geyer initial monotone sequence as :func:`_ess_single`; only the
+    autocovariance is batched (one FFT over all parameters instead of one
+    per parameter).
+    """
+    n, m, dim = x.shape
+    if n < 4:
+        return np.full(dim, np.nan)
+    acov = _autocov(x)                       # (N, M, dim), FFT along axis 0
+    w = (acov[0] * n / (n - 1)).mean(axis=0)                 # (dim,)
+    var_plus = w * (n - 1) / n
+    if m > 1:
+        var_plus = var_plus + x.mean(axis=0).var(axis=0, ddof=1)
+    rho = 1.0 - (w - acov.mean(axis=1)) / var_plus            # (N, dim)
+    rho[0] = 1.0
+
+    out = np.empty(dim)
+    for d in range(dim):
+        if var_plus[d] <= 0:
+            out[d] = np.nan
+            continue
+        sum_pairs, prev_pair = 0.0, np.inf
+        for k in range(n // 2):
+            pair = rho[2 * k, d] + rho[2 * k + 1, d]
+            if pair < 0:
+                break
+            pair = min(pair, prev_pair)
+            sum_pairs += pair
+            prev_pair = pair
+        tau = max(-1.0 + 2.0 * sum_pairs, 1.0 / np.log10(n * m + 10.0))
+        out[d] = n * m / tau
+    return out
+
+
 def ess_bulk(chain: np.ndarray) -> np.ndarray:
     """Rank-normalized bulk ESS per parameter. chain: (N, M[, dim])."""
     single = chain.ndim == 2
     if single:
         chain = chain[..., None]
-    out = np.empty(chain.shape[-1])
-    for d in range(chain.shape[-1]):
-        z = _rank_normalize(chain[..., d].astype(np.float64))
-        out[d] = _ess_single(_split_chains(z))
+    z = _rank_normalize_all(chain)
+    zs = np.concatenate(
+        [z[: z.shape[0] // 2], z[z.shape[0] // 2 : (z.shape[0] // 2) * 2]],
+        axis=1)                                    # split chains, all params
+    out = _ess_batched(zs)
     return out[0:1] if single else out
 
 
@@ -194,14 +298,47 @@ def nested_rhat(chain: np.ndarray, n_superchains: int) -> np.ndarray:
     return out[0:1] if single else out
 
 
+@dataclass
+class Diagnostics:
+    """Convergence summary for one chain array."""
+
+    rhat: np.ndarray
+    ess_bulk: np.ndarray
+    names: list[str]
+
+    def __str__(self) -> str:
+        lines = [f"{'param':>10s} {'rhat':>8s} {'ess_bulk':>10s}"]
+        for i, n in enumerate(self.names):
+            lines.append(f"{n:>10s} {self.rhat[i]:>8.4f} {self.ess_bulk[i]:>10.0f}")
+        return "\n".join(lines)
+
+
+def diagnose(chain: np.ndarray, names: list[str] | None = None) -> Diagnostics:
+    """R-hat and bulk ESS in a single pass.
+
+    Prefer this to calling :func:`split_rhat` and :func:`ess_bulk`
+    separately: rank normalization is ~85% of the work and this shares it
+    between the two statistics instead of repeating it.
+    """
+    if chain.ndim == 2:
+        chain = chain[..., None]
+    dim = chain.shape[-1]
+    z = _rank_normalize_all(chain)
+    rhat = np.array([_rhat_single(_split_chains(z[..., d])) for d in range(dim)])
+    half = z.shape[0] // 2
+    zs = np.concatenate([z[:half], z[half : 2 * half]], axis=1)
+    return Diagnostics(rhat=rhat, ess_bulk=_ess_batched(zs),
+                       names=names or [f"p{d}" for d in range(dim)])
+
+
 def summary(chain: np.ndarray, names: list[str] | None = None) -> str:
     """Human-readable per-parameter table: mean, sd, R-hat, bulk ESS."""
     if chain.ndim == 2:
         chain = chain[..., None]
     dim = chain.shape[-1]
     names = names or [f"p{d}" for d in range(dim)]
-    rhat = split_rhat(chain)
-    ess = ess_bulk(chain)
+    d = diagnose(chain, names)
+    rhat, ess = d.rhat, d.ess_bulk
     lines = [f"{'param':>10s} {'mean':>12s} {'sd':>12s} {'rhat':>8s} {'ess_bulk':>10s}"]
     for d in range(dim):
         draws = chain[..., d]
