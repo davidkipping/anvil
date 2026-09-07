@@ -102,13 +102,13 @@ def test_gaussian_loglike_matches_numpy():
     ll = ChunkedGaussianLogLike(line, x, y, yerr, PrecisionPolicy(chunk_size=1024))
     v32 = np.array([[2.0, 0.5], [1.9, 0.6]], dtype=np.float32)
     v = mx.array(v32)
-    got = np.array(ll(v), dtype=np.float64)
+    got = np.array(ll(v), dtype=np.float64) + ll.log_offset_const
     # reference from the fp32-rounded parameter values the mx paths receive
     p = v32.astype(np.float64)
     m = p[:, 0:1] * x[None, :] + p[:, 1:2]
     want = -0.5 * (((y[None, :] - m) / 0.01) ** 2).sum(axis=-1)
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=0.5)
-    hi = np.array(ll.hi(v))
+    hi = np.array(ll.hi(v)) + ll.log_offset_const
     # fp64 summation-order differences (MLX reduction vs numpy pairwise)
     np.testing.assert_allclose(hi, want, rtol=1e-7)
 
@@ -157,3 +157,42 @@ def test_hi_path_is_genuinely_float64():
     lp_a_hi = float(np.array(tt.loglike.hi(v_a))[0])
     assert lp_a_hi != lp_b_hi, "fp64 path insensitive to sub-fp32 perturbation"
     assert np.isfinite(lp_a)
+
+
+def test_recentring_is_an_exact_constant_offset():
+    """Recentring must shift log_prob by exactly -N/2 and nothing else:
+    every difference the sampler takes has to be unchanged."""
+    rng = np.random.default_rng(0)
+    x = np.linspace(0, 1, 20_000)
+    y = 2.0 * x + 0.5 + 0.01 * rng.standard_normal(20_000)
+    yerr = np.full(20_000, 0.01)
+
+    def line(v, xx):
+        return v[:, 0:1] * xx[None, :] + v[:, 1:2]
+
+    # near-truth: chi2/N ~ 1, the regime recentring targets
+    v = mx.array(np.array([[2.0, 0.5], [2.0004, 0.4998]], dtype=np.float32))
+    off = ChunkedGaussianLogLike(line, x, y, yerr,
+                                 PrecisionPolicy(recenter=False))
+    on = ChunkedGaussianLogLike(line, x, y, yerr,
+                                PrecisionPolicy(recenter=True))
+    assert off.log_offset_const == 0.0
+    assert on.log_offset_const == -0.5 * 20_000
+
+    # float64 paths must agree exactly once the constant is reinstated
+    a = np.array(off.hi(v)) + off.log_offset_const
+    b = np.array(on.hi(v)) + on.log_offset_const
+    np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    # and the recentred float32 value must be far smaller in magnitude,
+    # which is the entire point (smaller ulp for downstream differences)
+    m_off = np.abs(np.array(off(v), dtype=np.float64)).max()
+    m_on = np.abs(np.array(on(v), dtype=np.float64)).max()
+    assert m_on < 0.05 * m_off
+
+    # graceful degradation: when the model fits badly (chi2/N >> 1) there is
+    # no large constant to remove, so recentring is simply a no-op gain --
+    # it must never be WORSE than the plain form
+    bad = mx.array(np.array([[1.9, 0.55]], dtype=np.float32))
+    assert (np.abs(np.array(on(bad), dtype=np.float64)).max()
+            <= np.abs(np.array(off(bad), dtype=np.float64)).max())

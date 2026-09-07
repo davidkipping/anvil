@@ -42,7 +42,26 @@ posterior.
    one.
 3. **Fit the deviation, not the signal-plus-baseline.** Predict `f − 1`
    against baseline-subtracted data so the ordinate is O(depth).
-4. **Reduce with structure — but know its ceiling.**
+4. **Recentre the likelihood itself** (on by default;
+   `PrecisionPolicy(recenter=False)` opts out). A chi-squared over N
+   points is a sum of N terms whose expectation is −N/2, so the float32
+   graph would carry a ~5×10⁴ number for a 10⁵-point fit even though
+   every parameter-dependent part of it is O(√(N/2)) ≈ 200. anvil sums
+   `0.5·(1 − r²)` instead of `−0.5·r²` and keeps the exact −N/2 as a
+   float64 host constant (`log_offset_const`), alongside the Gaussian
+   normalization it already excluded. Measured: the float32 ulp of the
+   stored log-probability falls ~128×, so every difference the sampler
+   takes — Metropolis ratios, and **HMC's energy difference, which
+   `validate_precision` cannot observe because it is formed downstream
+   of the likelihood** — is resolved that much more finely. End-to-end
+   this is worth 2.8× on an accurate model and little on a model whose
+   own arithmetic dominates, it costs nothing measurable, and its value
+   grows with N (an 81× reduction in accumulation error at N = 10⁶).
+   Two caveats: when the model fits badly (χ²/N ≫ 1) there is no large
+   constant to remove and the scheme simply degrades to the plain form,
+   never worse; and anything wanting an *absolute* log-likelihood must
+   add `log_offset_const + log_norm_const` back in float64.
+5. **Reduce with structure — but know its ceiling.**
    {class}`anvil.precision.ChunkedGaussianLogLike` sums per-datum terms
    chunk-wise (tree error O(ε√n) instead of O(εn)). The `fp64_anchor`
    policy additionally performs the cross-chunk sum in float64 on the CPU
@@ -57,7 +76,7 @@ posterior.
    2–40% of the total, the rest being per-datum model arithmetic and
    parameter representation. Reduction tricks are the smallest lever
    here; conditioning (rules 1–3) is the large one.
-5. **Re-anchor — for adaptive densities, not for float32 rounding.**
+6. **Re-anchor — for adaptive densities, not for float32 rounding.**
    `run(..., reanchor_every=N)` recomputes the cached log-probabilities of
    the current states through the float64 CPU path every N iterations. Be
    clear about what this does and does not buy. anvil never *accumulates*

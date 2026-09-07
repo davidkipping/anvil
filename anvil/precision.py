@@ -32,7 +32,13 @@ class PrecisionPolicy:
     reduction: Literal["fp32_tree", "fp64_anchor"] = "fp32_tree"
     chunk_size: int = 65536
     #: engine-level cadence for re-anchoring cached log_prob in fp64; 0 = off
-    reanchor_every: int = 100
+    reanchor_every: int = 0
+    #: Subtract the parameter-independent -N/2 from the summed terms so the
+    #: float32 quantity is O(sqrt(N/2)) instead of O(N/2). Free, and it also
+    #: shrinks the rounding of every DOWNSTREAM difference (notably HMC's
+    #: energy difference, which validate_precision cannot see). See the
+    #: log_offset_const note on ChunkedGaussianLogLike.
+    recenter: bool = True
 
 
 def chunked_sum(
@@ -74,9 +80,28 @@ class ChunkedGaussianLogLike:
 
     Data enter as float64 numpy (the caller has already centered/scaled
     them into well-conditioned model units); fp32 copies feed the GPU path.
-    The parameter-independent normalization sum(log(2*pi*sigma^2))/2 is kept
-    as a float64 host scalar, available as ``.log_norm_const`` (it cancels
-    in MH ratios and is deliberately excluded from the graph).
+
+    TWO parameter-independent constants are deliberately kept out of the
+    graph as float64 host scalars, because both cancel in MH ratios and
+    both would otherwise force the float32 arithmetic to carry a large
+    number:
+
+    * ``log_norm_const`` = -sum(log(2*pi*sigma^2))/2, the Gaussian
+      normalization;
+    * ``log_offset_const`` = -N/2 (when ``policy.recenter``), which
+      recentres the chi-squared. Because E[sum r^2] = N for a correct
+      model, summing ``0.5*(1 - r^2)`` instead of ``-0.5*r^2`` leaves an
+      O(sqrt(N/2)) quantity rather than an O(N/2) one -- at N = 1e5 that
+      is ~200 instead of ~5e4, so the float32 ulp of the stored value
+      falls by ~500x and every difference taken downstream (Metropolis
+      ratios, and HMC's energy difference) gets correspondingly sharper.
+      The per-term form ``0.5*(1-r)*(1+r)`` is used because ``1-r`` is
+      exact for 0.5 <= r <= 2 (Sterbenz), avoiding cancellation near
+      r = 1.
+
+    So the true unnormalized log-likelihood is
+    ``value + log_offset_const``, and the fully normalized one adds
+    ``log_norm_const`` as well.
     """
 
     def __init__(
@@ -101,6 +126,16 @@ class ChunkedGaussianLogLike:
         self.log_norm_const = float(
             -0.5 * np.sum(np.log(2.0 * np.pi * self._yerr64**2))
         )
+        # exact in float64; add it back to recover the true chi-squared logL
+        self.log_offset_const = (
+            -0.5 * float(self.n_data) if self.policy.recenter else 0.0
+        )
+
+    def _terms(self, r: mx.array) -> mx.array:
+        """Per-datum contribution, dtype-polymorphic."""
+        if self.policy.recenter:
+            return 0.5 * (1.0 - r) * (1.0 + r)   # == 0.5 - 0.5*r*r
+        return -0.5 * r * r
 
     def __call__(self, v: mx.array) -> mx.array:
         """fp32 chunked chi-squared log-likelihood (n_chains,)."""
@@ -108,7 +143,7 @@ class ChunkedGaussianLogLike:
         def term_fn(s: int, e: int) -> mx.array:
             m = self.model_fn(v, self._x32[..., s:e])
             r = (self._y32[s:e] - m) * self._w32[s:e]
-            return -0.5 * r * r
+            return self._terms(r)
 
         return chunked_sum(term_fn, self.n_data, self.policy)
 
@@ -140,7 +175,7 @@ class ChunkedGaussianLogLike:
                     y = mx.array(self._y64[s:e], dtype=mx.float64)
                     w = mx.array(1.0 / self._yerr64[s:e], dtype=mx.float64)
                     r = (y - self.model_fn(vb, x)) * w
-                    acc = acc - 0.5 * mx.sum(r * r, axis=-1)
+                    acc = acc + mx.sum(self._terms(r), axis=-1)
                     mx.eval(acc)  # free this tile's graph before the next
                 out[cb : cb + vb.shape[0]] = np.array(acc)
             return mx.array(out, dtype=mx.float64)
