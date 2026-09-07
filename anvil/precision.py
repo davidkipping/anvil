@@ -40,9 +40,9 @@ class PrecisionPolicy:
     #: "fp32_tree": chunked fp32 sums only (compilable, default).
     #: "fp64_anchor": cross-chunk sum in fp64 on the CPU stream (uncompiled).
     #: "fixed_point": accumulate terms as int64 fixed-point in a custom
-    #:   Metal kernel — exact and order-independent, so the only rounding
-    #:   left is representing the answer as float32. Falls back to
-    #:   "fp32_tree" off-GPU or for non-float32 inputs.
+    #: Metal kernel -- exact and order-independent, so the only rounding
+    #: left is representing the answer as float32; falls back to
+    #: "fp32_tree" off-GPU or for non-float32 inputs.
     reduction: Literal["fp32_tree", "fp64_anchor", "fixed_point"] = "fp32_tree"
     chunk_size: int = 65536
     #: engine-level cadence for re-anchoring cached log_prob in fp64; 0 = off
