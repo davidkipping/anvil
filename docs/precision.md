@@ -77,6 +77,16 @@ posterior.
    parameter representation. Reduction tricks are the smallest lever
    here; conditioning (rules 1–3) is the large one.
 
+   `chunk_size` (default 16384) does have a second, non-accuracy role
+   worth knowing: the chunk loop unrolls into a single graph, so in
+   reverse mode every chunk's saved activations are live at once and
+   **peak gradient memory falls roughly with the chunk size**. Measured at
+   1024 chains × 10⁵ points, 65536 → 16384 costs nothing in forward time,
+   is marginally faster for gradients, and cuts peak memory 1.4–1.7×. If a
+   gradient-based run is memory-bound — 4096 chains × 10⁵ points reaches
+   ~19 GB at 65536 — lower it further before reducing the chain count.
+   Below ~4096 the dispatch count begins to cost at large N.
+
    `PrecisionPolicy(reduction="fixed_point")` takes the reduction as far
    as it can go: a custom Metal kernel accumulates the terms as int64
    fixed-point (multiples of 2⁻³⁰), which is **exact** — integer addition

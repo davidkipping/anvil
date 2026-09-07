@@ -44,7 +44,15 @@ class PrecisionPolicy:
     #: left is representing the answer as float32; falls back to
     #: "fp32_tree" off-GPU or for non-float32 inputs.
     reduction: Literal["fp32_tree", "fp64_anchor", "fixed_point"] = "fp32_tree"
-    chunk_size: int = 65536
+    #: Data-axis tile width. Primarily an accuracy knob (it sets the depth
+    #: of the summation tree), but it also bounds the reverse-mode tape:
+    #: the chunk loop unrolls into one graph, so peak gradient memory falls
+    #: roughly with the chunk. Measured at 1024 chains x 1e5 points,
+    #: 65536 -> 16384 costs nothing in forward time, is marginally faster
+    #: for gradients, and cuts peak memory ~1.4-1.7x; below ~4096 the
+    #: dispatch count starts to cost at large N. Lower it further if a
+    #: gradient run is memory-bound.
+    chunk_size: int = 16384
     #: engine-level cadence for re-anchoring cached log_prob in fp64; 0 = off
     reanchor_every: int = 0
     #: Subtract the parameter-independent -N/2 from the summed terms so the
