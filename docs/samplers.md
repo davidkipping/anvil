@@ -31,6 +31,41 @@ divergences.
   known-hard test: anvil's requirement is that diagnostics *flag* it,
   not that it be silently sampled.
 
+### Why ChEES-HMC can lose to a gradient-free move
+
+On the bundled transit problem the stretch move wins on wall-clock
+despite ChEES-HMC having ~80× better ESS *per draw*. The reason is worth
+understanding, because it tells you which sampler to reach for.
+
+ChEES-HMC adapts a **diagonal** preconditioner. That removes each
+parameter's scale but cannot remove *correlations between* parameters —
+and the transit posterior is full of them (`b`–`a` −0.96, `q1`–`q2`
+−0.95, `r`–`b` +0.92). Measured, the diagonal preconditioner does its
+job perfectly (it matches every posterior sd to three digits) and still
+leaves a condition number of ~500–1500 in the correlation matrix. HMC
+must then buy roughly √cond leapfrog steps per draw to cross the
+posterior — measured mean L ≈ 39, against √1546 = 39.3. The stretch move
+is *affine-invariant*, so it pays nothing for those correlations; that,
+and nothing else, is its advantage here.
+
+The natural fix is a dense (full-covariance) mass matrix, and on
+correlated posteriors it works exactly as theory predicts — measured on
+a correlated Gaussian, L collapses from 36 to 1 and ESS per gradient
+improves **40×**. It does *not* rescue the transit problem, because that
+posterior is not merely correlated but **curved**: whiten it by its own
+covariance and one parameter still has skew 1.9 and excess kurtosis 7.8.
+No single global mass matrix can linearize a banana, so L stays put and
+the gain is only ~1.6×.
+
+**The practical rule.** Whiten a pilot sample by its covariance and look
+at the residual skew/kurtosis:
+
+* near zero → the posterior is correlated but Gaussian-ish, and
+  gradient-based sampling with a good preconditioner should dominate;
+* large → the posterior is curved, a global preconditioner will not save
+  you, and an affine-invariant ensemble move is likely the better buy
+  (or reparameterize to remove the curvature, which is better still).
+
 ## Ensemble moves (gradient-free fallback)
 
 {class}`anvil.EnsembleKernel` runs Goodman-Weare stretch and
@@ -87,4 +122,16 @@ converged; `benchmarks/bench_transit.py`):
 Sustained-GPU thermal throttling swings wall-clock ~2× on laptop-class
 hardware; the conservative cross-run claims are ≥60× (stretch) and ≥10×
 (ChEES-HMC) over emcee's best measurement. The trapezoid's kinks are
-near ChEES-HMC's worst case; on smooth models the ranking flips.
+near ChEES-HMC's worst case; on smooth models the ranking flips — and
+see the correlation/curvature discussion above for *why* the
+gradient-free move competes at all here.
+
+## Diagnostics cost
+
+{func}`anvil.diagnose` returns R-hat and bulk ESS from one shared pass;
+prefer it to calling {func}`~anvil.diagnostics.split_rhat` and
+{func}`~anvil.diagnostics.ess_bulk` separately, which repeats the rank
+normalization that dominates the work. Measured at 400 draws × 2048
+chains × 8 parameters: 1685 ms → 109 ms. Worth knowing because on cheap
+targets the diagnostics used to cost several times the sampling run they
+described.
