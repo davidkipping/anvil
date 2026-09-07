@@ -25,11 +25,25 @@ import mlx.core as mx
 import numpy as np
 
 
+#: fixed-point scale for the exact reduction: terms are accumulated as
+#: int64 multiples of 2**-30. Chosen so that (a) multiplying a float32 by
+#: it is an exact exponent shift, (b) a per-term clamp at 2**43 still
+#: admits |term| up to 8192 (residuals ~128 sigma), and (c) 2**20 clamped
+#: terms cannot overflow int64.
+_FIXED_SHIFT = 30
+_FIXED_SCALE = float(2 ** _FIXED_SHIFT)
+_FIXED_CLAMP = float(2 ** 43)
+
+
 @dataclass
 class PrecisionPolicy:
     #: "fp32_tree": chunked fp32 sums only (compilable, default).
     #: "fp64_anchor": cross-chunk sum in fp64 on the CPU stream (uncompiled).
-    reduction: Literal["fp32_tree", "fp64_anchor"] = "fp32_tree"
+    #: "fixed_point": accumulate terms as int64 fixed-point in a custom
+    #:   Metal kernel — exact and order-independent, so the only rounding
+    #:   left is representing the answer as float32. Falls back to
+    #:   "fp32_tree" off-GPU or for non-float32 inputs.
+    reduction: Literal["fp32_tree", "fp64_anchor", "fixed_point"] = "fp32_tree"
     chunk_size: int = 65536
     #: engine-level cadence for re-anchoring cached log_prob in fp64; 0 = off
     reanchor_every: int = 0
@@ -39,6 +53,72 @@ class PrecisionPolicy:
     #: energy difference, which validate_precision cannot see). See the
     #: log_offset_const note on ChunkedGaussianLogLike.
     recenter: bool = True
+
+
+_FIXED_SRC = """
+    uint chain = threadgroup_position_in_grid.y;
+    uint tid   = thread_position_in_threadgroup.x;
+    uint nth   = threads_per_threadgroup.x;
+    uint m     = (uint)npts;
+    uint base  = chain * m;
+    long acc = 0;
+    for (uint j = tid; j < m; j += nth) {
+        // exact: multiplying a float32 by a power of two only shifts its
+        // exponent, so rint() is the only rounding, at 2**-31 per term
+        float f = metal::rint(terms[base + j] * SCALE);
+        f = metal::clamp(f, -CLAMP, CLAMP);
+        acc += (long)f;
+    }
+    threadgroup long tg[256];
+    tg[tid] = acc;
+    for (uint i = nth + tid; i < 256; i += nth) { tg[i] = 0; }  // pad: nth
+    threadgroup_barrier(mem_flags::mem_threadgroup);            // need not be
+    for (uint s = 128; s > 0; s >>= 1) {   // fixed power-of-two tree, exact
+        if (tid < s) { tg[tid] += tg[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { out[chain] = tg[0]; }
+""".replace("SCALE", f"{_FIXED_SCALE}f").replace("CLAMP", f"{_FIXED_CLAMP}f")
+
+_fixed_kernel = None
+
+
+def _fixed_point_partial(terms: mx.array) -> mx.array:
+    """Exact int64 fixed-point sum over the last axis of (n_chains, m)."""
+    global _fixed_kernel
+    if _fixed_kernel is None:
+        _fixed_kernel = mx.fast.metal_kernel(
+            name="anvil_fixed_point_sum",
+            input_names=["terms", "npts"],
+            output_names=["out"],
+            source=_FIXED_SRC,
+        )
+    n, m = terms.shape
+    return _fixed_kernel(
+        inputs=[terms, int(m)],
+        output_shapes=[(n,)], output_dtypes=[mx.int64],
+        grid=(256, n, 1), threadgroup=(256, 1, 1),
+    )[0]
+
+
+def _fixed_to_float32(acc: mx.array) -> mx.array:
+    """int64 fixed-point -> float32, without losing bits in the cast.
+
+    A direct ``astype(float32)`` of a ~2**37 integer discards 13 bits (and
+    is not even reproducible across MLX's eager/compiled paths). Splitting
+    the integer keeps both halves inside float32's exact-integer range, so
+    each half converts and scales exactly and only the final add rounds --
+    which is the unavoidable cost of returning a float32 at all.
+    """
+    split = 1 << 20
+    hi = acc // split
+    lo = acc - hi * split
+    return (hi.astype(mx.float32) / float(1 << (_FIXED_SHIFT - 20))
+            + lo.astype(mx.float32) / _FIXED_SCALE)
+
+
+def _fixed_point_usable(policy: PrecisionPolicy) -> bool:
+    return policy.reduction == "fixed_point" and mx.metal.is_available()
 
 
 def chunked_sum(
@@ -52,6 +132,16 @@ def chunked_sum(
     shape (n_chains, stop - start). Returns (n_chains,) fp32.
     """
     c = policy.chunk_size
+    if _fixed_point_usable(policy):
+        probe = term_fn(0, min(c, n_data))
+        if probe.dtype == mx.float32:
+            # accumulate int64 across chunks too, so the whole reduction is
+            # exact and only the final float32 cast rounds
+            acc = _fixed_point_partial(probe)
+            for s in range(c, n_data, c):
+                acc = acc + _fixed_point_partial(
+                    term_fn(s, min(s + c, n_data)))
+            return _fixed_to_float32(acc)
     partials = [
         mx.sum(term_fn(s, min(s + c, n_data)), axis=-1)
         for s in range(0, n_data, c)

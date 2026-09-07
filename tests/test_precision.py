@@ -249,3 +249,56 @@ def test_certify_requires_float64_path_and_valid_shapes():
     cert = certify(tt.target, res.get_chain(flat=True), n_probe=32)
     with pytest.raises(ValueError, match="same sample"):
         cert.correct(np.zeros(7))
+
+
+def _line_case(n=50_000, seed=0):
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0, 1, n)
+    y = 2.0 * x + 0.5 + 0.01 * rng.standard_normal(n)
+    return x, y, np.full(n, 0.01), (lambda v, xx: v[:, 0:1] * xx[None, :]
+                                    + v[:, 1:2])
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
+def test_fixed_point_reduction_is_exact_and_reproducible():
+    x, y, ye, line = _line_case()
+    v = mx.array(np.array([[2.0, 0.5], [2.001, 0.4995]], dtype=np.float32))
+    fp = ChunkedGaussianLogLike(line, x, y, ye,
+                                PrecisionPolicy(reduction="fixed_point"))
+    got = np.array(fp(v), dtype=np.float64)
+
+    # matches the exact sum of the float32 terms to the float32 output ulp
+    m = np.array(line(v, mx.array(x.astype(np.float32))), dtype=np.float64)
+    r = (y.astype(np.float32).astype(np.float64) - m) / 0.01
+    ref = (0.5 * (1.0 - r * r)).sum(axis=-1)
+    ulp = np.spacing(np.float32(np.abs(got).max()))
+    assert np.abs(got - ref).max() < 3 * ulp
+
+    # exact => bit-identical however the data axis is chunked, and under
+    # mx.compile. The float32 tree is neither.
+    for cs in (4096, 16384, 65536):
+        alt = ChunkedGaussianLogLike(
+            line, x, y, ye,
+            PrecisionPolicy(reduction="fixed_point", chunk_size=cs))
+        assert np.array_equal(got, np.array(alt(v), dtype=np.float64))
+    assert np.array_equal(
+        got, np.array(mx.compile(fp.__call__)(v), dtype=np.float64))
+
+    tree_a = ChunkedGaussianLogLike(line, x, y, ye,
+                                    PrecisionPolicy(chunk_size=4096))
+    tree_b = ChunkedGaussianLogLike(line, x, y, ye,
+                                    PrecisionPolicy(chunk_size=65536))
+    assert not np.array_equal(np.array(tree_a(v)), np.array(tree_b(v)))
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
+def test_fixed_point_saturates_instead_of_wrapping():
+    """A wildly bad fit must stay hugely negative. int64 wraparound would
+    be catastrophic — it could turn a rejected proposal into an accepted
+    one — so per-term values are clamped."""
+    x, y, ye, line = _line_case(n=20_000)
+    fp = ChunkedGaussianLogLike(line, x, y, ye,
+                                PrecisionPolicy(reduction="fixed_point"))
+    absurd = mx.array(np.array([[1e6, -1e6]], dtype=np.float32))
+    val = float(np.array(fp(absurd), dtype=np.float64)[0])
+    assert np.isfinite(val) and val < -1e6, val

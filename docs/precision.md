@@ -61,7 +61,7 @@ posterior.
    constant to remove and the scheme simply degrades to the plain form,
    never worse; and anything wanting an *absolute* log-likelihood must
    add `log_offset_const + log_norm_const` back in float64.
-5. **Reduce with structure — but know its ceiling.**
+5. **Reduce with structure — but know its ceiling, which is low.**
    {class}`anvil.precision.ChunkedGaussianLogLike` sums per-datum terms
    chunk-wise (tree error O(ε√n) instead of O(εn)). The `fp64_anchor`
    policy additionally performs the cross-chunk sum in float64 on the CPU
@@ -76,6 +76,24 @@ posterior.
    2–40% of the total, the rest being per-datum model arithmetic and
    parameter representation. Reduction tricks are the smallest lever
    here; conditioning (rules 1–3) is the large one.
+
+   `PrecisionPolicy(reduction="fixed_point")` takes the reduction as far
+   as it can go: a custom Metal kernel accumulates the terms as int64
+   fixed-point (multiples of 2⁻³⁰), which is **exact** — integer addition
+   never rounds — and therefore *order-independent*, so the result is
+   bit-identical however the data axis is chunked and whether or not the
+   graph is compiled. The float32 tree is neither. It costs nothing
+   measurable, and the only rounding left is the unavoidable one of
+   returning a float32.
+
+   Ship it only if you want that reproducibility, because **it buys no
+   measured end-to-end accuracy on any target bundled here.** Recentring
+   (rule 4) already dropped the reduction below the dominant term, which
+   is the float32 cancellation in the residual `y − m` itself: for a
+   well-fitting model the residual is a small difference of two O(1)
+   numbers, so its relative error is set by the *data* magnitude, not by
+   the residual's. No summation algorithm can reach that, and it is where
+   the remaining error lives.
 6. **Re-anchor — for adaptive densities, not for float32 rounding.**
    `run(..., reanchor_every=N)` recomputes the cached log-probabilities of
    the current states through the float64 CPU path every N iterations. Be
