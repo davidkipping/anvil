@@ -163,7 +163,7 @@ class PrecisionReport:
                        "the sampled posterior is small. Read this as a "
                        "direct proxy for accept/reject distortion: the error "
                        "in the log-density *difference* between two states "
-                       "does NOT cancel — measured 1.2-2.2x the pointwise "
+                       "does NOT cancel — measured 1.6-2.1x the pointwise "
                        "error at proposal-scale displacements.")
         else:
             verdict = ("WARNING: fp32 error reaches the scale of Metropolis "

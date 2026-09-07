@@ -35,10 +35,11 @@ posterior.
    and baselines enter the model as offsets from float64 references
    (`t0 − t0_ref`, `P − P_ref`, `f0 − 1`). Set
    `ParamSpec(report_offset=...)` and the reporting layer reinstates
-   absolute units in float64 on output. After applying rules 1–2, the
-   transit model's median error dropped from ~1.3 to ~0.09
-   log-likelihood units at the posterior typical set (and from ~10 to
-   ~0.4 over a wider parameter ball).
+   absolute units in float64 on output. Measured on the 100k-point
+   transit target at the posterior typical set, rules 1–2 take the
+   median error from **2.3 to 0.0015** log-likelihood units — a factor
+   of ~1500, and the difference between a `WARNING` verdict and an `OK`
+   one.
 3. **Fit the deviation, not the signal-plus-baseline.** Predict `f − 1`
    against baseline-subtracted data so the ordinate is O(depth).
 4. **Reduce with structure.** {class}`anvil.precision.ChunkedGaussianLogLike`
@@ -49,6 +50,19 @@ posterior.
 5. **Re-anchor.** `run(..., reanchor_every=100)` recomputes the cached
    log-probabilities of the current states through the float64 CPU path
    periodically, so rounding drift can never accumulate along the chain.
+
+The same principle applies *inside* the engine, and it is worth knowing
+about because it once dominated everything else. A bounded parameter's
+map used to be evaluated as `lo + (hi − lo)·sigmoid(u)`, whose float32
+error scales with the **box width** rather than with the parameter's own
+magnitude — so a tightly-constrained epoch inside a generous ±0.5-day
+box inherited ~26 ulp of noise, and that single effect contributed
+80–97% of anvil's total float32 error budget. It is now evaluated in
+centre/half-width form, `mid + half·tanh(u/2)` — the identical map, but
+with error relative to the distance from the box centre. Free, and worth
+a factor of 7–56× end to end. The lesson generalizes: **prefer the
+algebraic form whose rounding is relative to the quantity you care
+about.**
 
 ## The instrument
 
@@ -70,7 +84,7 @@ dtype-polymorphic.
 ## What errors remain, and why they are acceptable
 
 For a well-conditioned 10⁵-point chi-squared, the residual float32 error
-is ~0.1–0.5 log-likelihood units at the typical set. Three mitigating
+is ~0.002–0.005 log-likelihood units at the typical set. Three mitigating
 facts: the error in the *difference* between nearby states (what
 accept/reject uses) is smaller than the pointwise error because the error
 field varies smoothly with parameters; decisions with |Δ| ≫ 1 are

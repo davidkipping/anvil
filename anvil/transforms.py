@@ -83,6 +83,18 @@ class Transform:
         self._width32 = mx.array(
             np.where(self._bounded, hi - lo, 1.0).astype(np.float32)
         )
+        # Centre/half-width form of the bounded map. Algebraically
+        # identical to lo + (hi-lo)*sigmoid(u) (since tanh(u/2) = 2*sigmoid(u)-1)
+        # but its float32 error is relative to the parameter's distance from
+        # the box CENTRE rather than absolute in the box WIDTH — the latter
+        # dominated anvil's total float32 error budget for parameters whose
+        # posterior sits well inside a wide box.
+        # finite stand-ins first: (-inf + inf) is nan even when np.where
+        # would discard it
+        _lo_f = np.where(self._bounded, lo, 0.0)
+        _hi_f = np.where(self._bounded, hi, 1.0)
+        self._mid32 = mx.array(((_lo_f + _hi_f) / 2.0).astype(np.float32))
+        self._half32 = mx.array(((_hi_f - _lo_f) / 2.0).astype(np.float32))
         self._loc32 = mx.array(np.array([s.loc for s in specs], dtype=np.float32))
         self._scale32 = mx.array(np.array([s.scale for s in specs], dtype=np.float32))
         for m, arr in (
@@ -99,8 +111,7 @@ class Transform:
 
     def to_model(self, u: mx.array) -> mx.array:
         """(n, dim) unbounded -> (n, dim) model space."""
-        sig = mx.sigmoid(u)
-        bounded = self._lo32 + self._width32 * sig
+        bounded = self._mid32 + self._half32 * mx.tanh(0.5 * u)
         lower = self._lo32 + self._scale32 * mx.exp(u)
         upper = self._hi32 - self._scale32 * mx.exp(-u)
         free = self._loc32 + self._scale32 * u
