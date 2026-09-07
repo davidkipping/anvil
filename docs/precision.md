@@ -121,6 +121,58 @@ likelihood. The float64 path comes for free when you build on
 model code runs in both precisions because MLX ops are
 dtype-polymorphic.
 
+## Certifying (and removing) the residual bias
+
+The float32 log-density is a *deterministic* function of the parameters —
+the same point always gives the same value, independent of batch shape,
+row position, and compilation (all verified). A sampler driven by it is
+therefore not an approximate sampler for your posterior; it is an **exact
+sampler for a slightly tilted one**, `π·exp(err)`. That is a much more
+tractable situation than it sounds, because the bias it puts into any
+posterior mean has a closed form:
+
+```
+E_tilted[f] − E_true[f]  =  Cov(f, err)  + O(err²)
+```
+
+So evaluating `err` on a small random subset of your stored draws both
+*measures* the bias and *removes* it — for a few hundred float64
+evaluations over the entire run, rather than one per iteration:
+
+```python
+cert = anvil.certify(target, results.get_chain(flat=True),
+                     target_ess=1e5, names=transform.names)
+print(cert)                  # per-parameter bias vs Monte Carlo error
+cert.corrected_mean          # bias-corrected posterior means
+cert.correct(any_quantity)   # correct any derived quantity too
+```
+
+The report states the bias in units of the Monte Carlo standard error at
+your target ESS, which is the only comparison that means anything —
+"small" is meaningless without asking *small compared to what*:
+
+```
+  float32 error dispersion (sd) : 0.00543   [mean +0.00022, irrelevant: it cancels]
+  exact-reweighting ESS retained: 0.999971
+  probes used / needed          : 256 / 16
+  bias at ESS = 100,000 (units of MC standard error):
+              q1   +0.195   (+0.000618 posterior sd)
+               r   -0.188   (-0.000595 posterior sd)
+  ACCEPTABLE: bias is 0.20x the Monte Carlo standard error at ESS=100,000
+```
+
+Only the error's *dispersion* matters; a constant offset is absorbed
+entirely by the normalization, which is why the mean is reported but
+flagged as irrelevant. The probe count needs only `n_probe >> err_sd² ×
+ESS` — often a few dozen — and the report tells you if you under-probed.
+
+The same numbers price the exact alternative: `is_retention` is the
+fraction of ESS that full importance reweighting would keep. At these
+error levels it is 0.99997, i.e. reweighting is statistically free — it
+is only the *evaluation* cost (one float64 call per stored draw, ~100×
+more than certifying) that makes the covariance correction the better
+buy.
+
 ## What errors remain, and why they are acceptable
 
 For a well-conditioned 10⁵-point chi-squared, the residual float32 error

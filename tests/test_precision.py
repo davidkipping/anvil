@@ -196,3 +196,56 @@ def test_recentring_is_an_exact_constant_offset():
     bad = mx.array(np.array([[1.9, 0.55]], dtype=np.float32))
     assert (np.abs(np.array(on(bad), dtype=np.float64)).max()
             <= np.abs(np.array(off(bad), dtype=np.float64)).max())
+
+
+def _short_run(n_data=20_000, n_chains=128, seed=0):
+    from anvil import run
+    from anvil.kernels.ensemble import EnsembleKernel
+    tt = make_transit_target(n_data=n_data, seed=seed)
+    u0 = mx.array(
+        (tt.transform.from_model_np(tt.truth_model)
+         + 1e-3 * np.random.default_rng(1).standard_normal((n_chains, 6))
+         ).astype(np.float32))
+    res = run(EnsembleKernel(tt.target, seed=0), tt.target, u0,
+              n_warmup=300, n_samples=60, seed=2)
+    return tt, res
+
+
+def test_certify_reports_and_corrects():
+    from anvil import certify
+    tt, res = _short_run()
+    draws = res.get_chain(flat=True)
+    cert = certify(tt.target, draws, n_probe=64, target_ess=1e4,
+                   names=tt.transform.names)
+
+    assert cert.n_probe == 64 and cert.n_draws == draws.shape[0]
+    assert cert.err_sd > 0 and np.isfinite(cert.err_sd)
+    assert 0.0 < cert.is_retention <= 1.0
+    assert cert.bias_std.shape == (6,)
+    assert "ESS" in cert.verdict and str(cert)
+
+    # the correction is exactly mean - Cov(f, err), and tiny here
+    shift = np.abs(cert.corrected_mean - cert.raw_mean)
+    assert np.all(shift < 0.5 * draws.std(axis=0))
+
+    # correct() on the draws themselves must reproduce corrected_mean
+    np.testing.assert_allclose(cert.correct(draws), cert.corrected_mean,
+                               rtol=1e-10, atol=1e-14)
+    # and it must work for a derived quantity of a different width
+    phys = tt.transform.model_np(draws.astype(np.float64))
+    assert cert.correct(phys).shape == (6,)
+    assert np.isfinite(cert.correct(phys)).all()
+
+
+def test_certify_requires_float64_path_and_valid_shapes():
+    from anvil import certify
+    from anvil.targets import correlated_gaussian
+    tgt, mu, _ = correlated_gaussian(3, seed=0)
+    with pytest.raises(ValueError, match="log_prob_hi"):
+        certify(tgt, np.zeros((10, 3)))
+    tt, res = _short_run()
+    with pytest.raises(ValueError, match="n_draws, dim"):
+        certify(tt.target, np.zeros(10))
+    cert = certify(tt.target, res.get_chain(flat=True), n_probe=32)
+    with pytest.raises(ValueError, match="same sample"):
+        cert.correct(np.zeros(7))

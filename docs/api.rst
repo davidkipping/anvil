@@ -39,7 +39,7 @@ Precision
 
 .. automodule:: anvil.precision
    :members: PrecisionPolicy, chunked_sum, ChunkedGaussianLogLike,
-             PrecisionReport, validate_precision
+             PrecisionReport, validate_precision, Certificate, certify
 
 Diagnostics
 -----------

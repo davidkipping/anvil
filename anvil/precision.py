@@ -229,3 +229,166 @@ def validate_precision(target, u: mx.array) -> PrecisionReport:
         max_abs_err=float(err.max()),
         median_logl_magnitude=float(np.median(np.abs(lp64))),
     )
+
+
+@dataclass
+class Certificate:
+    """Bias certificate and correction from :func:`certify`.
+
+    All bias figures are in units of the parameter's own posterior
+    standard deviation, so they compare directly against the Monte Carlo
+    standard error 1/sqrt(ESS).
+    """
+
+    n_probe: int
+    n_probe_needed: float    # >~ err_sd^2 * target_ess for the correction
+    n_draws: int
+    err_mean: float          # irrelevant to inference; reported for context
+    err_sd: float            # the dispersion — this is what biases things
+    chi2: float              # Var(err): importance-weight variance
+    is_retention: float      # exp(-chi2): ESS kept by exact reweighting
+    bias_std: np.ndarray     # (dim,) standardized bias per parameter
+    max_bias_std: float
+    target_ess: float
+    ess_ceiling: float       # worst-case ESS certified by err_sd alone
+    raw_mean: np.ndarray
+    corrected_mean: np.ndarray
+    probe_index: np.ndarray
+    probe_err: np.ndarray
+    names: list[str] | None
+    verdict: str
+
+    def correct(self, values: np.ndarray) -> np.ndarray:
+        """Bias-correct the mean of any quantity evaluated on the draws.
+
+        ``values`` has shape (n_draws,) or (n_draws, k), aligned with the
+        ``draws`` passed to :func:`certify`. Returns the corrected mean(s):
+        ``mean(f) - Cov(f, err)``, exact to O(err^2).
+        """
+        v = np.asarray(values, dtype=np.float64)
+        flat = v.reshape(v.shape[0], -1)
+        if flat.shape[0] != self.n_draws:
+            raise ValueError(
+                f"values has {flat.shape[0]} rows but certify() was given "
+                f"{self.n_draws} draws; they must be the same sample"
+            )
+        probe = flat[self.probe_index]
+        de = self.probe_err - self.probe_err.mean()
+        cov = (probe - probe.mean(axis=0)).T @ de / len(de)
+        out = flat.mean(axis=0) - cov
+        return out.reshape(v.shape[1:]) if v.ndim > 1 else out[0]
+
+    def __str__(self) -> str:
+        lines = [
+            f"Certificate from {self.n_probe} probe evaluations "
+            f"of {self.n_draws} draws",
+            f"  float32 error dispersion (sd) : {self.err_sd:.4g}"
+            f"   [mean {self.err_mean:+.4g}, irrelevant: it cancels]",
+            f"  exact-reweighting ESS retained: {self.is_retention:.6f}",
+            f"  worst-case certified ESS      : {self.ess_ceiling:,.0f}",
+            f"  probes used / needed          : {self.n_probe} / "
+            f"{max(16.0, self.n_probe_needed):.0f}",
+            f"  bias at ESS = {self.target_ess:,.0f} (units of MC standard error):",
+        ]
+        order = np.argsort(-np.abs(self.bias_std))
+        names = self.names or [f"p{i}" for i in range(len(self.bias_std))]
+        for i in order[:8]:
+            rel = self.bias_std[i] * np.sqrt(self.target_ess)
+            lines.append(f"    {names[i]:>12s} {rel:+8.3f}"
+                         f"   ({self.bias_std[i]:+.3g} posterior sd)")
+        lines.append(f"  {self.verdict}")
+        return "\n".join(lines)
+
+
+def certify(
+    target,
+    draws,
+    *,
+    n_probe: int = 256,
+    target_ess: float = 1e4,
+    seed: int = 0,
+    names: list[str] | None = None,
+) -> Certificate:
+    """Quantify — and correct — the posterior bias caused by float32.
+
+    Because the float32 log-density is a *deterministic* function of the
+    parameters, the sampler is exactly stationary for a slightly tilted
+    target ``pi * exp(err)``. The resulting bias in any posterior mean is
+    ``Cov(f, err)`` to first order, so evaluating ``err`` on a small
+    random subset of the stored draws both measures the bias and removes
+    it — at a cost of ``n_probe`` float64 evaluations for the whole run,
+    rather than one per iteration.
+
+    ``draws``: (n_draws, dim) posterior draws in *sampling* (u) space,
+    e.g. ``results.get_chain(flat=True)``. Requires ``target.log_prob_hi``.
+
+    Pick ``n_probe`` >> err_sd^2 * target_ess (the returned ``err_sd``
+    lets you check afterwards); the default 256 is generous for the
+    error levels a well-conditioned model produces.
+    """
+    if not hasattr(target, "log_prob_hi"):
+        raise ValueError(
+            "certify() needs a float64 path (target.log_prob_hi); pass "
+            "model_log_prob_hi= to TransformedLogDensity"
+        )
+    d = np.asarray(draws, dtype=np.float64)
+    if d.ndim != 2:
+        raise ValueError(f"draws must be (n_draws, dim); got {d.shape}")
+    n_draws, dim = d.shape
+    n_probe = int(min(n_probe, n_draws))
+    idx = np.random.default_rng(seed).choice(n_draws, n_probe, replace=False)
+    idx.sort()
+
+    probe = mx.array(d[idx].astype(np.float32))
+    lp32 = np.array(target.log_prob(probe), dtype=np.float64)
+    lp64 = np.array(target.log_prob_hi(probe), dtype=np.float64)
+    err = lp32 - lp64
+
+    de = err - err.mean()
+    dp = d[idx] - d[idx].mean(axis=0)
+    bias = dp.T @ de / n_probe                   # Cov(u_j, err)
+    sd = d.std(axis=0)
+    bias_std = np.divide(bias, sd, out=np.zeros_like(bias), where=sd > 0)
+
+    err_sd = float(err.std())
+    chi2 = err_sd**2
+    max_b = float(np.abs(bias_std).max()) if dim else 0.0
+    rel = max_b * np.sqrt(target_ess)
+
+    # the correction's own noise is sd*err_sd/sqrt(n_probe) versus the MC
+    # error sd/sqrt(target_ess): negligible once n_probe >> err_sd^2*ess
+    needed = 10.0 * chi2 * target_ess
+    short = n_probe < max(16.0, needed)
+
+    if max_b >= 0.1 or err_sd >= 0.5:
+        verdict = ("WARNING: float32 bias is large in absolute terms "
+                   "(>=0.1 posterior sd, or error dispersion >=0.5 nats) — "
+                   "fix the model's conditioning; a correction cannot be "
+                   "trusted this far out")
+    elif rel < 0.1:
+        verdict = (f"OK: bias is {rel:.3f}x the Monte Carlo standard error "
+                   f"at ESS={target_ess:,.0f} — negligible")
+    elif rel < 1.0:
+        verdict = (f"ACCEPTABLE: bias is {rel:.2f}x the Monte Carlo standard "
+                   f"error at ESS={target_ess:,.0f} — below the error bar, "
+                   "and corrected_mean removes it")
+    else:
+        verdict = (f"WARNING: bias is {rel:.1f}x the Monte Carlo standard "
+                   f"error at ESS={target_ess:,.0f} — report corrected_mean, "
+                   "or improve conditioning")
+
+    if short:
+        verdict = (f"UNDER-PROBED: n_probe={n_probe} is too few to resolve "
+                   f"the bias at ESS={target_ess:,.0f} (need >~{needed:.0f}). "
+                   "Re-run certify with a larger n_probe. " + verdict)
+
+    return Certificate(
+        n_probe=n_probe, n_probe_needed=float(needed), n_draws=n_draws,
+        err_mean=float(err.mean()), err_sd=err_sd, chi2=chi2,
+        is_retention=float(np.exp(-chi2)),
+        bias_std=bias_std, max_bias_std=max_b,
+        target_ess=float(target_ess),
+        ess_ceiling=float(1.0 / chi2) if chi2 > 0 else float("inf"),
+        raw_mean=d.mean(axis=0), corrected_mean=d.mean(axis=0) - bias,
+        probe_index=idx, probe_err=err, names=names, verdict=verdict,
+    )
