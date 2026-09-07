@@ -81,9 +81,12 @@ Metal GPUs have no float64. Sampling correctness in float32 is a
      |fp32 - fp64| max        : 0.0079
      OK: fp32 error is far below the ~1-unit scale of Metropolis ...
    ```
-5. **Re-anchor.** `run(..., reanchor_every=100)` recomputes the cached
-   log-probabilities through the float64 path periodically, so rounding
-   drift can never accumulate in the chain.
+5. **Re-anchor only when the density can go stale.**
+   `run(..., reanchor_every=N)` refreshes cached log-probabilities through
+   the float64 path. Float32 rounding does *not* drift (cached values are
+   fresh evaluations of a deterministic function), so this is insurance
+   for adaptive/surrogate densities, not for rounding — and it is
+   expensive. Default off.
 
 ## Performance
 

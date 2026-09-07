@@ -61,8 +61,13 @@ def run(
 
     ``reanchor_every`` > 0 recomputes the cached log_prob of the current
     states through the target's float64 path every that many iterations
-    (requires ``target.log_prob_hi``), so fp32 rounding drift cannot
-    accumulate in the chain's accept/reject bookkeeping.
+    (requires ``target.log_prob_hi``). Note this is insurance for
+    log-densities that can go *stale* — a surrogate retrained mid-run, or
+    any non-deterministic evaluation — NOT a remedy for float32 rounding:
+    cached values are always fresh evaluations of a deterministic
+    function, so rounding cannot accumulate, and re-anchoring does not
+    change the distribution being sampled. It is expensive (the float64
+    path can cost ~1000x the float32 one); default off.
 
     ``archive`` (a :class:`~anvil.surrogate.TrainingArchive`) records
     every stored (u, log_prob) frame as future emulator training data —

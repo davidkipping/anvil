@@ -42,14 +42,35 @@ posterior.
    one.
 3. **Fit the deviation, not the signal-plus-baseline.** Predict `f − 1`
    against baseline-subtracted data so the ordinate is O(depth).
-4. **Reduce with structure.** {class}`anvil.precision.ChunkedGaussianLogLike`
-   sums per-datum terms chunk-wise (tree error O(ε√n) instead of O(εn));
-   the `fp64_anchor` policy additionally performs the cross-chunk sum in
-   float64 on the CPU stream *inside the same lazy graph*, for a measured
-   0–20% cost.
-5. **Re-anchor.** `run(..., reanchor_every=100)` recomputes the cached
-   log-probabilities of the current states through the float64 CPU path
-   periodically, so rounding drift can never accumulate along the chain.
+4. **Reduce with structure — but know its ceiling.**
+   {class}`anvil.precision.ChunkedGaussianLogLike` sums per-datum terms
+   chunk-wise (tree error O(ε√n) instead of O(εn)). The `fp64_anchor`
+   policy additionally performs the cross-chunk sum in float64 on the CPU
+   stream *inside the same lazy graph*, for a measured 0–20% cost — but
+   read the fine print: **it only does anything when there are many
+   chunks.** At the default `chunk_size=65536` over 10⁵ points there are
+   two chunks, and the exact sum of two float32 values rounds identically
+   whether added in float32 or in float64 — the two policies are then
+   *bit-identical* (verified). Shrinking to `chunk_size=1024` makes it
+   real but buys only ~6% of the error dispersion. Measured error
+   contributions on the transit targets: the summation accounts for only
+   2–40% of the total, the rest being per-datum model arithmetic and
+   parameter representation. Reduction tricks are the smallest lever
+   here; conditioning (rules 1–3) is the large one.
+5. **Re-anchor — for adaptive densities, not for float32 rounding.**
+   `run(..., reanchor_every=N)` recomputes the cached log-probabilities of
+   the current states through the float64 CPU path every N iterations. Be
+   clear about what this does and does not buy. anvil never *accumulates*
+   a cached log-probability — every stored value is a fresh evaluation of
+   a function that is bitwise deterministic and invariant to batch shape,
+   position and compilation (verified) — so there is no drift mechanism
+   for float32 rounding to exploit, and re-anchoring does not change the
+   distribution the chain samples. It is genuine insurance where the
+   log-density really can go stale: a surrogate/emulator that is retrained
+   mid-run (see {mod}`anvil.surrogate`), or any non-deterministic
+   evaluation. For a deterministic float32 likelihood it is expensive
+   (a float64 pass can cost 1000× a float32 one for a GPU-kernel model)
+   and unnecessary; the default is off.
 
 The same principle applies *inside* the engine, and it is worth knowing
 about because it once dominated everything else. A bounded parameter's
