@@ -73,6 +73,10 @@ def _rank_normalize(x: np.ndarray) -> np.ndarray:
     return norm_ppf(p).reshape(x.shape)
 
 
+#: rows above which mx.argsort(axis=0) no longer returns a permutation
+_MX_SORT_LIMIT = 2 ** 21
+
+
 def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
     """Rank-normalize every parameter at once.
 
@@ -87,6 +91,12 @@ def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
     chain: (N, M, dim) -> (N, M, dim) normal scores.
     """
     n, m, dim = chain.shape
+    if n * m > _MX_SORT_LIMIT:
+        # MLX's argsort along axis 0 stops returning a valid permutation
+        # above 2**21 rows (verified: exact at 2**21, broken at 2**21 + 1),
+        # which would silently corrupt every rank. Fall back to numpy.
+        return np.stack([_rank_normalize(chain[..., d].astype(np.float64))
+                         for d in range(dim)], axis=-1)
     flat = mx.array(np.ascontiguousarray(
         chain.reshape(n * m, dim), dtype=np.float32))
     order = mx.argsort(flat, axis=0)

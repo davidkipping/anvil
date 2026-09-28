@@ -99,3 +99,24 @@ def test_autocov_batches_over_parameters():
     for d in range(3):
         np.testing.assert_allclose(batched[..., d], _autocov(x[..., d]),
                                    rtol=1e-10, atol=1e-12)
+
+
+def test_diagnostics_correct_above_the_mlx_sort_limit():
+    """Regression: MLX's argsort(axis=0) stops returning a valid
+    permutation above 2**21 rows, which silently corrupted every rank and
+    surfaced as NaN ESS on long runs. Above the limit we must fall back to
+    numpy and still be right."""
+    import anvil.diagnostics as D
+    rng = np.random.default_rng(5)
+    n, m, dim = 9000, 256, 3           # n*m = 2,304,000 > 2**21
+    assert n * m > D._MX_SORT_LIMIT
+    chain = rng.normal(size=(n, m, dim))
+    d = D.diagnose(chain)
+    assert np.all(np.isfinite(d.rhat)) and np.all(np.isfinite(d.ess_bulk))
+    assert np.all(d.rhat < 1.01)                     # iid data
+    assert np.all(d.ess_bulk > 0.3 * n * m)
+
+    # and the normal scores are a proper rank normalization
+    z = D._rank_normalize_all(chain)
+    assert np.all(np.isfinite(z))
+    assert abs(z.mean()) < 0.01 and abs(z.std() - 1.0) < 0.01
