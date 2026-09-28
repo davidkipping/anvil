@@ -51,11 +51,15 @@ and nothing else, is its advantage here.
 The natural fix is a dense (full-covariance) mass matrix, and on
 correlated posteriors it works exactly as theory predicts — measured on
 a correlated Gaussian, L collapses from 36 to 1 and ESS per gradient
-improves **40×**. It does *not* rescue the transit problem, because that
-posterior is not merely correlated but **curved**: whiten it by its own
-covariance and one parameter still has skew 1.9 and excess kurtosis 7.8.
-No single global mass matrix can linearize a banana, so L stays put and
-the gain is only ~1.6×.
+improves **40×**. Whether it rescues a *transit* posterior depends on the system. For the
+hot Jupiter in `examples/metalplanet_hotjupiter.py` it does: that
+posterior is correlated but essentially uncurved (max whitened skew
+0.07), and dense takes it from 38 leapfrog steps per draw to 3, a
+measured 6.8× in ESS/s. For a longer-baseline warm Jupiter it does not:
+there the scaled semi-major axis keeps skew 2.2 and excess kurtosis 13.6
+after whitening, so the posterior is **curved** rather than merely
+correlated, no global mass matrix can linearize it, L stays at 30 and the
+gain falls to 1.85×.
 
 **The practical rule.** Use {func}`anvil.whitened_shape` on a pilot
 sample. It whitens by the sample covariance — removing exactly the linear
@@ -92,7 +96,12 @@ Measured gains, ESS per gradient evaluation:
 |---|---:|---:|
 | correlated Gaussian, ρ = 0.9 | 11 → 3 | 5× |
 | correlated Gaussian, ρ = 0.99 | 36 → 1 | 40× |
-| transit (curved) | 30 → 30 | 1.6× |
+| hot-Jupiter transit, uncurved (max \|skew\| 0.07) | 38 → 3 | **6.8×** |
+| warm-Jupiter transit, curved (\|skew\| 2.2) | 30 → 30 | 1.85× |
+
+The last two rows are both transit fits, and the difference between them
+is entirely curvature — which is why it is worth measuring rather than
+guessing.
 
 Two guards fire automatically. With fewer than `4 × dim` chains the
 cross-chain covariance is mostly noise, so the kernel warns and falls back

@@ -18,10 +18,10 @@ import time
 import mlx.core as mx
 import numpy as np
 
+import anvil
 from anvil import run
-from anvil.diagnostics import ess_bulk, split_rhat
 from anvil.kernels.chees import ChEESHMC
-from anvil.kernels.ensemble import EnsembleKernel, StretchMove
+from anvil.kernels.ensemble import DEMove, EnsembleKernel, StretchMove
 from anvil.targets import make_transit_target
 from anvil.targets.builtin import epoch_center_times
 
@@ -67,16 +67,19 @@ def bench_anvil(tt, kernel_name, n_chains, n_warmup, n_samples, thin=1):
         (u_truth + 1e-3 * rng.standard_normal((n_chains, 6))).astype(np.float32)
     )
     if kernel_name == "chees":
-        kernel = ChEESHMC(tt.target, max_leapfrog=128)
+        kernel = ChEESHMC(tt.target, max_leapfrog=128, dense=True)
     else:
-        kernel = EnsembleKernel(tt.target, moves=[(StretchMove(), 1.0)], seed=0)
+        # 50/50 stretch + DE roughly halves the autocorrelation of stretch
+        # alone on this target
+        kernel = EnsembleKernel(
+            tt.target, moves=[(StretchMove(), 0.5), (DEMove(), 0.5)], seed=0)
     t0 = time.perf_counter()
     res = run(kernel, tt.target, u0, n_warmup=n_warmup, n_samples=n_samples,
               thin=thin, seed=1)
     wall = time.perf_counter() - t0
     chain = res.get_chain()
-    ess = ess_bulk(chain)
-    rhat = split_rhat(chain)
+    diag = anvil.diagnose(chain)
+    ess, rhat = diag.ess_bulk, diag.rhat
     return {
         "label": f"anvil-{kernel_name} (GPU, {n_chains} chains)",
         "wall_s": wall,
@@ -107,8 +110,8 @@ def bench_emcee(tt, n_walkers, n_steps, n_burn):
     sampler.run_mcmc(p0, n_steps, progress=False)
     wall = time.perf_counter() - t0
     chain = sampler.get_chain(discard=n_burn)
-    ess = ess_bulk(chain)
-    rhat = split_rhat(chain)
+    diag = anvil.diagnose(chain)
+    ess, rhat = diag.ess_bulk, diag.rhat
     return {
         "label": f"emcee (CPU fp64 numpy, {n_walkers} walkers)",
         "wall_s": wall,
@@ -128,14 +131,18 @@ def main():
     print(f"transit benchmark: {N_DATA} data points, 6 parameters\n")
 
     results = []
+    # Configurations are chosen so every row CONVERGES (R-hat < 1.01).
+    # The ensemble decorrelates in ~10^2 iterations, so it needs long
+    # chains and few walkers; ChEES decorrelates in ~1 and needs the
+    # opposite. Comparing an unconverged run's ESS/s is meaningless.
     if args.quick:
-        results.append(bench_anvil(tt, "chees", 1024, 300, 150))
-        results.append(bench_anvil(tt, "stretch", 1024, 1000, 400))
-        results.append(bench_emcee(tt, 64, 1000, 500))
+        results.append(bench_anvil(tt, "chees", 512, 300, 200))
+        results.append(bench_anvil(tt, "ensemble", 128, 500, 8000))
+        results.append(bench_emcee(tt, 64, 2000, 1000))
     else:
-        results.append(bench_anvil(tt, "chees", 1024, 400, 200))
-        results.append(bench_anvil(tt, "stretch", 2048, 3000, 1000, thin=2))
-        results.append(bench_emcee(tt, 64, 4000, 2000))
+        results.append(bench_anvil(tt, "chees", 512, 400, 300))
+        results.append(bench_anvil(tt, "ensemble", 128, 500, 30000))
+        results.append(bench_emcee(tt, 64, 12000, 6000))
 
     print(f"{'sampler':>44s} {'wall[s]':>8s} {'minESS':>9s} "
           f"{'rhat':>7s} {'ESS/s':>9s}")

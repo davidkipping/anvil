@@ -95,19 +95,23 @@ curve on an M2 Max (30-core GPU); metric is minimum bulk ESS per second of
 total wall time (warmup included) versus emcee running vectorized float64
 numpy. See `benchmarks/bench_transit.py`.
 
-| sampler | wall [s] | min ESS | max R-hat | ESS/s | vs emcee |
-|---|---:|---:|---:|---:|---:|
-| ChEES-HMC (GPU, 1024 chains) | 803 | 80,313 | 1.009 | 100 | 49× |
-| stretch (GPU, 2048 walkers) | 80 | 48,952 | 1.033 | 612 | 302× |
-| emcee (CPU, 64 walkers) | 596 | 1,207 | 1.041 | 2.0 | — |
+<!-- BENCH_TABLE -->
 
-All runs converged (zero ChEES divergences). Honest caveats: sustained
-GPU throughput swings ~2× with thermal state, and emcee's own ESS/s
-varied 2–10 across repeats on the same machine — against emcee's *best*
-measurement the conservative claims are **≥60× (stretch)** and **≥10×
-(ChEES-HMC)**. The trapezoid model's kinks and plateaus are near ChEES's
-worst case; on smooth targets it reaches ~60% ESS per draw (see
-`tests/test_chees.py`) and the ranking flips.
+Every configuration is chosen so that it **converges** (R-hat < 1.01) —
+comparing the ESS/s of an unconverged run is meaningless. The two
+samplers want opposite settings to get there: the ensemble decorrelates
+in ~10² iterations so it needs long chains and few walkers, while
+ChEES-HMC decorrelates in ~1 and wants the opposite.
+
+Honest caveats: sustained GPU throughput swings ~2× with thermal state,
+and emcee's own ESS/s varies several-fold across repeats on the same
+machine, so treat the ratios as order-of-magnitude. The trapezoid model's
+kinks and plateaus are near ChEES's worst case; on smooth targets it
+reaches ~60% ESS per draw (see `tests/test_chees.py`).
+
+For a science-grade worked example on a real transit model, including a
+converged head-to-head and a curvature read-out explaining the result,
+run `examples/metalplanet_hotjupiter.py`.
 
 Rules of thumb from profiling:
 
