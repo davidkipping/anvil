@@ -170,6 +170,39 @@ near ChEES-HMC's worst case; on smooth models the ranking flips — and
 see the correlation/curvature discussion above for *why* the
 gradient-free move competes at all here.
 
+## Pipelining the sampling loop
+
+Every sampling iteration normally ends in a blocking `mx.eval`, which is a
+GPU round-trip with a ~167 µs floor *regardless of how much work it waits
+on*. When a target's per-iteration GPU work is comparable to that floor,
+the barrier — not the likelihood — is what you are paying for.
+
+`run(..., pipeline=N)` keeps `N` iterations in flight and copies stored
+frames out `N` steps behind, by which time they have landed. Measured at
+512–1024 chains, median of interleaved repeats:
+
+| GPU work / iteration | speedup at depth 2 |
+|---|---:|
+| ~200–300 µs (analytic posteriors, small-N fits) | **1.9–2.5×** |
+| ~1.7 ms | 1.0× |
+| ~8 ms (100k-point transit) | 1.0× |
+
+Depth 2 is the sweet spot; depth 1 captures about half of it and depth 4
+adds nothing. Peak memory was identical at every depth on the targets
+measured. The default `pipeline="auto"` times the first few iterations and
+enables it only where it pays, reporting the decision when `progress` is
+on; pass an integer to override.
+
+**Results are bit-identical at any depth** — pipelining changes when
+arrays are evaluated, never what is computed, and `tests/test_engine.py`
+asserts exact equality across all three kernels rather than checking it
+statistically.
+
+This applies to the sampling phase only. Warmup keeps its barrier because
+adaptation reads freshly-computed parameters back on the host each
+iteration, so pipelining it would mean adapting from stale ones — a
+change in what the sampler does, not just when.
+
 ## Diagnostics cost
 
 {func}`anvil.diagnose` returns R-hat and bulk ESS from one shared pass;
