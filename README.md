@@ -14,8 +14,10 @@ operations live inside the same lazy graph as float32 GPU work.
 
 - **ChEES-HMC** (flagship) — Hamiltonian Monte Carlo with cross-chain
   adaptation of step size (dual averaging on the harmonic-mean acceptance),
-  trajectory length (the ChEES criterion), and a diagonal preconditioner
-  (Hoffman & Sountsov, AISTATS 2021). No per-chain control flow anywhere:
+  trajectory length (the ChEES criterion), and a preconditioner —
+  diagonal by default, or the full cross-chain covariance with
+  `dense=True` (Hoffman & Sountsov, AISTATS 2021). No per-chain control
+  flow anywhere:
   the trajectory jitter is a shared per-iteration Halton scalar, so
   thousands of chains advance in lockstep. Requires an MLX-differentiable
   log density. On smooth targets it reaches ~60% ESS per draw.
@@ -65,10 +67,13 @@ Metal GPUs have no float64. Sampling correctness in float32 is a
    `anvil/targets/builtin.py` for a worked transit example — the
    naive absolute-parameter model loses ~10 units of log-likelihood to
    float32 rounding; the offset model loses ~0.2.
-3. **Reduce with structure.** `ChunkedGaussianLogLike` sums per-datum
-   terms chunk-wise (tree error O(ε√n)); the optional `fp64_anchor`
-   policy does the cross-chunk sum in float64 on the CPU stream for
-   little cost (~0–20%).
+3. **Recentre, then reduce with structure.** A chi-squared over N points
+   sums to ≈ −N/2, so anvil sums `0.5·(1 − r²)` and keeps the exact −N/2
+   as a float64 host constant: the float32 quantity is then O(√(N/2))
+   rather than O(N/2), and the ulp of every stored log-probability falls
+   ~128×. `ChunkedGaussianLogLike` then sums chunk-wise (tree error
+   O(ε√n)). Reduction tricks are the *small* lever here — conditioning is
+   the large one; see the precision guide for the measured breakdown.
 4. **Verify, don't hope.** `anvil.validate_precision(target, u)`
    compares the production float32 path against a float64 CPU path and
    reports the error against the ~1-unit scale of Metropolis accept
@@ -131,7 +136,19 @@ Rules of thumb from profiling:
   stretch move is the safer pick for kinky or plateau-ridden posteriors
   (transit ingress/egress edges, box-like models).
 
-## Diagnostics
+## Diagnostics and after-the-fact checks
+
+`anvil.diagnose(chain)` returns R-hat and bulk ESS from a single shared
+pass (rank normalization is ~85% of the work, so don't compute it twice).
+Alongside it:
+
+| call | question it answers |
+|---|---|
+| `anvil.diagnose` | did it converge, and how many effective samples? |
+| `anvil.warmup_report` | was warmup long enough — or far longer than needed? |
+| `anvil.whitened_shape` | is the posterior merely correlated, or curved? (predicts whether `dense=True` will pay) |
+| `anvil.validate_precision` | is the float32 likelihood accurate enough to trust? |
+| `anvil.certify` | how much did float32 bias the posterior, and what is it corrected? |
 
 `anvil.diagnostics` implements split rank-normalized R-hat, bulk ESS
 (Geyer-truncated, FFT), and **nested R-hat** (Margossian et al. 2022) for
