@@ -95,13 +95,20 @@ curve on an M2 Max (30-core GPU); metric is minimum bulk ESS per second of
 total wall time (warmup included) versus emcee running vectorized float64
 numpy. See `benchmarks/bench_transit.py`.
 
-<!-- BENCH_TABLE -->
+| sampler | wall [s] | min ESS | max R-hat | ESS/s | vs emcee |
+|---|---:|---:|---:|---:|---:|
+| ensemble, stretch+DE (GPU, 128 walkers) | 36 | 123,917 | 1.001 | 3,469 | **215×** |
+| ChEES-HMC, dense mass (GPU, 512 chains) | 75 | 90,156 | 1.003 | 1,203 | **75×** |
+| emcee (CPU fp64 numpy, 64 walkers) | 336 | 5,427 | 1.014 | 16 | — |
 
-Every configuration is chosen so that it **converges** (R-hat < 1.01) —
-comparing the ESS/s of an unconverged run is meaningless. The two
-samplers want opposite settings to get there: the ensemble decorrelates
-in ~10² iterations so it needs long chains and few walkers, while
-ChEES-HMC decorrelates in ~1 and wants the opposite.
+Both anvil rows are **converged** (R-hat ≤ 1.003) because comparing the
+ESS/s of an unconverged run is meaningless. The two samplers need
+opposite settings to get there: the ensemble decorrelates in ~10²
+iterations so it wants long chains and few walkers, while ChEES-HMC
+decorrelates in ~1 and wants the reverse. The emcee row is given 12,000
+iterations and still sits at R-hat 1.014 — slightly short of the same
+bar, and left that way because closing it costs another several minutes
+of CPU and would only widen the gap.
 
 Honest caveats: sustained GPU throughput swings ~2× with thermal state,
 and emcee's own ESS/s varies several-fold across repeats on the same
