@@ -387,3 +387,138 @@ def whitened_shape(draws: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     L = np.linalg.cholesky(cov + 1e-12 * np.eye(cov.shape[0]) * np.trace(cov))
     z = xc @ np.linalg.inv(L).T
     return (z ** 3).mean(axis=0), (z ** 4).mean(axis=0) - 3.0
+
+
+@dataclass
+class WarmupReport:
+    """Verdict on whether a run's warmup was long enough. See
+    :func:`warmup_report`."""
+
+    verdict: str
+    settled_at: int | None      # iteration the spread stopped drifting
+    n_warmup: int
+    n_chains: int
+    final_accept: float
+    noise_floor: float          # relative sd of the spread estimate itself
+    suggestion: str
+
+    def __str__(self) -> str:
+        at = "never" if self.settled_at is None else f"iteration {self.settled_at}"
+        return (
+            f"WarmupReport over {self.n_warmup} warmup iterations\n"
+            f"  cross-chain spread settled : {at}\n"
+            f"  final mean acceptance      : {self.final_accept:.3f}\n"
+            f"  spread-estimate noise floor: {self.noise_floor:.1%} "
+            f"({self.n_chains} chains)\n"
+            f"  {self.verdict}: {self.suggestion}"
+        )
+
+
+def warmup_report(results, settle_tol: float = 0.05) -> WarmupReport:
+    """Judge, after the fact, whether warmup was long enough.
+
+    Warmup is pure overhead — it produces no samples — but cutting it too
+    far biases everything downstream, so the useful thing is a measurement
+    rather than a guess. This reads the cheap trace ``run()`` records and
+    asks when the cross-chain spread stopped drifting.
+
+    Two traps it is built to avoid:
+
+    * **Noise masquerading as drift.** The cross-chain standard deviation
+      is itself estimated from ``n_chains`` samples, with relative error
+      ~1/sqrt(2(n_chains-1)) — 6% at 128 chains. Demanding tighter
+      agreement than that never succeeds. The tolerance used is
+      ``max(settle_tol, 3 x noise_floor)``.
+    * **A stuck chain looking converged.** A chain that has stopped moving
+      has a perfectly stable spread — and for HMC it also has acceptance
+      near *one*, not near zero, because arbitrarily small steps are
+      trivially accepted. The test that actually works is whether the
+      spread ever changed at all: if it never moved off its initial value,
+      the run is reported as inconclusive rather than converged.
+
+    ``results``: a :class:`~anvil.engine.Results` from a run with
+    ``warmup_probes > 0`` (the default).
+    """
+    tr = getattr(results, "warmup_trace", None)
+    if not tr:
+        raise ValueError(
+            "no warmup trace on this result; run() needs warmup_probes > 0 "
+            "and n_warmup > 0"
+        )
+    it, sd = tr["iter"], tr["sd"]
+    # the requested warmup length, not merely the last probe (probes land
+    # on multiples of the probe interval, so they usually stop just short)
+    n_warm = int(getattr(results, "n_warmup", 0) or it[-1])
+    n_chains = results.n_chains
+    accept = float(tr["accept"][-1])
+    eps = tr["step_size"]
+    noise = 1.0 / np.sqrt(2.0 * max(n_chains - 1, 1))
+    tol = max(settle_tol, 3.0 * noise)
+
+    # reference: the last third of probes, which is the best estimate of
+    # the stationary spread available from this run
+    ref = np.median(sd[max(1, 2 * len(sd) // 3):], axis=0)
+    ref = np.where(ref > 0, ref, 1.0)
+    within = np.all(np.abs(sd / ref - 1.0) <= tol, axis=1)
+    settled = None
+    for k in range(len(within)):
+        if within[k:].all():
+            settled = int(it[k])
+            break
+
+    # Stuck-chain guards, checked before any "converged" verdict.
+    # The decisive signal is that the spread never moved off its starting
+    # value: a chain that is not exploring has a perfectly stable spread,
+    # and for HMC its acceptance is near 1 (tiny steps are always
+    # accepted), so acceptance alone would point the wrong way.
+    drift = float(np.abs(sd[-1] / np.where(sd[0] > 0, sd[0], 1.0) - 1.0).max())
+    tiny_eps = np.isfinite(eps).any() and float(eps[-1]) < 1e-4
+    if drift <= tol:
+        return WarmupReport(
+            verdict="INCONCLUSIVE", settled_at=settled, n_warmup=n_warm,
+            n_chains=n_chains, final_accept=accept, noise_floor=noise,
+            suggestion=(
+                f"the cross-chain spread never changed (by {drift:.1%} over "
+                "the whole of warmup), so this cannot distinguish chains that "
+                "began at the stationary distribution from chains that never "
+                f"moved. Acceptance is {accept:.3f}"
+                + (f" and the step size ended at {float(eps[-1]):.2g}, which is "
+                   "small enough to suggest the latter" if tiny_eps else "")
+                + ". Compare the spread against an independent estimate of the "
+                "posterior width before trusting this run"
+            ),
+        )
+    if accept < 0.01:
+        return WarmupReport(
+            verdict="FAILED", settled_at=settled, n_warmup=n_warm,
+            n_chains=n_chains, final_accept=accept, noise_floor=noise,
+            suggestion=(f"acceptance collapsed to {accept:.3g}; the chains are "
+                        "barely moving, so warmup length is not the problem — "
+                        "check the initialization and the model"),
+        )
+
+    if settled is None:
+        return WarmupReport(
+            verdict="TOO SHORT", settled_at=None, n_warmup=n_warm,
+            n_chains=n_chains, final_accept=accept, noise_floor=noise,
+            suggestion=("the cross-chain spread was still drifting at the end "
+                        f"of warmup; try at least {2 * n_warm} iterations and "
+                        "re-check"),
+        )
+
+    if settled <= n_warm // 2:
+        return WarmupReport(
+            verdict="LONGER THAN NEEDED", settled_at=settled, n_warmup=n_warm,
+            n_chains=n_chains, final_accept=accept, noise_floor=noise,
+            suggestion=(f"the spread settled by iteration {settled}; roughly "
+                        f"{min(n_warm, 2 * settled)} warmup iterations would "
+                        "do for this problem and initialization, leaving the "
+                        "rest of the budget for draws"),
+        )
+
+    return WarmupReport(
+        verdict="OK", settled_at=settled, n_warmup=n_warm, n_chains=n_chains,
+        final_accept=accept, noise_floor=noise,
+        suggestion=(f"the spread settled by iteration {settled}, comfortably "
+                    "inside the warmup budget"),
+    )

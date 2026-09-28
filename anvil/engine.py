@@ -41,6 +41,9 @@ class Results:
     accept_fraction: np.ndarray  # (n_chains,) mean over sampling phase
     final_state: ChainState
     final_params: dict[str, mx.array]
+    #: cheap per-probe record of the warmup phase, for warmup_report():
+    #: keys "iter", "sd", "mean", "accept", "step_size"
+    warmup_trace: dict[str, np.ndarray] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False):
@@ -65,6 +68,7 @@ def run(
     reanchor_every: int = 0,
     archive=None,
     pipeline: int | str = "auto",
+    warmup_probes: int = 40,
 ) -> Results:
     """Run ``kernel`` on ``target`` from initial positions ``u0``
     ((n_chains, dim), float32). Records ``n_samples`` states per chain, one
@@ -88,6 +92,12 @@ def run(
     phase; an int N for a tick every N iterations. Ticks are flushed
     (safe to ``tail -f`` through a redirected log) and report rate, ETA,
     mean acceptance, and the running divergence count.
+
+    ``warmup_probes``: how many times during warmup to record cross-chain
+    spread, acceptance and step size, for
+    :func:`anvil.diagnostics.warmup_report` to judge afterwards whether
+    warmup was long enough (or far longer than needed). Costs one host
+    sync per probe -- negligible at the default 40 -- and 0 disables it.
 
     ``pipeline``: depth of the sampling-phase evaluation pipeline. Each
     iteration normally ends in a blocking ``mx.eval``, a GPU round-trip
@@ -137,6 +147,10 @@ def run(
         return f"{h:d}:{m:02d}:{s:02d}"
 
     # -- warmup: adapt every iteration ------------------------------------
+    probe_every = (max(1, n_warmup // warmup_probes)
+                   if warmup_probes and n_warmup else 0)
+    trace: dict[str, list] = {k: [] for k in
+                              ("iter", "sd", "mean", "accept", "step_size")}
     t_phase = time.perf_counter()
     for t in range(n_warmup):
         state, info = step(keys.key(t), state, params)
@@ -145,6 +159,15 @@ def run(
         if reanchor_every and (t + 1) % reanchor_every == 0:
             state = reanchor(state)
         mx.eval(*state.values(), *params.values())
+        if probe_every and (t + 1) % probe_every == 0:
+            u = state["u"]
+            trace["iter"].append(t + 1)
+            trace["sd"].append(np.array(mx.std(u, axis=0)))
+            trace["mean"].append(np.array(mx.mean(u, axis=0)))
+            trace["accept"].append(float(mx.mean(info["accept_prob"]).item()))
+            trace["step_size"].append(
+                float(params["step_size"].item())
+                if "step_size" in params else float("nan"))
         if progress and (t + 1) % _tick_every(n_warmup) == 0:
             el = time.perf_counter() - t_phase
             rate = (t + 1) / el
@@ -246,5 +269,7 @@ def run(
         accept_fraction=np.array(accept_sum) / max(1, total_iters),
         final_state=state,
         final_params=params,
+        warmup_trace=({k: np.array(v) for k, v in trace.items()}
+                      if trace["iter"] else None),
         extras={"n_divergent": int(np.array(divergent_sum).sum())},
     )

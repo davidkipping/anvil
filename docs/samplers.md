@@ -170,6 +170,53 @@ near ChEES-HMC's worst case; on smooth models the ranking flips — and
 see the correlation/curvature discussion above for *why* the
 gradient-free move competes at all here.
 
+## How much warmup do you need?
+
+Warmup is pure overhead — it produces no samples — but cutting it too far
+biases everything downstream, so guessing is the wrong move in both
+directions. `run()` records a cheap trace of the warmup phase (cross-chain
+spread, acceptance, step size; one host sync per probe, 40 by default) and
+{func}`anvil.warmup_report` reads it back:
+
+```python
+res = anvil.run(kernel, target, u0, n_warmup=1000, n_samples=500)
+print(anvil.warmup_report(res))
+```
+
+```
+WarmupReport over 1000 warmup iterations
+  cross-chain spread settled : iteration 310
+  final mean acceptance      : 0.374
+  spread-estimate noise floor: 6.3% (128 chains)
+  LONGER THAN NEEDED: the spread settled by iteration 310; roughly 620
+  warmup iterations would do for this problem and initialization
+```
+
+Two traps it is built around, both of which caught out an earlier attempt
+at this:
+
+- **The cross-chain spread is itself a noisy estimate**, with relative
+  error ~1/√(2·n_chains) — 6% at 128 chains. A fixed 5% convergence band
+  is *below the noise floor* and would never be satisfied, making every
+  run look unconverged. The tolerance scales with chain count.
+- **A stalled chain looks perfectly converged**, because a chain that has
+  stopped moving has a perfectly stable spread. Worse, a stalled *HMC*
+  chain has acceptance near **one**, not near zero, since arbitrarily
+  small steps are always accepted — so acceptance alone points the wrong
+  way. The test that works is whether the spread ever moved off its
+  starting value at all; if it did not, the verdict is `INCONCLUSIVE`
+  rather than a confident "cut your warmup". A real stalled run looks like
+  this: spread frozen at the initialization ball, acceptance 0.98, step
+  size 7×10⁻⁶.
+
+Verdicts are `OK`, `LONGER THAN NEEDED`, `TOO SHORT`, `INCONCLUSIVE` and
+`FAILED`. Pass `warmup_probes=0` to skip the recording entirely.
+
+Note what this deliberately is *not*: automatic warmup termination. Given
+that a stalled run is indistinguishable from a converged one on spread
+alone, stopping warmup automatically would risk silently biased posteriors
+— so anvil measures and tells you, and leaves the decision with you.
+
 ## Pipelining the sampling loop
 
 Every sampling iteration normally ends in a blocking `mx.eval`, which is a

@@ -6,7 +6,8 @@ under gradient-based (ChEES-HMC) and gradient-free (ensemble) kernels.
 """
 
 from . import diagnostics
-from .diagnostics import Diagnostics, diagnose, whitened_shape
+from .diagnostics import (Diagnostics, WarmupReport, diagnose,
+                          warmup_report, whitened_shape)
 from .emcee_api import EnsembleSampler, HMCSampler
 from .engine import Results, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
@@ -32,11 +33,13 @@ __all__ = [
     "Results",
     "StretchMove",
     "Transform",
+    "WarmupReport",
     "TransformedLogDensity",
     "diagnose",
     "diagnostics",
     "certify",
     "run",
     "validate_precision",
+    "warmup_report",
     "whitened_shape",
 ]

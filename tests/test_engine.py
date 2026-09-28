@@ -128,3 +128,110 @@ def test_explicit_depth_overrides_auto(capsys):
     run(RandomWalkMetropolis(target), target, u0, pipeline=2, **kw)
     out = capsys.readouterr().out
     assert "pipelining at depth" not in out and "not pipelining" not in out
+
+
+# --- warmup diagnostics -----------------------------------------------------
+
+def test_warmup_trace_is_recorded_and_disableable():
+    target, u0 = _setup(n=64)
+    r = run(RandomWalkMetropolis(target), target, u0,
+            n_warmup=100, n_samples=5, seed=20, warmup_probes=20)
+    tr = r.warmup_trace
+    assert sorted(tr) == ["accept", "iter", "mean", "sd", "step_size"]
+    assert len(tr["iter"]) == 20 and tr["iter"][-1] == 100
+    assert tr["sd"].shape == (20, 4) and tr["mean"].shape == (20, 4)
+    assert np.all(np.isfinite(tr["accept"]))
+
+    off = run(RandomWalkMetropolis(target), target, u0,
+              n_warmup=100, n_samples=5, seed=20, warmup_probes=0)
+    assert off.warmup_trace is None
+    # and the trace must not perturb the run
+    np.testing.assert_array_equal(r.get_chain(), off.get_chain())
+
+
+class _FakeResults:
+    """Minimal stand-in: warmup_report only reads the trace and n_chains."""
+
+    def __init__(self, sd, accept, step_size, n_chains):
+        n = len(sd)
+        self.n_chains = n_chains
+        self.warmup_trace = {
+            "iter": np.arange(1, n + 1) * 10,
+            "sd": np.asarray(sd, dtype=np.float64),
+            "mean": np.zeros_like(np.asarray(sd, dtype=np.float64)),
+            "accept": np.full(n, accept, dtype=np.float64),
+            "step_size": np.full(n, step_size, dtype=np.float64),
+        }
+
+
+def test_warmup_report_verdicts_on_known_traces():
+    """The verdict logic is pure, so exercise it on traces whose right
+    answer is known by construction rather than on runs whose behaviour
+    has to be reverse-engineered."""
+    from anvil import warmup_report
+    n = 30
+
+    # still expanding at the end -> too short
+    grow = np.linspace(0.1, 3.0, n)[:, None] * np.ones((1, 3))
+    rep = warmup_report(_FakeResults(grow, 0.4, 0.1, 512))
+    assert rep.verdict == "TOO SHORT" and rep.settled_at is None
+
+    # expands, then flat for most of the run -> settled early
+    early = np.concatenate([np.linspace(0.1, 1.0, 5), np.ones(n - 5)])[:, None] \
+        * np.ones((1, 3))
+    rep = warmup_report(_FakeResults(early, 0.4, 0.1, 512))
+    assert rep.verdict == "LONGER THAN NEEDED"
+    assert rep.settled_at is not None and rep.settled_at <= 60
+
+    # expands for most of it, settling only near the end -> about right
+    late = np.concatenate([np.linspace(0.1, 1.0, 22), np.ones(n - 22)])[:, None] \
+        * np.ones((1, 3))
+    rep = warmup_report(_FakeResults(late, 0.4, 0.1, 512))
+    assert rep.verdict == "OK"
+
+    # never moved at all -> cannot tell converged from stuck
+    flat = np.ones((n, 3)) * 2.45
+    rep = warmup_report(_FakeResults(flat, 0.98, 7e-6, 256))
+    assert rep.verdict == "INCONCLUSIVE"
+    assert "never changed" in rep.suggestion
+    # the tell for a stalled HMC run is a TINY step size with HIGH
+    # acceptance, so the report must mention the step size
+    assert "step size" in rep.suggestion
+
+    # acceptance collapsed, but the spread did move -> a different failure
+    rep = warmup_report(_FakeResults(grow, 0.001, 0.1, 512))
+    assert rep.verdict == "FAILED" and "acceptance" in rep.suggestion
+
+
+def test_warmup_report_on_a_real_run_is_sane():
+    from anvil import warmup_report
+    target, u0 = _setup(n=128)
+    r = run(RandomWalkMetropolis(target), target, u0,
+            n_warmup=300, n_samples=10, seed=23)
+    rep = warmup_report(r)
+    assert rep.verdict in ("OK", "LONGER THAN NEEDED")
+    assert rep.n_chains == 128 and rep.n_warmup == 300
+    assert 0.0 < rep.final_accept <= 1.0 and str(rep)
+
+
+def test_warmup_report_tolerance_scales_with_chain_count():
+    """The cross-chain spread is itself a noisy estimate; demanding tighter
+    agreement than that noise floor would never succeed."""
+    from anvil import warmup_report
+    target, u0_small = _setup(n=32)
+    _, u0_big = _setup(n=512)
+    small = warmup_report(run(RandomWalkMetropolis(target), target, u0_small,
+                              n_warmup=200, n_samples=5, seed=26))
+    big = warmup_report(run(RandomWalkMetropolis(target), target, u0_big,
+                            n_warmup=200, n_samples=5, seed=26))
+    assert small.noise_floor > big.noise_floor
+    assert abs(small.noise_floor - 1 / np.sqrt(2 * 31)) < 1e-9
+
+
+def test_warmup_report_requires_a_trace():
+    from anvil import warmup_report
+    target, u0 = _setup(n=64)
+    r = run(RandomWalkMetropolis(target), target, u0,
+            n_warmup=20, n_samples=5, seed=27, warmup_probes=0)
+    with pytest.raises(ValueError, match="warmup_probes"):
+        warmup_report(r)
