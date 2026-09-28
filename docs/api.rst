@@ -46,7 +46,7 @@ Diagnostics
 
 .. automodule:: anvil.diagnostics
    :members: diagnose, Diagnostics, split_rhat, ess_bulk, nested_rhat,
-             summary
+             summary, whitened_shape
 
 Storage
 -------

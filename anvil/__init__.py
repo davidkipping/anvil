@@ -6,7 +6,7 @@ under gradient-based (ChEES-HMC) and gradient-free (ensemble) kernels.
 """
 
 from . import diagnostics
-from .diagnostics import Diagnostics, diagnose
+from .diagnostics import Diagnostics, diagnose, whitened_shape
 from .emcee_api import EnsembleSampler, HMCSampler
 from .engine import Results, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
@@ -38,4 +38,5 @@ __all__ = [
     "certify",
     "run",
     "validate_precision",
+    "whitened_shape",
 ]

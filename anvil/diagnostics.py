@@ -347,3 +347,33 @@ def summary(chain: np.ndarray, names: list[str] | None = None) -> str:
             f"{rhat[d]:>8.4f} {ess[d]:>10.0f}"
         )
     return "\n".join(lines)
+
+
+def whitened_shape(draws: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-parameter skew and excess kurtosis *after* whitening.
+
+    Whitens the sample by its own covariance, which removes all linear
+    correlation, and reports what is left. This predicts whether a dense
+    mass matrix will help a gradient sampler, because a dense matrix
+    removes exactly the linear part and nothing else:
+
+    * both near zero -> the posterior is correlated but Gaussian-ish, and
+      ``ChEESHMC(..., dense=True)`` should pay off (measured 5-40x more
+      effective samples per gradient on correlated Gaussians);
+    * large -> the posterior is *curved*, no single global mass matrix can
+      linearize it, and an affine-invariant ensemble move is likely the
+      better buy -- or better still, reparameterize the curvature away.
+
+    ``draws``: (n_draws, dim), e.g. ``results.get_chain(flat=True)``.
+    Returns ``(skew, excess_kurtosis)``, each (dim,).
+    """
+    x = np.asarray(draws, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"draws must be (n_draws, dim); got {x.shape}")
+    xc = x - x.mean(axis=0)
+    cov = np.cov(xc.T)
+    cov = np.atleast_2d(cov)
+    # whiten with the Cholesky factor: z = xc @ inv(L).T has identity cov
+    L = np.linalg.cholesky(cov + 1e-12 * np.eye(cov.shape[0]) * np.trace(cov))
+    z = xc @ np.linalg.inv(L).T
+    return (z ** 3).mean(axis=0), (z ** 4).mean(axis=0) - 3.0

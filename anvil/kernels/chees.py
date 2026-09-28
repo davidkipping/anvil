@@ -22,9 +22,12 @@ then all three freeze at their averaged iterates.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from ..adaptation.chees_criterion import (
     ChEESState,
@@ -38,7 +41,16 @@ from ..adaptation.dual_averaging import (
     init_dual_averaging,
     update_dual_averaging,
 )
-from ..adaptation.moments import MomentsState, init_moments, stddev, update_moments
+from ..adaptation.moments import (
+    DenseMomentsState,
+    MomentsState,
+    dense_factors,
+    init_dense_moments,
+    init_moments,
+    stddev,
+    update_dense_moments,
+    update_moments,
+)
 from ..halton import halton_jitter
 from ..logdensity import LogDensity
 from ..state import ChainState
@@ -52,6 +64,10 @@ class ChEESAdaptState:
     moments: MomentsState
     frozen_sigma: mx.array  # (dim,) preconditioner scales
     t: int = 0
+    # dense preconditioner only (all None on the diagonal path)
+    dense_moments: DenseMomentsState | None = None
+    corr: mx.array | None = None    # (dim, dim) correlation R
+    lrinv: mx.array | None = None   # (dim, dim) inv(chol(R))
 
 
 class ChEESHMC(Kernel):
@@ -67,6 +83,8 @@ class ChEESHMC(Kernel):
         target_accept: float = 0.651,
         divergence_threshold: float = 1000.0,
         precondition_after: int = 50,
+        dense: bool = False,
+        ridge: float = 1e-6,
     ):
         if not target.supports_grad:
             raise ValueError("ChEES-HMC requires a gradient-capable target")
@@ -77,10 +95,19 @@ class ChEESHMC(Kernel):
         self.target_accept = float(target_accept)
         self.div_threshold = float(divergence_threshold)
         self.precondition_after = int(precondition_after)
+        self.dense = bool(dense)
+        self.ridge = float(ridge)
         self._iter = 0
         self._last_h = 1.0
-        self._leapfrog_c = mx.compile(self._leapfrog)
-        self._finish_c = mx.compile(self._finish)
+        self._compile_kernels()
+
+    def _compile_kernels(self):
+        if self.dense:
+            self._leapfrog_c = mx.compile(self._leapfrog_dense)
+            self._finish_c = mx.compile(self._finish_dense)
+        else:
+            self._leapfrog_c = mx.compile(self._leapfrog)
+            self._finish_c = mx.compile(self._finish)
 
     # -- pure compiled pieces ---------------------------------------------
 
@@ -119,10 +146,73 @@ class ChEESHMC(Kernel):
         }
         return new_state, info
 
+    # -- dense-preconditioner variants -------------------------------------
+    #
+    # M^-1 is the full covariance Sigma = S R S. Every use of it goes through
+    # _sigma_p, which applies the factored form so float32 only ever touches
+    # the well-conditioned correlation matrix R.
+
+    @staticmethod
+    def _sigma_p(p, s, R):
+        """Sigma @ p for row-vector batches: S(R(S p))."""
+        return ((p * s) @ R) * s
+
+    def _leapfrog_dense(self, q, p, g, eps, s, R):
+        p_half = p + 0.5 * eps * g
+        q_new = q + eps * self._sigma_p(p_half, s, R)
+        lp, g_new = self.target.log_prob_and_grad(q_new)
+        return q_new, p_half + 0.5 * eps * g_new, g_new, lp
+
+    def _finish_dense(self, key, q0, lp0, g0, p0, q1, lp1, g1, p1, s, R):
+        ke0 = 0.5 * mx.sum(p0 * self._sigma_p(p0, s, R), axis=-1)
+        ke1 = 0.5 * mx.sum(p1 * self._sigma_p(p1, s, R), axis=-1)
+        dH = (lp1 - ke1) - (lp0 - ke0)
+        dH_safe = mx.where(mx.isfinite(dH), dH, -mx.inf)
+        accept_prob = mx.minimum(1.0, mx.exp(dH_safe))
+        diverged = ~mx.isfinite(dH) | (dH < -self.div_threshold)
+        log_u = mx.log(mx.random.uniform(shape=dH.shape, key=key))
+        accept = (log_u < dH_safe) & ~diverged
+        acc = accept[:, None]
+        new_state = {
+            "u": mx.where(acc, q1, q0),
+            "log_prob": mx.where(accept, lp1, lp0),
+            "grad": mx.where(acc, g1, g0),
+        }
+        info: StepInfo = {
+            "accept_prob": accept_prob,
+            "accepted": accept,
+            "diverged": diverged,
+            "q_prev": q0,
+            "q_prop": q1,
+            "v_end": self._sigma_p(p1, s, R),
+        }
+        return new_state, info
+
     # -- Kernel protocol ---------------------------------------------------
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
+        n_chains, dim = u0.shape
+        if self.dense:
+            # a cross-chain covariance needs comfortably more chains than
+            # dimensions to be usable; below that, silently degrading to the
+            # diagonal preconditioner is far better than inverting noise
+            if n_chains < 4 * dim:
+                warnings.warn(
+                    f"dense=True needs n_chains >= 4*dim for a usable "
+                    f"cross-chain covariance (got {n_chains} chains, dim "
+                    f"{dim}); falling back to the diagonal preconditioner",
+                    stacklevel=2,
+                )
+                self.dense = False
+                self._compile_kernels()
+            elif dim > 512:
+                warnings.warn(
+                    f"dense=True costs O(dim^2) per leapfrog step and a "
+                    f"dim x dim host factorization per warmup iteration; at "
+                    f"dim={dim} that may outweigh the preconditioning gain",
+                    stacklevel=2,
+                )
         lp, g = target.log_prob_and_grad(u0)
         return {"u": u0, "log_prob": lp, "grad": g}
 
@@ -136,17 +226,29 @@ class ChEESHMC(Kernel):
 
         k_mom, k_acc = mx.random.split(key)
         u = state["u"]
-        inv_mass = params["inv_mass"]          # (dim,) = sigma^2
-        # p ~ N(0, M) with M = diag(1/sigma^2)
-        p0 = mx.random.normal(u.shape, key=k_mom) / mx.sqrt(inv_mass)
-
         eps = params["step_size"]
+        z = mx.random.normal(u.shape, key=k_mom)
+
+        if self.dense:
+            # p ~ N(0, Sigma^-1): Cov((z @ B)/sd) = B^T B / (sd sd^T) with
+            # B = inv(chol(R)), so B^T B = R^-1 and the whole thing is
+            # (S R S)^-1. Getting this transpose wrong is silent -- it
+            # samples a valid-looking chain from the wrong distribution.
+            s_arr, R = params["sigma"], params["corr"]
+            p0 = (z @ params["lrinv"]) / s_arr
+            extra = (s_arr, R)
+        else:
+            inv_mass = params["inv_mass"]      # (dim,) = sigma^2
+            # p ~ N(0, M) with M = diag(1/sigma^2)
+            p0 = z / mx.sqrt(inv_mass)
+            extra = (inv_mass,)
+
         q, p, g, lp = u, p0, state["grad"], state["log_prob"]
         for _ in range(L):
-            q, p, g, lp = self._leapfrog_c(q, p, g, eps, inv_mass)
+            q, p, g, lp = self._leapfrog_c(q, p, g, eps, *extra)
         return self._finish_c(
             k_acc, u, state["log_prob"], state["grad"], p0, q, lp, g, p,
-            inv_mass,
+            *extra,
         )
 
     def init_adapt(self, state: ChainState) -> ChEESAdaptState:
@@ -156,6 +258,9 @@ class ChEESHMC(Kernel):
             chees=init_chees(self.T0),
             moments=init_moments(dim),
             frozen_sigma=mx.ones((dim,)),
+            dense_moments=init_dense_moments(dim) if self.dense else None,
+            corr=mx.eye(dim) if self.dense else None,
+            lrinv=mx.eye(dim) if self.dense else None,
         )
 
     def adapt(self, a: ChEESAdaptState, state, info: StepInfo, t: int):
@@ -173,8 +278,26 @@ class ChEESHMC(Kernel):
         )
         moments = update_moments(a.moments, state["u"], t)
         sigma = stddev(moments) if t >= self.precondition_after else a.frozen_sigma
+
+        dm, corr, lrinv = a.dense_moments, a.corr, a.lrinv
+        if self.dense:
+            # one host copy per warmup iteration; microseconds at realistic
+            # sizes, and it never touches the compiled step
+            dm = update_dense_moments(dm, np.array(state["u"]), t)
+            if t >= self.precondition_after:
+                for ridge in (self.ridge, 100.0 * self.ridge, 1e4 * self.ridge):
+                    try:
+                        sigma, corr, lrinv = dense_factors(dm, ridge)
+                        break
+                    except np.linalg.LinAlgError:
+                        continue
+                # if every ridge failed, keep the previous factors: a warmup
+                # iteration with a stale preconditioner is recoverable, a
+                # crash is not
+
         return ChEESAdaptState(
-            da=da, chees=chees, moments=moments, frozen_sigma=sigma, t=t
+            da=da, chees=chees, moments=moments, frozen_sigma=sigma, t=t,
+            dense_moments=dm, corr=corr, lrinv=lrinv,
         )
 
     def make_params(self, a: ChEESAdaptState, warmup: bool):
@@ -183,8 +306,11 @@ class ChEESHMC(Kernel):
         else:
             log_eps, log_T = a.da.log_eps_bar, a.chees.log_T_bar
         sigma = a.frozen_sigma
-        return {
-            "step_size": mx.exp(log_eps),
-            "traj_length": mx.exp(log_T),
-            "inv_mass": sigma * sigma,
-        }
+        out = {"step_size": mx.exp(log_eps), "traj_length": mx.exp(log_T)}
+        if self.dense:
+            out["sigma"] = sigma
+            out["corr"] = a.corr
+            out["lrinv"] = a.lrinv
+        else:
+            out["inv_mass"] = sigma * sigma
+        return out

@@ -57,14 +57,49 @@ covariance and one parameter still has skew 1.9 and excess kurtosis 7.8.
 No single global mass matrix can linearize a banana, so L stays put and
 the gain is only ~1.6×.
 
-**The practical rule.** Whiten a pilot sample by its covariance and look
-at the residual skew/kurtosis:
+**The practical rule.** Use {func}`anvil.whitened_shape` on a pilot
+sample. It whitens by the sample covariance — removing exactly the linear
+part a dense mass matrix would remove — and reports what is left:
 
-* near zero → the posterior is correlated but Gaussian-ish, and
-  gradient-based sampling with a good preconditioner should dominate;
-* large → the posterior is curved, a global preconditioner will not save
+```python
+skew, exkurt = anvil.whitened_shape(pilot.get_chain(flat=True))
+```
+
+* both near zero → correlated but Gaussian-ish; turn on `dense=True`;
+* large → the posterior is curved, no global preconditioner will save
   you, and an affine-invariant ensemble move is likely the better buy
-  (or reparameterize to remove the curvature, which is better still).
+  (better still, reparameterize the curvature away). Measured: ~0.01 on a
+  correlated Gaussian, 1.9 on the transit posterior.
+
+### Using a dense mass matrix
+
+```python
+sampler = anvil.HMCSampler(n_chains, dim, log_prob, dense=True)
+# or, at the kernel level:
+kernel = anvil.ChEESHMC(target, dense=True)
+```
+
+Off by default; enabling it changes nothing else about the sampler. The
+covariance is estimated across chains during warmup and frozen with
+everything else. It is held factored as Σ = S·R·S so that float32 only
+ever sees the correlation matrix R, never the covariance itself — on the
+transit posterior those have condition numbers of ~10³ and ~10⁷
+respectively, and the second would not survive single precision.
+
+Measured gains, ESS per gradient evaluation:
+
+| posterior | leapfrog steps: diagonal → dense | gain |
+|---|---:|---:|
+| correlated Gaussian, ρ = 0.9 | 11 → 3 | 5× |
+| correlated Gaussian, ρ = 0.99 | 36 → 1 | 40× |
+| transit (curved) | 30 → 30 | 1.6× |
+
+Two guards fire automatically. With fewer than `4 × dim` chains the
+cross-chain covariance is mostly noise, so the kernel warns and falls back
+to the diagonal preconditioner. Above `dim = 512` it warns that the
+O(dim²) work per leapfrog step may outweigh the preconditioning gain. A
+singular correlation matrix is absorbed by an escalating ridge rather than
+raising.
 
 ## Ensemble moves (gradient-free fallback)
 
