@@ -40,6 +40,11 @@ this project out at least once:
 | {func}`~anvil.precision.validate_precision` | is the float32 likelihood accurate enough to trust? |
 | {func}`~anvil.precision.certify` | how much did float32 bias the posterior, and what is it corrected? |
 
+Short of samples, extend the same chains rather than start again:
+`run(..., resume=res)` continues them with the adaptation frozen and the
+key stream carried forward, and `res.save_state()` / `anvil.load_state()`
+carry a run across process boundaries.
+
 ## Where to start
 
 ```{toctree}

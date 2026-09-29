@@ -9,7 +9,7 @@ from . import diagnostics
 from .diagnostics import (Diagnostics, WarmupReport, diagnose,
                           warmup_report, whitened_shape)
 from .emcee_api import EnsembleSampler, HMCSampler
-from .engine import Results, run
+from .engine import Results, ResumeState, load_state, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
 from .logdensity import FunctionLogDensity, LogDensity
 from .precision import (Certificate, PrecisionPolicy, certify,
@@ -31,12 +31,14 @@ __all__ = [
     "Diagnostics",
     "PrecisionPolicy",
     "Results",
+    "ResumeState",
     "StretchMove",
     "Transform",
     "WarmupReport",
     "TransformedLogDensity",
     "diagnose",
     "diagnostics",
+    "load_state",
     "certify",
     "run",
     "validate_precision",

@@ -11,7 +11,7 @@ Engine
 ------
 
 .. automodule:: anvil.engine
-   :members: run, Results
+   :members: run, Results, ResumeState, load_state
 
 Kernels
 -------

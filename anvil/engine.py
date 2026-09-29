@@ -7,6 +7,7 @@ acceptance bookkeeping. One loop serves every kernel.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -31,6 +32,133 @@ _PIPELINE_THRESHOLD_S = 1e-3
 _PIPELINE_DEPTH = 2
 
 
+#: bump when the .npz layout changes incompatibly
+_STATE_FORMAT = 1
+
+
+def _anvil_version() -> str:
+    from . import __version__          # deferred: anvil/__init__ imports us
+    return __version__
+
+
+def _to_mx(a: np.ndarray) -> mx.array:
+    # mx.array() on a float64 numpy array silently returns float32; naming
+    # the dtype is the only way to keep a float64 round-trip exact
+    return mx.array(a, dtype=mx.float64) if a.dtype == np.float64 else mx.array(a)
+
+
+@dataclass
+class ResumeState:
+    """A run frozen between iterations: chain state, frozen params, and the
+    position reached in the key stream.
+
+    Produced by :meth:`Results.resume_state` or :func:`load_state`, consumed
+    by ``run(..., resume=...)``. ``iteration`` is the total number of engine
+    iterations already drawn from the key stream (warmup plus
+    ``n_samples * thin``); continuing from it is what keeps a resumed
+    segment's randomness disjoint from the segment before it.
+    """
+
+    state: ChainState
+    params: dict[str, mx.array]
+    iteration: int
+    seed: int
+    n_chains: int
+    dim: int
+    kernel: str
+    kernel_ckpt: dict[str, float] = field(default_factory=dict)
+    anvil_version: str = ""
+
+    # -- validation --------------------------------------------------------
+
+    def check(self, target=None, u0=None, kernel=None) -> None:
+        """Raise a legible error rather than let a mismatch crash inside a
+        compiled step."""
+        u = self.state.get("u")
+        if u is None:
+            raise ValueError("resume state has no 'u' (chain positions)")
+        if tuple(u.shape) != (self.n_chains, self.dim):
+            raise ValueError(
+                f"resume state is inconsistent: declares {self.n_chains} "
+                f"chains x {self.dim} dims, but 'u' has shape {tuple(u.shape)}"
+            )
+        lp = self.state.get("log_prob")
+        if lp is not None and tuple(lp.shape) != (self.n_chains,):
+            raise ValueError(
+                f"resume state is inconsistent: 'log_prob' has shape "
+                f"{tuple(lp.shape)}, expected ({self.n_chains},)")
+        if kernel is not None and type(kernel).__name__ != self.kernel:
+            raise ValueError(
+                f"resume state was written by {self.kernel}, but this run "
+                f"uses {type(kernel).__name__}: one kernel's frozen params "
+                f"mean nothing to another. To change kernels, start a fresh "
+                f"run (with warmup) from the saved positions instead.")
+        t_dim = getattr(target, "dim", None)
+        if t_dim is not None and int(t_dim) != self.dim:
+            raise ValueError(
+                f"resume state has dim={self.dim}, but the target has "
+                f"dim={int(t_dim)}")
+        if u0 is not None and tuple(u0.shape) != (self.n_chains, self.dim):
+            raise ValueError(
+                f"resume state holds {self.n_chains} chains x {self.dim} "
+                f"dims, but u0 has shape {tuple(u0.shape)}. u0 is not used on "
+                f"a resume, so this is a configuration mismatch, not an "
+                f"initialization.")
+
+    # -- persistence -------------------------------------------------------
+
+    def save(self, path) -> None:
+        """Write to ``path`` as a plain ``.npz`` — arrays under transparent
+        names, no pickle, so another process (or another language) can read
+        it and a mismatch can be *reported* rather than raised from inside a
+        deserializer."""
+        out: dict[str, np.ndarray] = {
+            "format": np.array(_STATE_FORMAT),
+            "anvil_version": np.array(self.anvil_version or _anvil_version()),
+            "kernel": np.array(self.kernel),
+            "iteration": np.array(int(self.iteration)),
+            "seed": np.array(int(self.seed)),
+            "n_chains": np.array(int(self.n_chains)),
+            "dim": np.array(int(self.dim)),
+        }
+        for k, v in self.state.items():
+            out[f"state__{k}"] = np.array(v)
+        for k, v in self.params.items():
+            out[f"params__{k}"] = np.array(v)
+        for k, v in self.kernel_ckpt.items():
+            out[f"ckpt__{k}"] = np.array(float(v))
+        path = os.fspath(path)
+        np.savez(path, **out)
+        # np.savez appends .npz to a bare name; hand back what we promised
+        if not path.endswith(".npz") and os.path.exists(path + ".npz"):
+            os.replace(path + ".npz", path)
+
+
+def load_state(path) -> ResumeState:
+    """Read a state written by :meth:`Results.save_state` back into a
+    :class:`ResumeState` accepted by ``run(..., resume=...)``."""
+    with np.load(os.fspath(path), allow_pickle=False) as z:
+        fmt = int(z["format"]) if "format" in z else -1
+        if fmt != _STATE_FORMAT:
+            raise ValueError(
+                f"{path}: state format {fmt}, this anvil reads "
+                f"{_STATE_FORMAT}")
+        state = {k[len("state__"):]: _to_mx(z[k])
+                 for k in z.files if k.startswith("state__")}
+        params = {k[len("params__"):]: _to_mx(z[k])
+                  for k in z.files if k.startswith("params__")}
+        ckpt = {k[len("ckpt__"):]: float(z[k])
+                for k in z.files if k.startswith("ckpt__")}
+        rs = ResumeState(
+            state=state, params=params, kernel_ckpt=ckpt,
+            iteration=int(z["iteration"]), seed=int(z["seed"]),
+            n_chains=int(z["n_chains"]), dim=int(z["dim"]),
+            kernel=str(z["kernel"]), anvil_version=str(z["anvil_version"]),
+        )
+    rs.check()
+    return rs
+
+
 @dataclass
 class Results:
     backend: MemoryBackend
@@ -45,6 +173,13 @@ class Results:
     #: keys "iter", "sd", "mean", "accept", "step_size"
     warmup_trace: dict[str, np.ndarray] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    #: effective RNG seed, and total iterations drawn from its key stream
+    #: (this run's *and* any it resumed) -- together they are what lets a
+    #: continuation keep off the keys already spent
+    seed: int = 0
+    iters_consumed: int = 0
+    kernel: str = ""
+    kernel_ckpt: dict[str, float] = field(default_factory=dict)
 
     def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False):
         return self.backend.get_chain(discard, thin, flat)
@@ -52,16 +187,46 @@ class Results:
     def get_log_prob(self, discard: int = 0, thin: int = 1, flat: bool = False):
         return self.backend.get_log_prob(discard, thin, flat)
 
+    def resume_state(self) -> ResumeState:
+        """The handle for continuing these chains: pass it (or this
+        ``Results``) as ``run(..., resume=...)``."""
+        return ResumeState(
+            state=dict(self.final_state),
+            params=dict(self.final_params),
+            iteration=int(self.iters_consumed),
+            seed=int(self.seed),
+            n_chains=int(self.n_chains),
+            dim=int(self.dim),
+            kernel=self.kernel,
+            kernel_ckpt=dict(self.kernel_ckpt),
+            anvil_version=_anvil_version(),
+        )
+
+    def save_state(self, path) -> None:
+        """Persist enough to continue this run in another process
+        (``.npz``, no pickle). See :func:`anvil.load_state`."""
+        self.resume_state().save(path)
+
+
+def _as_resume_state(obj) -> ResumeState:
+    if isinstance(obj, ResumeState):
+        return obj
+    if isinstance(obj, Results):
+        return obj.resume_state()
+    raise TypeError(
+        f"resume= takes a Results or a ResumeState from anvil.load_state(), "
+        f"not {type(obj).__name__}")
+
 
 def run(
     kernel: Kernel,
     target: LogDensity,
-    u0: mx.array,
+    u0: mx.array | None = None,
     *,
-    n_warmup: int = 500,
+    n_warmup: int | None = None,
     n_samples: int = 1000,
     thin: int = 1,
-    seed: int = 0,
+    seed: int | None = None,
     storage: MemoryBackend | None = None,
     compile_step: bool = True,
     progress: bool | int = False,
@@ -69,10 +234,13 @@ def run(
     archive=None,
     pipeline: int | str = "auto",
     warmup_probes: int = 40,
+    callback=None,
+    resume: "Results | ResumeState | None" = None,
 ) -> Results:
     """Run ``kernel`` on ``target`` from initial positions ``u0``
     ((n_chains, dim), float32). Records ``n_samples`` states per chain, one
-    every ``thin`` post-warmup iterations.
+    every ``thin`` post-warmup iterations, after ``n_warmup`` adapting ones
+    (default 500, or 0 when continuing a run with ``resume``).
 
     ``reanchor_every`` > 0 recomputes the cached log_prob of the current
     states through the target's float64 path every that many iterations
@@ -84,6 +252,20 @@ def run(
     change the distribution being sampled. It is expensive (the float64
     path can cost ~1000x the float32 one); default off.
 
+    ``resume``: a :class:`Results` (or a :class:`ResumeState` from
+    :func:`load_state`) to *continue* rather than start. The chains pick up
+    at their final positions with the adaptation frozen where it stopped, so
+    ``n_warmup`` defaults to 0 there — passing a nonzero one raises rather
+    than silently discarding it, and ``u0`` is not used (if given it is only
+    checked for a matching shape). ``kernel.init`` is not called;
+    ``kernel.attach`` is, so a kernel object built for the resumed run is
+    configured from the saved params rather than from its constructor
+    arguments. The key stream continues from the resumed state's iteration
+    count, so a continuation never replays the keys the first segment
+    already spent, and ``seed`` defaults to the one recorded in the state
+    (pass one explicitly to override). ``accept_fraction`` and the
+    divergence counts describe the resumed segment alone.
+
     ``archive`` (a :class:`~anvil.surrogate.TrainingArchive`) records
     every stored (u, log_prob) frame as future emulator training data —
     this happens on already-evaluated host copies, off the hot path.
@@ -92,6 +274,15 @@ def run(
     phase; an int N for a tick every N iterations. Ticks are flushed
     (safe to ``tail -f`` through a redirected log) and report rate, ETA,
     mean acceptance, and the running divergence count.
+
+    ``callback``: optional ``callback(phase, iteration, info)``, invoked on
+    the same cadence as ``progress`` with ``phase`` in ``{"warmup",
+    "sample"}`` and ``info`` carrying the numbers the progress line reports
+    (``total``, ``rate``, ``accept``, ``elapsed``, ``eta``, ``step_size``,
+    and ``n_divergent`` while sampling). Supplying one does not turn
+    printing on, so a caller that renders its own progress can pass
+    ``progress=False`` and still be driven; if ``progress`` is False the
+    cadence is the one ``progress=True`` would have used.
 
     ``warmup_probes``: how many times during warmup to record cross-chain
     spread, acceptance and step size, for
@@ -114,13 +305,46 @@ def run(
     which the engine tests assert directly. Sampling only: warmup keeps its
     barrier because adaptation reads freshly-computed parameters on the
     host, and pipelining it would mean adapting from stale ones."""
-    u0 = u0.astype(mx.float32) if u0.dtype != mx.float32 else u0
-    n_chains, dim = u0.shape
-    keys = KeyStream(seed)
+    if u0 is not None:
+        u0 = u0.astype(mx.float32) if u0.dtype != mx.float32 else u0
 
-    state = kernel.init(keys.init_key(), u0, target)
-    adapt_state = kernel.init_adapt(state)
-    params = kernel.make_params(adapt_state, warmup=True)
+    if resume is None:
+        if u0 is None:
+            raise TypeError(
+                "run() needs initial positions u0, unless resume= is given")
+        n_chains, dim = u0.shape
+        n_warmup = 500 if n_warmup is None else int(n_warmup)
+        seed = 0 if seed is None else int(seed)
+        keys = KeyStream(seed)
+        iter0 = 0
+        state = kernel.init(keys.init_key(), u0, target)
+        adapt_state = kernel.init_adapt(state)
+        params = kernel.make_params(adapt_state, warmup=True)
+    else:
+        rs = _as_resume_state(resume)
+        # a continuation does not adapt, so the fresh-run default of 500 is
+        # not a request for warmup -- but an explicit one is, and honouring
+        # it is impossible, so say so
+        if n_warmup:
+            raise ValueError(
+                f"resume= continues frozen adaptation, so n_warmup must be 0 "
+                f"(got {n_warmup}). Re-adapting would make the continuation a "
+                f"different Markov chain, whose draws cannot honestly be "
+                f"concatenated with the first segment's -- if that is what you "
+                f"want, start a fresh run from the saved positions.")
+        n_warmup = 0
+        rs.check(target=target, u0=u0, kernel=kernel)
+        n_chains, dim = rs.n_chains, rs.dim
+        # continue the same stream: with n_warmup=0 a naive resume would
+        # redraw the original run's *warmup* keys, correlating the
+        # continuation with the adaptation phase it is supposed to follow
+        seed = rs.seed if seed is None else int(seed)
+        keys = KeyStream(seed)
+        iter0 = int(rs.iteration)
+        state, params, adapt_state = dict(rs.state), dict(rs.params), None
+        kernel.attach(target, state, params)
+        kernel.restore(rs.kernel_ckpt)
+        mx.eval(*state.values(), *params.values())
     if compile_step and not kernel.self_compiled:
         step = mx.compile(kernel.step)
     else:
@@ -137,9 +361,15 @@ def run(
         return {**st, "log_prob": lp}
 
     def _tick_every(n_total):
-        if progress is True:
+        if progress is True or (not progress and callback is not None):
             return max(1, n_total // 10)
         return max(1, int(progress))
+
+    ticking = bool(progress) or callback is not None
+
+    def _step_size_of(pars):
+        p = pars.get("step_size")
+        return float(p.item()) if p is not None else None
 
     def _fmt_eta(seconds):
         m, s = divmod(int(seconds), 60)
@@ -153,7 +383,7 @@ def run(
                               ("iter", "sd", "mean", "accept", "step_size")}
     t_phase = time.perf_counter()
     for t in range(n_warmup):
-        state, info = step(keys.key(t), state, params)
+        state, info = step(keys.key(iter0 + t), state, params)
         adapt_state = kernel.adapt(adapt_state, state, info, t + 1)
         params = kernel.make_params(adapt_state, warmup=True)
         if reanchor_every and (t + 1) % reanchor_every == 0:
@@ -168,16 +398,24 @@ def run(
             trace["step_size"].append(
                 float(params["step_size"].item())
                 if "step_size" in params else float("nan"))
-        if progress and (t + 1) % _tick_every(n_warmup) == 0:
+        if ticking and (t + 1) % _tick_every(n_warmup) == 0:
             el = time.perf_counter() - t_phase
             rate = (t + 1) / el
             acc = float(np.array(info["accept_prob"]).mean())
-            print(f"[warmup] {t + 1}/{n_warmup} | {rate:.2f} it/s | "
-                  f"accept {acc:.2f} | elapsed {_fmt_eta(el)} | "
-                  f"eta {_fmt_eta((n_warmup - t - 1) / rate)}", flush=True)
+            eta = (n_warmup - t - 1) / rate
+            if progress:
+                print(f"[warmup] {t + 1}/{n_warmup} | {rate:.2f} it/s | "
+                      f"accept {acc:.2f} | elapsed {_fmt_eta(el)} | "
+                      f"eta {_fmt_eta(eta)}", flush=True)
+            if callback is not None:
+                callback("warmup", t + 1, {
+                    "total": n_warmup, "rate": rate, "accept": acc,
+                    "elapsed": el, "eta": eta,
+                    "step_size": _step_size_of(params)})
 
-    params = kernel.make_params(adapt_state, warmup=False)
-    mx.eval(*params.values())
+    if resume is None:
+        params = kernel.make_params(adapt_state, warmup=False)
+        mx.eval(*params.values())
 
     # -- sampling: frozen params ------------------------------------------
     if storage is None:
@@ -212,7 +450,7 @@ def run(
 
     t_phase = time.perf_counter()
     for t in range(total_iters):
-        state, info = step(keys.key(n_warmup + t), state, params)
+        state, info = step(keys.key(iter0 + n_warmup + t), state, params)
         accept_sum = accept_sum + info["accept_prob"]
         if "diverged" in info:
             divergent_sum = divergent_sum + info["diverged"]
@@ -245,16 +483,22 @@ def run(
             elif progress:
                 print(f"[sample] not pipelining ({per_iter * 1e3:.1f} ms/iter "
                       "— the eval barrier is already negligible)", flush=True)
-        if progress and (t + 1) % _tick_every(total_iters) == 0:
+        if ticking and (t + 1) % _tick_every(total_iters) == 0:
             _drain()
             mx.eval(accept_sum, divergent_sum)
             el = time.perf_counter() - t_phase
             rate = (t + 1) / el
             acc = float(np.array(accept_sum).mean()) / (t + 1)
             ndiv = int(np.array(divergent_sum).sum())
-            print(f"[sample] {t + 1}/{total_iters} | {rate:.2f} it/s | "
-                  f"accept {acc:.2f} | divergences {ndiv} | "
-                  f"elapsed {_fmt_eta(el)} | "
+            if callback is not None:
+                callback("sample", t + 1, {
+                    "total": total_iters, "rate": rate, "accept": acc,
+                    "elapsed": el, "eta": (total_iters - t - 1) / rate,
+                    "n_divergent": ndiv, "step_size": _step_size_of(params)})
+            if progress:
+                print(f"[sample] {t + 1}/{total_iters} | {rate:.2f} it/s | "
+                      f"accept {acc:.2f} | divergences {ndiv} | "
+                      f"elapsed {_fmt_eta(el)} | "
                   f"eta {_fmt_eta((total_iters - t - 1) / rate)}", flush=True)
 
     _drain()
@@ -271,5 +515,16 @@ def run(
         final_params=params,
         warmup_trace=({k: np.array(v) for k, v in trace.items()}
                       if trace["iter"] else None),
-        extras={"n_divergent": int(np.array(divergent_sum).sum())},
+        extras={
+            "n_divergent": int(np.array(divergent_sum).sum()),
+            # per-chain resolution: a chain that both sits low in
+            # log-probability and diverges on most proposals is stuck at a
+            # boundary, whereas one that sits low with healthy acceptance is
+            # in a secondary mode. The scalar above cannot tell those apart.
+            "divergent_per_chain": np.array(divergent_sum),
+        },
+        seed=seed,
+        iters_consumed=iter0 + n_warmup + total_iters,
+        kernel=type(kernel).__name__,
+        kernel_ckpt=kernel.checkpoint(),
     )

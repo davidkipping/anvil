@@ -136,6 +136,28 @@ Rules of thumb from profiling:
   stretch move is the safer pick for kinky or plateau-ridden posteriors
   (transit ingress/egress edges, box-like models).
 
+## Extending a run
+
+Short of effective samples? Extend the same chains rather than start over:
+
+```python
+res1 = anvil.run(kernel, target, u0, n_warmup=400, n_samples=200, seed=1)
+res2 = anvil.run(kernel, target, resume=res1, n_samples=400)
+res1.save_state("run.npz")                 # .npz, no pickle
+state = anvil.load_state("run.npz")        # ... in another process
+```
+
+A resume continues from the final positions with the adaptation frozen
+(step size, trajectory length, diagonal or dense preconditioner), so a
+target needing 16k draws per chain pays warmup once rather than once per
+doubling round. It also continues the **key stream**: keys come from
+`(seed, iteration, role)`, so a naive `n_warmup=0` rerun would redraw the
+warmup keys — every `Results` carries `iters_consumed` and a continuation
+offsets from it. `n_warmup` defaults to 0 on a resume and an explicit
+nonzero one raises: re-adapting would make the continuation a different
+Markov chain, whose draws could not honestly be concatenated with the first
+segment's.
+
 ## Diagnostics and after-the-fact checks
 
 `anvil.diagnose(chain)` returns R-hat and bulk ESS from a single shared

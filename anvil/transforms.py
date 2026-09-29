@@ -123,9 +123,19 @@ class Transform:
     def log_det_jac(self, u: mx.array) -> mx.array:
         """(n, dim) -> (n,) log-abs-determinant of d(model)/du, summed
         over dimensions."""
-        sig = mx.sigmoid(u)
-        # d/du [lo + w*sigmoid(u)] = w * sig * (1 - sig)
-        lj_bounded = mx.log(self._width32) + mx.log(sig) + mx.log1p(-sig)
+        # d/du [lo + w*sigmoid(u)] = w * sig * (1 - sig), whose log is
+        # log(w) + log(sig) + log1p(-sig). Written that way it is -inf for
+        # |u| >= 18, because mx.sigmoid(18) is exactly 1.0 in float32 — and
+        # a parameter pinned against its bound is then unrecoverable, since
+        # every proposal out of -inf reads as a divergence. The identity
+        #     log(sig) + log1p(-sig) == -|u| - 2*log1p(exp(-|u|))
+        # is finite and accurate for every float32 u (and more accurate
+        # than the sigmoid form well before it saturates: at u = 15 it
+        # gives -15.0000 against -15.0261). The host float64 replica in
+        # log_det_jac_np already used the equivalent logaddexp form.
+        au = mx.abs(u)
+        lj_bounded = (mx.log(self._width32) - au
+                      - 2.0 * mx.log1p(mx.exp(-au)))
         lj_lower = mx.log(self._scale32) + u        # d/du [lo + s e^u]
         lj_upper = mx.log(self._scale32) - u        # d/du [hi - s e^-u]
         lj_free = mx.log(self._scale32)

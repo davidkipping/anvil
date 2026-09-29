@@ -235,3 +235,57 @@ def test_warmup_report_requires_a_trace():
             n_warmup=20, n_samples=5, seed=27, warmup_probes=0)
     with pytest.raises(ValueError, match="warmup_probes"):
         warmup_report(r)
+
+
+# -- per-chain divergences and the progress callback ----------------------
+
+
+def test_divergences_are_reported_per_chain_as_well_as_summed():
+    """A scalar count cannot tell one pathological chain from a diffusely
+    unhappy ensemble; the funnel produces both."""
+    from anvil.targets import neals_funnel
+
+    target = neals_funnel(5)
+    u0 = mx.array(
+        np.random.default_rng(0).standard_normal((128, 5)).astype(np.float32)
+        * 0.5)
+    res = run(ChEESHMC(target), target, u0, n_warmup=200, n_samples=200, seed=2)
+    per_chain = res.extras["divergent_per_chain"]
+    assert per_chain.shape == (128,)
+    assert np.all(per_chain >= 0)
+    assert per_chain.sum() == res.extras["n_divergent"]
+    assert res.extras["n_divergent"] > 0        # the funnel is meant to be hard
+
+
+def test_callback_sees_both_phases_with_the_numbers_progress_prints(capsys):
+    target, u0 = _setup()
+    seen = []
+    res = run(RandomWalkMetropolis(target), target, u0,
+              n_warmup=40, n_samples=40, seed=1,
+              callback=lambda ph, it, info: seen.append((ph, it, info)))
+    assert capsys.readouterr().out == ""        # a callback is not a printer
+    phases = [p for p, _, _ in seen]
+    assert phases.count("warmup") == 10 and phases.count("sample") == 10
+    assert [it for p, it, _ in seen if p == "warmup"] == list(range(4, 41, 4))
+    for phase, _, info in seen:
+        assert info["total"] == 40
+        assert 0.0 <= info["accept"] <= 1.0
+        assert info["rate"] > 0 and info["elapsed"] > 0 and info["eta"] >= 0
+        assert info["step_size"] is None       # RWM has no step_size param
+        assert ("n_divergent" in info) == (phase == "sample")
+
+
+def test_callback_follows_an_explicit_progress_cadence(capsys):
+    target, u0 = _setup()
+    seen = []
+    run(ChEESHMC(target), target, u0, n_warmup=20, n_samples=20, seed=1,
+        progress=5, callback=lambda ph, it, info: seen.append((ph, it, info)))
+    assert capsys.readouterr().out != ""        # progress=5 still prints
+    assert [it for p, it, _ in seen if p == "warmup"] == [5, 10, 15, 20]
+    assert all(info["step_size"] > 0 for _, _, info in seen)
+
+
+def test_no_callback_and_no_progress_stays_silent(capsys):
+    target, u0 = _setup()
+    run(RandomWalkMetropolis(target), target, u0, n_warmup=10, n_samples=10)
+    assert capsys.readouterr().out == ""

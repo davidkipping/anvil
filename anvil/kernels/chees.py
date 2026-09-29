@@ -125,9 +125,21 @@ class ChEESHMC(Kernel):
         ke0 = 0.5 * mx.sum(inv_mass * p0 * p0, axis=-1)
         ke1 = 0.5 * mx.sum(inv_mass * p1 * p1, axis=-1)
         dH = (lp1 - ke1) - (lp0 - ke0)
-        dH_safe = mx.where(mx.isfinite(dH), dH, -mx.inf)
+        # A chain sitting on a non-finite log-probability (a hard prior
+        # edge, a model that returns -inf) must be able to leave. Its dH is
+        # +inf for exactly the proposal that rescues it, and treating
+        # "not finite" as "divergent" would reject that move and trap the
+        # chain permanently. So: a move out of a non-finite current state
+        # into a finite one is always accepted, and a chain that is already
+        # stuck is not counted as diverging -- it is not the proposal's
+        # fault. Moves the other way (finite -> non-finite) are divergences
+        # as before.
+        stuck = ~mx.isfinite(lp0)
+        rescue = stuck & mx.isfinite(lp1)
+        dH_safe = mx.where(mx.isfinite(dH), dH,
+                           mx.where(rescue, mx.inf, -mx.inf))
         accept_prob = mx.minimum(1.0, mx.exp(dH_safe))
-        diverged = ~mx.isfinite(dH) | (dH < -self.div_threshold)
+        diverged = (~mx.isfinite(dH) | (dH < -self.div_threshold)) & ~stuck
         log_u = mx.log(mx.random.uniform(shape=dH.shape, key=key))
         accept = (log_u < dH_safe) & ~diverged
         acc = accept[:, None]
@@ -167,9 +179,21 @@ class ChEESHMC(Kernel):
         ke0 = 0.5 * mx.sum(p0 * self._sigma_p(p0, s, R), axis=-1)
         ke1 = 0.5 * mx.sum(p1 * self._sigma_p(p1, s, R), axis=-1)
         dH = (lp1 - ke1) - (lp0 - ke0)
-        dH_safe = mx.where(mx.isfinite(dH), dH, -mx.inf)
+        # A chain sitting on a non-finite log-probability (a hard prior
+        # edge, a model that returns -inf) must be able to leave. Its dH is
+        # +inf for exactly the proposal that rescues it, and treating
+        # "not finite" as "divergent" would reject that move and trap the
+        # chain permanently. So: a move out of a non-finite current state
+        # into a finite one is always accepted, and a chain that is already
+        # stuck is not counted as diverging -- it is not the proposal's
+        # fault. Moves the other way (finite -> non-finite) are divergences
+        # as before.
+        stuck = ~mx.isfinite(lp0)
+        rescue = stuck & mx.isfinite(lp1)
+        dH_safe = mx.where(mx.isfinite(dH), dH,
+                           mx.where(rescue, mx.inf, -mx.inf))
         accept_prob = mx.minimum(1.0, mx.exp(dH_safe))
-        diverged = ~mx.isfinite(dH) | (dH < -self.div_threshold)
+        diverged = (~mx.isfinite(dH) | (dH < -self.div_threshold)) & ~stuck
         log_u = mx.log(mx.random.uniform(shape=dH.shape, key=key))
         accept = (log_u < dH_safe) & ~diverged
         acc = accept[:, None]
@@ -222,7 +246,17 @@ class ChEESHMC(Kernel):
         h = halton_jitter(self._iter)
         self._iter += 1
         self._last_h = h
-        L = max(1, min(self.max_leapfrog, math.ceil(h * T_f / eps_f)))
+        if eps_f > 0.0 and math.isfinite(T_f):
+            L = max(1, min(self.max_leapfrog, math.ceil(h * T_f / eps_f)))
+        else:
+            # Adaptation has collapsed -- dual averaging can drive the step
+            # size to float32 underflow when a subset of chains sits on a
+            # non-finite log-probability and drags the harmonic-mean
+            # acceptance to zero. Take a single (inert) step rather than
+            # dividing by zero: the run then ends with a stalled-chain
+            # signature that warmup_report and the divergence counts can
+            # describe, instead of a traceback from inside the sampler.
+            L = 1
 
         k_mom, k_acc = mx.random.split(key)
         u = state["u"]
@@ -250,6 +284,25 @@ class ChEESHMC(Kernel):
             k_acc, u, state["log_prob"], state["grad"], p0, q, lp, g, p,
             *extra,
         )
+
+    def attach(self, target, state, params) -> None:
+        self.target = target
+        # The params decide the preconditioner, not the constructor: a run
+        # that asked for dense= and was downgraded at init (too few chains)
+        # wrote diagonal params, and continuing it densely would read a
+        # "corr" that is not there. Reconcile, recompiling if we moved.
+        dense = "corr" in params
+        if dense != self.dense:
+            self.dense = dense
+            self._compile_kernels()
+
+    def checkpoint(self) -> dict[str, float]:
+        # the Halton jitter is a *sequence*, not a draw: restarting it would
+        # replay the same trajectory lengths the first segment already used
+        return {"halton_iter": float(self._iter)}
+
+    def restore(self, ckpt: dict[str, float]) -> None:
+        self._iter = int(ckpt.get("halton_iter", 0))
 
     def init_adapt(self, state: ChainState) -> ChEESAdaptState:
         dim = state["u"].shape[1]

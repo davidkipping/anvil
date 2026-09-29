@@ -57,3 +57,24 @@ class Kernel:
         """Extract the params dict ``step`` consumes. With ``warmup=False``
         return the frozen (iterate-averaged) values."""
         return {}
+
+    # -- continuation (engine.run(..., resume=...)) ------------------------
+
+    def attach(self, target: LogDensity, state: ChainState,
+               params: dict[str, mx.array]) -> None:
+        """Prepare to continue an existing run: whatever ``init`` sets up
+        besides the chain state itself. The engine calls this instead of
+        ``init`` on a resume, so a kernel that caches ``target`` (all of
+        them do) must not rely on ``init`` having run."""
+        self.target = target
+
+    def checkpoint(self) -> dict[str, float]:
+        """Host-side counters to carry across a resume -- a quasi-random
+        jitter index, a move-mixing draw count. Scalars only; anything
+        array-shaped belongs in the chain state or the params."""
+        return {}
+
+    def restore(self, ckpt: dict[str, float]) -> None:
+        """Inverse of :meth:`checkpoint`. Missing keys mean an older or
+        different kernel wrote the state: start from the default."""
+        return None

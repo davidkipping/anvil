@@ -110,7 +110,9 @@ class EnsembleKernel(Kernel):
         self.moves = moves or [(StretchMove(), 1.0)]
         total = sum(w for _, w in self.moves)
         self._weights = [w / total for _, w in self.moves]
+        self._seed = int(seed)
         self._chooser = _pyrandom.Random(seed ^ 0x5EED)
+        self._moves_drawn = 0
         self._compiled = [mx.compile(self._make_step(m)) for m, _ in self.moves]
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
@@ -169,4 +171,17 @@ class EnsembleKernel(Kernel):
 
     def step(self, key, state, params):
         i = self._chooser.choices(range(len(self.moves)), self._weights)[0]
+        self._moves_drawn += 1
         return self._compiled[i](key, state, params)
+
+    def checkpoint(self) -> dict[str, float]:
+        return {"move_draws": float(self._moves_drawn)}
+
+    def restore(self, ckpt: dict[str, float]) -> None:
+        # the move choice is host-side, so replay it to the recorded point
+        # rather than restarting the mixture from move zero
+        n = int(ckpt.get("move_draws", 0))
+        self._chooser = _pyrandom.Random(self._seed ^ 0x5EED)
+        for _ in range(n):
+            self._chooser.choices(range(len(self.moves)), self._weights)
+        self._moves_drawn = n

@@ -250,6 +250,90 @@ adaptation reads freshly-computed parameters back on the host each
 iteration, so pipelining it would mean adapting from stale ones — a
 change in what the sampler does, not just when.
 
+## Continuing a run instead of restarting it
+
+The usual convergence loop is: run, check R-hat and ESS, and if they are
+short, run longer. Restarting pays warmup again every round and — worse —
+produces a *different* Markov chain, whose draws cannot honestly be
+concatenated with the first attempt's. `resume=` extends the same chains
+with the same frozen adaptation:
+
+```python
+res1 = anvil.run(kernel, target, u0, n_warmup=400, n_samples=200, seed=1)
+if anvil.diagnose(res1.get_chain()).min_ess < 400:
+    res2 = anvil.run(kernel, target, resume=res1, n_samples=400)
+    draws = np.concatenate([res1.get_chain(), res2.get_chain()])
+```
+
+`resume=` takes a `Results` (or a `ResumeState` from
+{func}`anvil.load_state`) and continues from its final positions, cached
+log-probabilities and gradients, with `final_params` — step size,
+trajectory length, and the diagonal or dense preconditioner — held exactly
+as warmup left them. `n_warmup` defaults to 0 on a resume, since the
+fresh-run default of 500 is not a request to re-adapt; an *explicit*
+nonzero one raises rather than being silently discarded, because
+re-adapting would break precisely the continuity being asked for. `u0` is
+not used (pass it anyway and it is checked for a matching shape). On a 400-warmup, 512-chain ChEES run,
+extending rather than restarting removes a ~50% tax from every round.
+
+**The key stream continues.** This is the part that is easy to get silently
+wrong. Keys are derived from `(seed, iteration, role)`, and the sampling
+loop draws `key(n_warmup + t)` — so a naive resume with `n_warmup=0` would
+redraw the *warmup* keys, correlating the continuation with the adaptation
+phase it is meant to follow. Every `Results` therefore carries
+`iters_consumed` (warmup plus `n_samples × thin`, accumulated across
+resumes) and a continuation offsets from it. `seed` defaults to the one
+recorded in the state; pass a different one to fork a segment deliberately.
+
+`accept_fraction` and both divergence counts describe the resumed segment
+alone — aggregate across rounds yourself.
+
+Ensemble runs resume too (their `make_params` is empty, so there is little
+to freeze), and the host-side bookkeeping that is not in the params rides
+along in `kernel_ckpt`: ChEES's Halton jitter index, the ensemble's
+move-mixing draw count. Restarting either of those would replay a sequence
+the first segment had already used.
+
+### Across process boundaries
+
+```python
+res.save_state("run_state.npz")
+state = anvil.load_state("run_state.npz")
+res2 = anvil.run(kernel, target, resume=state, n_samples=400)
+```
+
+A plain `.npz`, **no pickle**: positions, cached log-prob and gradient, the
+params (including the dense `corr` and `lrinv` as `(dim, dim)` matrices),
+the iteration counter, the seed, the chain/dimension counts, and a
+kernel/version tag. Everything is stored under a transparent name so a
+caller can *read* the tag and refuse a mismatch rather than discover it
+from a traceback. anvil checks what it can itself: a `dim` that disagrees
+with the target, a `u0` whose shape disagrees with the saved chains, a
+state written by a different kernel, or an internally inconsistent file
+each raise a specific error naming both sides.
+
+## Bounded parameters at their edges
+
+A chain that reaches a bounded parameter's boundary used to stay there.
+Two independent causes, both fixed:
+
+- `log_det_jac` computed the bounded branch as `log(sig) + log1p(-sig)`,
+  which is `-inf` for `|u| ≳ 18` because `mx.sigmoid(18.0)` is exactly
+  `1.0` in float32. The identity `-|u| - 2·log1p(exp(-|u|))` is finite for
+  every float32 `u`, and is *more* accurate well before saturation
+  (−15.0000 against −15.0261 at `u = 15`). The value is unchanged
+  elsewhere, so a run with no boundary chains cannot move.
+- ChEES rejected a proposal flagged divergent even when the current state
+  was already non-finite — vetoing the one move that rescues the chain. A
+  divergence now only vetoes a proposal from a *finite* state.
+
+Grazing transit geometries and low-signal timing offsets sit at their
+bounds by construction, so with hundreds of chains a few arriving at an
+edge is routine; before this, each was lost for the rest of the run,
+silently, and dragged the shared step size down for everyone else.
+`tests/test_boundary.py` starts chains at `u = 15` and `u = 25` and
+requires them to rejoin the bulk.
+
 ## Diagnostics cost
 
 {func}`anvil.diagnose` returns R-hat and bulk ESS from one shared pass;
