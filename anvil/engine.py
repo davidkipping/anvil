@@ -7,6 +7,7 @@ acceptance bookkeeping. One loop serves every kernel.
 
 from __future__ import annotations
 
+import inspect
 import os
 import time
 from collections import deque
@@ -45,6 +46,25 @@ def _to_mx(a: np.ndarray) -> mx.array:
     # mx.array() on a float64 numpy array silently returns float32; naming
     # the dtype is the only way to keep a float64 round-trip exact
     return mx.array(a, dtype=mx.float64) if a.dtype == np.float64 else mx.array(a)
+
+
+def _kernel_class(name: str) -> type[Kernel]:
+    """The Kernel subclass called ``name``. Found by walking the subclass
+    tree rather than a registry, so a user-defined kernel works as soon as
+    its module is imported."""
+    seen: dict[str, type[Kernel]] = {}
+    stack = [Kernel]
+    while stack:
+        cls = stack.pop()
+        seen.setdefault(cls.__name__, cls)
+        stack.extend(cls.__subclasses__())
+    if name not in seen:
+        raise ValueError(
+            f"no imported Kernel subclass is named {name!r}, so there is no "
+            f"way to know what this state caches; import the module that "
+            f"defines it, or pass kernel= an instance of it "
+            f"(known: {', '.join(sorted(seen))})")
+    return seen[name]
 
 
 @dataclass
@@ -104,6 +124,82 @@ class ResumeState:
                 f"dims, but u0 has shape {tuple(u0.shape)}. u0 is not used on "
                 f"a resume, so this is a configuration mismatch, not an "
                 f"initialization.")
+
+    # -- moving the chains -------------------------------------------------
+
+    def with_positions(self, u, target: LogDensity, kernel=None
+                       ) -> "ResumeState":
+        """A copy of this state with the chains moved to ``u``
+        ((n_chains, dim), unconstrained space), every cached per-chain
+        quantity the kernel keeps recomputed there, and everything else --
+        frozen params, iteration, seed, kernel -- unchanged.
+
+        For composing an exact move of your own with anvil's sampling: draw
+        new positions however you like (a Gibbs sweep over a conditional
+        that anvil cannot see, a mode-hopping proposal, a
+        reparameterization), hand them in here, and resume. The result is
+        still one Markov chain, so its segments pool exactly as resumed
+        segments already do.
+
+        What this exists to prevent is the hand-written version: writing
+        ``state["u"]`` and leaving the cached ``log_prob`` (and, for ChEES,
+        ``grad``) describing where the chain *used* to be. That resumes from
+        a stale cache — a wrong answer that no diagnostic flags, because
+        every array still has the right shape and the chain still moves.
+        The recomputation goes through the kernel's
+        :meth:`~anvil.kernels.base.Kernel.refresh`, so a kernel that caches
+        something this layout does not know about raises rather than
+        silently copying it.
+
+        The key stream is untouched: ``iteration`` and ``seed`` are carried
+        over, so the next segment draws exactly the keys it would have drawn
+        without the move. Randomness for the move itself is the caller's.
+        """
+        u = (u.astype(mx.float32) if isinstance(u, mx.array)
+             else mx.array(np.asarray(u, dtype=np.float32)))
+        if tuple(u.shape) != (self.n_chains, self.dim):
+            raise ValueError(
+                f"new positions must have shape ({self.n_chains}, "
+                f"{self.dim}) to match the resumed chains, got "
+                f"{tuple(u.shape)}")
+        if not bool(mx.all(mx.isfinite(u)).item()):
+            bad = int(np.array(~mx.isfinite(u).all(axis=-1)).sum())
+            raise ValueError(
+                f"new positions are not all finite ({bad} of "
+                f"{self.n_chains} chains); a non-finite position cannot be "
+                f"refreshed into a usable state")
+
+        cls = type(kernel) if kernel is not None else _kernel_class(self.kernel)
+        fn = kernel.refresh if kernel is not None else cls.refresh
+        if kernel is None and not inspect.ismethod(fn):
+            raise TypeError(
+                f"{cls.__name__}.refresh is an instance method, so it cannot "
+                f"be reached from a saved state by name; declare it a "
+                f"classmethod, or pass kernel= an instance")
+        fresh = fn(self.state, u, target)
+        mx.eval(*fresh.values())
+
+        lp = fresh.get("log_prob")
+        if lp is not None and not bool(mx.all(mx.isfinite(lp)).item()):
+            bad = int(np.array(~mx.isfinite(lp)).sum())
+            raise ValueError(
+                f"the target is not finite at the new positions for {bad} of "
+                f"{self.n_chains} chains. Resuming from those would strand "
+                f"them: a chain whose current log-probability is -inf can "
+                f"only move if a proposal happens to land somewhere finite. "
+                f"Keep the move inside the support, or leave those chains "
+                f"where they were.")
+        return ResumeState(
+            state=fresh,
+            params=dict(self.params),
+            iteration=self.iteration,
+            seed=self.seed,
+            n_chains=self.n_chains,
+            dim=self.dim,
+            kernel=self.kernel,
+            kernel_ckpt=dict(self.kernel_ckpt),
+            anvil_version=self.anvil_version,
+        )
 
     # -- persistence -------------------------------------------------------
 

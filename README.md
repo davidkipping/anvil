@@ -147,6 +147,12 @@ res1.save_state("run.npz")                 # .npz, no pickle
 state = anvil.load_state("run.npz")        # ... in another process
 ```
 
+`res.resume_state().with_positions(u, target)` moves the chains somewhere
+else first, recomputing every cached quantity there — the seam for
+alternating anvil's sampling with an exact move of your own (a Gibbs sweep
+over a conditional anvil cannot see, a mode hop across a gap HMC will not
+cross).
+
 A resume continues from the final positions with the adaptation frozen
 (step size, trajectory length, diagonal or dense preconditioner), so a
 target needing 16k draws per chain pays warmup once rather than once per

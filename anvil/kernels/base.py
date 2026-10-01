@@ -68,6 +68,38 @@ class Kernel:
         them do) must not rely on ``init`` having run."""
         self.target = target
 
+    @classmethod
+    def refresh(cls, state: ChainState, u: mx.array,
+                target: LogDensity) -> ChainState:
+        """Rebuild the chain state at new positions ``u``: every cached
+        per-chain quantity recomputed there, nothing carried over.
+
+        This is what makes it safe to *move* chains between segments (a
+        Gibbs sweep, a mode-hopping proposal, a reparameterization) without
+        the caller knowing which quantities a kernel caches. A classmethod
+        because the answer is a property of the kernel's state layout, not
+        of a tuned instance -- which is what lets
+        :meth:`anvil.ResumeState.with_positions` reach it from a saved
+        state by name alone.
+
+        The default covers the ``{"u", "log_prob"}`` layout and *refuses*
+        anything else: a kernel that caches more must say how to recompute
+        it, because the alternative is resuming from a stale cache, which
+        is a wrong answer rather than a crash."""
+        return cls._check_refresh(state, {"u": u, "log_prob": target.log_prob(u)})
+
+    @classmethod
+    def _check_refresh(cls, state: ChainState, fresh: ChainState) -> ChainState:
+        stale = sorted(set(state) - set(fresh))
+        if stale:
+            raise NotImplementedError(
+                f"{cls.__name__} caches {stale} in its chain state, which "
+                f"refresh() does not recompute. Override refresh() (a "
+                f"classmethod) to rebuild it at the new positions -- copying "
+                f"it across a move would resume from a stale cache, which is "
+                f"a silently wrong answer, not a crash.")
+        return fresh
+
     def checkpoint(self) -> dict[str, float]:
         """Host-side counters to carry across a resume -- a quasi-random
         jitter index, a move-mixing draw count. Scalars only; anything

@@ -309,3 +309,245 @@ def test_the_proposed_spelling_works_without_naming_n_warmup():
     assert res2.iters_consumed == 40
     np.testing.assert_array_equal(np.array(res1.final_params["step_scale"]),
                                   np.array(res2.final_params["step_scale"]))
+
+
+# -- moving the chains between segments -----------------------------------
+#
+# The point of with_positions is that a caller composing its own exact move
+# (a Gibbs sweep over a conditional anvil cannot see, a mode hop) does not
+# have to know which per-chain quantities a kernel caches. Writing u by hand
+# and leaving the cache behind is a silently wrong answer, so these tests
+# check both that the refreshed state is right and that the stale one is
+# visibly different.
+
+
+def _moved(rng, n=128, dim=4, scale=1.0):
+    return mx.array(rng.standard_normal((n, dim)).astype(np.float32) * scale)
+
+
+@pytest.mark.parametrize("kernel_name", ["rwm", "ensemble", "chees"])
+def test_with_positions_rebuilds_exactly_what_init_would_have(kernel_name):
+    target, u0, _, _ = _setup()
+    make = _kernels(target)[kernel_name]
+    res = run(make(), target, u0, n_warmup=40, n_samples=10, seed=21)
+    rs = res.resume_state()
+    new = _moved(np.random.default_rng(99))
+
+    moved = rs.with_positions(new, target)
+    reference = make().init(mx.random.key(0), new, target)
+    assert set(moved.state) == set(reference)
+    for k, v in reference.items():
+        np.testing.assert_array_equal(np.array(moved.state[k]), np.array(v))
+
+
+@pytest.mark.parametrize("kernel_name", ["rwm", "ensemble", "chees"])
+def test_resuming_a_moved_state_matches_a_run_started_there(kernel_name):
+    """Same frozen params, same key-stream position, chains at `new`: the
+    moved state and a state built from scratch at `new` must sample
+    identically, bit for bit."""
+    from dataclasses import replace
+
+    target, u0, _, _ = _setup()
+    make = _kernels(target)[kernel_name]
+    res = run(make(), target, u0, n_warmup=40, n_samples=10, seed=22)
+    rs = res.resume_state()
+    new = _moved(np.random.default_rng(100))
+
+    a = run(make(), target, resume=rs.with_positions(new, target), n_samples=12)
+    built = replace(rs, state=make().init(mx.random.key(0), new, target))
+    b = run(make(), target, resume=built, n_samples=12)
+    np.testing.assert_array_equal(a.get_chain(), b.get_chain())
+    np.testing.assert_array_equal(a.get_log_prob(), b.get_log_prob())
+
+
+def test_a_hand_moved_state_keeps_a_stale_cache_and_samples_differently():
+    """What with_positions exists to prevent: setting u and leaving
+    log_prob/grad describing where the chain used to be."""
+    from dataclasses import replace
+
+    target, u0, _, _ = _setup()
+    res = run(ChEESHMC(target), target, u0, n_warmup=40, n_samples=10, seed=23)
+    rs = res.resume_state()
+    new = _moved(np.random.default_rng(101), scale=2.0)
+
+    refreshed = rs.with_positions(new, target)
+    stale = replace(rs, state={**rs.state, "u": new})      # the brittle version
+
+    # the cache really is wrong, by far more than the ~1-unit scale of a
+    # Metropolis accept decision for a typical chain (a few chains always
+    # happen to land at a similar density, which is the insidious part)
+    gap = np.abs(np.array(stale.state["log_prob"])
+                 - np.array(refreshed.state["log_prob"]))
+    assert np.median(gap) > 1.0, np.median(gap)
+    # ... and it changes the sampling, silently: same shapes, no error
+    a = run(ChEESHMC(target), target, resume=refreshed, n_samples=10)
+    b = run(ChEESHMC(target), target, resume=stale, n_samples=10)
+    assert not np.array_equal(a.get_chain(), b.get_chain())
+
+
+def test_a_kernel_that_caches_more_must_say_how_to_refresh_it():
+    from dataclasses import replace
+
+    target, u0, _, _ = _setup()
+    res = run(ChEESHMC(target), target, u0, n_warmup=20, n_samples=5, seed=24)
+    rs = replace(res.resume_state(),
+                 state={**res.final_state, "hessian_est": res.final_state["u"]})
+    with pytest.raises(NotImplementedError, match=r"caches \['hessian_est'\]"):
+        rs.with_positions(_moved(np.random.default_rng(1)), target)
+
+
+def test_with_positions_leaves_the_key_stream_and_the_original_alone():
+    target, u0, _, _ = _setup()
+    res = run(ChEESHMC(target), target, u0, n_warmup=40, n_samples=10, seed=25)
+    rs = res.resume_state()
+    before = np.array(rs.state["u"])
+    moved = rs.with_positions(_moved(np.random.default_rng(2)), target)
+
+    assert moved is not rs
+    assert (moved.iteration, moved.seed) == (rs.iteration, rs.seed)
+    assert (moved.kernel, moved.kernel_ckpt) == (rs.kernel, rs.kernel_ckpt)
+    for k, v in rs.params.items():
+        np.testing.assert_array_equal(np.array(v), np.array(moved.params[k]))
+    np.testing.assert_array_equal(before, np.array(rs.state["u"]))   # not in place
+    # and the moved state is itself persistable
+    assert moved.n_chains == rs.n_chains and moved.dim == rs.dim
+
+
+def test_with_positions_accepts_numpy_and_casts_to_float32():
+    target, u0, _, _ = _setup()
+    res = run(ChEESHMC(target), target, u0, n_warmup=20, n_samples=5, seed=26)
+    new = np.random.default_rng(3).standard_normal((128, 4))      # float64
+    moved = res.resume_state().with_positions(new, target)
+    assert moved.state["u"].dtype == mx.float32
+    np.testing.assert_allclose(np.array(moved.state["u"]), new, rtol=1e-6)
+
+
+def test_with_positions_rejects_a_wrong_shape_or_non_finite_move():
+    target, u0, _, _ = _setup()
+    rs = run(ChEESHMC(target), target, u0,
+             n_warmup=20, n_samples=5, seed=27).resume_state()
+    with pytest.raises(ValueError, match=r"shape \(128, 4\)"):
+        rs.with_positions(mx.zeros((64, 4)), target)
+    bad = np.zeros((128, 4), np.float32)
+    bad[3] = np.inf
+    with pytest.raises(ValueError, match="not all finite"):
+        rs.with_positions(bad, target)
+
+
+def test_with_positions_refuses_a_move_outside_the_support():
+    """A chain whose log-probability is -inf can only escape by luck, so
+    moving one there is reported rather than accepted."""
+    import mlx.core as _mx
+
+    from anvil.logdensity import FunctionLogDensity
+
+    def boxed(u):
+        inside = _mx.all(_mx.abs(u) < 10.0, axis=-1)
+        return _mx.where(inside, -0.5 * _mx.sum(u * u, axis=-1), -_mx.inf)
+
+    target = FunctionLogDensity(boxed, dim=2)
+    u0 = mx.array(np.random.default_rng(4).standard_normal((64, 2))
+                  .astype(np.float32))
+    rs = run(ChEESHMC(target), target, u0,
+             n_warmup=30, n_samples=5, seed=28).resume_state()
+    out = np.zeros((64, 2), np.float32)
+    out[:5] = 50.0
+    with pytest.raises(ValueError, match="not finite at the new positions"):
+        rs.with_positions(out, target)
+
+
+def test_with_positions_needs_to_know_the_kernel():
+    from dataclasses import replace
+
+    target, u0, _, _ = _setup()
+    rs = run(ChEESHMC(target), target, u0,
+             n_warmup=20, n_samples=5, seed=29).resume_state()
+    unknown = replace(rs, kernel="SomeKernelFromAnotherPackage")
+    with pytest.raises(ValueError, match="no imported Kernel subclass"):
+        unknown.with_positions(_moved(np.random.default_rng(5)), target)
+    # ... but an instance settles it
+    moved = unknown.with_positions(_moved(np.random.default_rng(5)), target,
+                                   kernel=ChEESHMC(target))
+    assert sorted(moved.state) == ["grad", "log_prob", "u"]
+
+
+def _bimodal(sep=6.0, w=0.7):
+    """Two well-separated Gaussians in dim 0 (weights w, 1-w) and a
+    standard normal in dim 1. ChEES cannot cross a gap of 6 sd."""
+    import math
+
+    from anvil.logdensity import FunctionLogDensity
+
+    def lp(u):
+        x0, x1 = u[:, 0], u[:, 1]
+        return (mx.logaddexp(math.log(w) - 0.5 * (x0 - sep) ** 2,
+                             math.log1p(-w) - 0.5 * (x0 + sep) ** 2)
+                - 0.5 * x1 * x1)
+
+    return FunctionLogDensity(lp, dim=2)
+
+
+def _grid_gibbs(u, target, rng, lo=-12.0, hi=12.0, n=481):
+    """Redraw dim 0 from its conditional on a grid, with an independence
+    Metropolis-Hastings correction — the move the seam exists for, written
+    the way a caller would write it (host-side, its own RNG)."""
+    u = np.array(u, dtype=np.float32)
+    n_ch = u.shape[0]
+    grid = np.linspace(lo, hi, n, dtype=np.float32)
+
+    cand = np.repeat(u[:, None, :], n, axis=1)
+    cand[:, :, 0] = grid
+    lp_grid = np.array(target.log_prob(
+        mx.array(cand.reshape(-1, u.shape[1])))).reshape(n_ch, n)
+    w = np.exp(lp_grid - lp_grid.max(1, keepdims=True))
+    w /= w.sum(1, keepdims=True)
+
+    idx = (rng.random((n_ch, 1)) < np.cumsum(w, 1)).argmax(1)
+    prop = u.copy()
+    prop[:, 0] = grid[idx]
+    cur = np.clip(np.rint((u[:, 0] - lo) / (hi - lo) * (n - 1)).astype(int),
+                  0, n - 1)
+    rows = np.arange(n_ch)
+    # q is the discretized conditional, so the proposal is not symmetric
+    log_ratio = ((lp_grid[rows, idx] - lp_grid[rows, cur])
+                 + (np.log(w[rows, cur]) - np.log(w[rows, idx])))
+    take = np.log(rng.random(n_ch)) < log_ratio
+    return mx.array(np.where(take[:, None], prop, u))
+
+
+def test_an_exact_move_between_segments_recovers_mode_weights():
+    """The end-to-end claim: ChEES alternated with an exact move through
+    with_positions is still one Markov chain, and samples the mixture ChEES
+    alone cannot. Weights 0.7/0.3, all chains started in the heavy mode."""
+    target = _bimodal()
+    rng = np.random.default_rng(7)
+    u0 = mx.array(np.stack([6.0 + 0.1 * rng.standard_normal(128),
+                            rng.standard_normal(128)], axis=1)
+                  .astype(np.float32))
+
+    # control: ChEES alone, same budget. Every chain stays where it started.
+    alone = run(ChEESHMC(target), target, u0,
+                n_warmup=300, n_samples=1000, seed=31)
+    assert (alone.get_chain()[..., 0] > 0).mean() > 0.999
+
+    res = run(ChEESHMC(target), target, u0,
+              n_warmup=300, n_samples=200, seed=31)
+    segments = []
+    for _ in range(5):
+        rs = res.resume_state()
+        moved = rs.with_positions(_grid_gibbs(rs.state["u"], target, rng),
+                                  target)
+        res = run(ChEESHMC(target), target, resume=moved, n_samples=200)
+        segments.append(res.get_chain())
+
+    draws = np.concatenate(segments)
+    heavy = (draws[..., 0] > 0).mean()
+    assert abs(heavy - 0.7) < 0.06, heavy
+    # both modes are resolved, not merely visited
+    for sign, centre in ((+1, 6.0), (-1, -6.0)):
+        x = draws[..., 0][np.sign(draws[..., 0]) == sign]
+        assert abs(x.mean() - centre) < 0.15
+        assert abs(x.std() - 1.0) < 0.15
+    # the nuisance dimension is unharmed by the move
+    assert abs(draws[..., 1].mean()) < 0.05
+    assert abs(draws[..., 1].std() - 1.0) < 0.05

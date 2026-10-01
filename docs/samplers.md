@@ -294,6 +294,50 @@ along in `kernel_ckpt`: ChEES's Halton jitter index, the ensemble's
 move-mixing draw count. Restarting either of those would replay a sequence
 the first segment had already used.
 
+### Moving the chains between segments
+
+A resume does not have to continue from where the chains stopped.
+`ResumeState.with_positions(u, target)` returns the same state with the
+chains somewhere else and every cached per-chain quantity recomputed
+there:
+
+```python
+rs = res.resume_state()
+u_new = my_exact_move(np.array(rs.state["u"]))        # your move, your RNG
+res2 = anvil.run(kernel, target, resume=rs.with_positions(u_new, target),
+                 n_samples=400)
+```
+
+This is the seam for composing a move anvil cannot see with anvil's
+sampling. The motivating case is multimodality that HMC cannot cross: if
+your model has a parameter whose conditional you can enumerate — a
+per-epoch transit time whose likelihood term depends on that time alone,
+say — you can redraw it exactly on a grid spanning the prior, with a
+Metropolis-Hastings correction, and land in any mode with the right
+probability. ChEES alternated with an exact move is still one Markov
+chain, so the segments pool exactly as resumed segments already do.
+Measured by a downstream caller on a weakly constrained transit time: total
+variation from the exact marginal 0.162 → 0.019, R-hat 1.63 → 1.05, bulk
+ESS 827 → 7,570, for 20% more wall clock.
+
+**Why this is a method and not a line of your own code.** Moving chains by
+hand means writing `state["u"]` and leaving the cached `log_prob` — and,
+for ChEES, the cached `grad` — describing where the chain *used* to be. The
+run continues, every array has the right shape, no diagnostic fires, and
+the answer is wrong. `with_positions` recomputes through the kernel's
+`refresh`, so a kernel that caches something beyond `{u, log_prob, grad}`
+raises rather than copying it across: `refresh` is the contract that makes
+a future cached quantity a loud failure instead of a quiet one.
+
+What it validates: the shape of `u`, that the new positions are finite, and
+that the target is finite at all of them (a chain whose current
+log-probability is `-inf` can only escape by luck, so moving one there is
+reported rather than accepted). What it leaves alone: `iteration` and
+`seed`, so the next segment draws exactly the keys it would have drawn
+without the move — the randomness for the move itself is yours. It returns
+a new `ResumeState`; the original is untouched and still usable for
+diagnostics.
+
 ### Across process boundaries
 
 ```python

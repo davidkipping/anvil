@@ -296,6 +296,14 @@ class ChEESHMC(Kernel):
             self.dense = dense
             self._compile_kernels()
 
+    @classmethod
+    def refresh(cls, state, u, target) -> ChainState:
+        # one forward+backward pass, exactly as init does: the cached
+        # gradient is as position-dependent as the log-probability, and
+        # carrying either across a move is the bug this exists to stop
+        lp, g = target.log_prob_and_grad(u)
+        return cls._check_refresh(state, {"u": u, "log_prob": lp, "grad": g})
+
     def checkpoint(self) -> dict[str, float]:
         # the Halton jitter is a *sequence*, not a draw: restarting it would
         # replay the same trajectory lengths the first segment already used
