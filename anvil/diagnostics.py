@@ -73,8 +73,98 @@ def _rank_normalize(x: np.ndarray) -> np.ndarray:
     return norm_ppf(p).reshape(x.shape)
 
 
-#: rows above which mx.argsort(axis=0) no longer returns a permutation
-_MX_SORT_LIMIT = 2 ** 21
+#: Rows above which ``mx.argsort`` stops returning a permutation. The two
+#: cases are different, and the difference is worth 100x here:
+#:
+#:   * a **contiguous 1-D** sort is exact to at least 2**27 rows;
+#:   * a **strided multi-column** sort (``axis=0`` of an (rows, dim) array
+#:     with dim >= 2) breaks above ``1023 * 2048`` rows -- a tile counter,
+#:     not a row counter, and identical at dim 2, 3, 8 and 105.
+#:
+#: Both failures are silent. Just past the limit the result repeats indices;
+#: further past it, entries come back as 2143289344, which is the bit
+#: pattern of float32 NaN, so the indices are being carried through float32
+#: somewhere. Minimal reproducer (MLX 0.32.2, M2 Max):
+#:
+#:     x = mx.array(np.random.standard_normal((2_095_105, 2)).astype("f4"))
+#:     o = np.array(mx.argsort(x, axis=0))
+#:     np.array_equal(np.sort(o[:, 0]), np.arange(len(o)))   # False
+#:     # ... and True at 2_095_104 rows, or at any size with dim == 1.
+#:
+#: An earlier version of this file guarded on ``rows > 2**21``, which is
+#: BOTH too lenient and too strict: it let the corrupt multi-column sort run
+#: for rows in (2_095_104, 2**21] -- 512 chains x 4096 draws lands exactly
+#: there -- while sending every single-column sort above 2**21 to a numpy
+#: fallback 100x slower than the GPU can do it.
+_MX_SORT_COL_LIMIT = 1023 * 2048          # 2_095_104
+_MX_SORT_1D_LIMIT = 2 ** 27
+#: tail fraction of draws at each end whose normal score is recomputed on
+#: the host in float64 -- see _rank_scores_1d
+_TAIL_FRACTION = 1e-4
+
+#: largest integer float32 represents exactly; above it ranks need int32 and
+#: the quantile transform has to happen on the host in float64
+_F32_EXACT_INT = 2 ** 24
+
+#: Default ceiling on the working set of the sort and FFT stages, in bytes.
+#: Diagnostics are not where a run should run out of memory: the old code's
+#: peak grew as rows x chains x dim and reached 21 GB on a 16-parameter,
+#: 16k-draw, 512-chain fit, which made a 32 GB machine swap. Peak device
+#: memory comes out at about twice this, consistently (measured 0.96 GB at
+#: 512 MiB, 3.85 GB at 2 GiB, 7.70 GB at 4 GiB), because the budget sizes
+#: one stage's working set and MLX holds its own workspace beside it.
+_DEFAULT_BUDGET = 1 << 31                 # 2 GiB
+
+#: Grouping parameters amortizes the strided host gather, but only up to a
+#: point: past ~2 GiB of working set the extra memory pressure costs more
+#: than the batching saves. Measured at 8.4 M draws x 105 parameters --
+#: 18.4 s at 2 parameters per group, 12.1 s at 9, 16.2 s at 18, 27.1 s at 36
+#: -- so the heuristic is capped here even when a larger budget is given.
+#: A *smaller* budget is always honoured; this only stops a generous one
+#: from making things slower.
+_GROUP_SOFT_CAP = 1 << 31                 # 2 GiB
+
+
+def _rank_scores_1d(a: mx.array, rows: int) -> np.ndarray:
+    """Normal scores for one parameter, ranked by a contiguous 1-D GPU sort.
+
+    ``a`` is that parameter's draws as a (rows,) device array. The 1-D sort
+    MLX gets right at any size we can store, and it is ~55x faster than
+    numpy's stable argsort (measured 20 ms against 1.14 s at 8.4 M draws).
+    MLX's sort is stable, so the ranks are bit-identical to
+    ``np.argsort(kind="stable")`` even when ties are the rule rather than the
+    exception (verified on 3 M draws taking only 8 distinct values)."""
+    order = mx.argsort(a)
+    if rows > _F32_EXACT_INT:
+        # ranks stay exact as int32, but float32 cannot hold them, so the
+        # quantile transform moves to the host (156 ms per parameter at
+        # 8.4 M draws against 28 ms on the GPU -- only worth it up here)
+        ranks = mx.put_along_axis(mx.zeros(rows, dtype=mx.int32), order,
+                                  mx.arange(1, rows + 1, dtype=mx.int32),
+                                  axis=0)
+        return norm_ppf((np.array(ranks, dtype=np.int64) - 0.375)
+                        / (rows + 0.25))
+    ranks = mx.put_along_axis(mx.zeros(rows, dtype=mx.int32), order,
+                              mx.arange(1, rows + 1, dtype=mx.int32), axis=0)
+    p = (ranks.astype(mx.float32) - 0.375) / (rows + 0.25)
+    z = np.array(_norm_ppf_mx_compiled(p), dtype=np.float64)
+
+    # Float32 evaluates the quantile function poorly exactly where it is
+    # steepest: at |z| ~ 5 it is off by 0.03, against 3.6e-4 for |z| < 4.
+    # That is a handful of draws -- 1,679 of 8.4 M lie outside
+    # p in [1e-4, 1-1e-4] -- and their ranks are known a priori (the k
+    # smallest are ranks 1..k, the k largest are rows-k+1..rows), so only
+    # their POSITIONS have to come back from the device. Redoing just those
+    # in float64 costs ~nothing and removes the tail error entirely.
+    k = int(np.ceil(_TAIL_FRACTION * rows))
+    if k:
+        lo_pos = np.array(order[:k], dtype=np.int64)
+        hi_pos = np.array(order[rows - k:], dtype=np.int64)
+        lo_rank = np.arange(1, k + 1, dtype=np.float64)
+        z[lo_pos] = norm_ppf((lo_rank - 0.375) / (rows + 0.25))
+        hi_rank = np.arange(rows - k + 1, rows + 1, dtype=np.float64)
+        z[hi_pos] = norm_ppf((hi_rank - 0.375) / (rows + 0.25))
+    return z
 
 
 def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
@@ -91,12 +181,25 @@ def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
     chain: (N, M, dim) -> (N, M, dim) normal scores.
     """
     n, m, dim = chain.shape
-    if n * m > _MX_SORT_LIMIT:
-        # MLX's argsort along axis 0 stops returning a valid permutation
-        # above 2**21 rows (verified: exact at 2**21, broken at 2**21 + 1),
-        # which would silently corrupt every rank. Fall back to numpy.
-        return np.stack([_rank_normalize(chain[..., d].astype(np.float64))
-                         for d in range(dim)], axis=-1)
+    rows = n * m
+    if rows > _MX_SORT_COL_LIMIT:
+        # The strided multi-column sort is wrong past this size, but the
+        # contiguous 1-D one is not: rank each parameter on its own rather
+        # than falling all the way back to the host.
+        if rows > _MX_SORT_1D_LIMIT:
+            return np.stack([_rank_normalize(chain[..., d].astype(np.float64))
+                             for d in range(dim)], axis=-1)
+        # Upload the whole group in one go. Pulling a single parameter out of
+        # a (N, M, dim) host array reads one float in every `dim`, which cost
+        # 46 ms per parameter at 8.4 M draws -- more than the sort itself --
+        # while reading all `dim` adjacent columns costs barely more than
+        # reading one. The per-parameter sorts then slice on the device.
+        blk = mx.array(np.ascontiguousarray(chain.reshape(rows, dim),
+                                            dtype=np.float32))
+        out = np.empty((rows, dim), dtype=np.float64)
+        for d in range(dim):
+            out[:, d] = _rank_scores_1d(mx.contiguous(blk[:, d]), rows)
+        return out.reshape(n, m, dim)
     flat = mx.array(np.ascontiguousarray(
         chain.reshape(n * m, dim), dtype=np.float32))
     order = mx.argsort(flat, axis=0)
@@ -105,6 +208,38 @@ def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
     ranks = mx.put_along_axis(mx.zeros_like(flat), order, pos, axis=0)
     p = (ranks - 0.375) / (n * m + 0.25)
     return np.array(_norm_ppf_mx(p), dtype=np.float64).reshape(n, m, dim)
+
+
+def _param_group(rows: int, memory_budget: int) -> int:
+    """How many parameters to score at once under ``memory_budget``.
+
+    Per parameter and per draw: ~12 bytes on the GPU (the float32 column, its
+    sort order and the ranks) and ~16 on the host (the float64 scores and
+    their split-chain copy). Grouping is what makes the peak independent of
+    ``dim``: the old code scored all of them at once, so a 105-parameter fit
+    at 8.4 M draws asked for ~140 GB."""
+    return max(1, int(min(memory_budget, _GROUP_SOFT_CAP)
+                      // max(1, rows * 28)))
+
+
+def _score_groups(chain: np.ndarray, memory_budget: int):
+    """Yield ``(slice, normal scores)`` one memory-bounded parameter group at
+    a time. chain: (N, M, dim)."""
+    n, m, dim = chain.shape
+    group = _param_group(n * m, memory_budget)
+    for s0 in range(0, dim, group):
+        sl = slice(s0, min(s0 + group, dim))
+        yield sl, _rank_normalize_all(chain[..., sl])
+
+
+def _norm_ppf_mx_compiled(p: mx.array) -> mx.array:
+    """``_norm_ppf_mx`` with the whole rational approximation fused.
+
+    Uncompiled it is ~30 ops over the full array, each writing a temporary:
+    28 ms for 8.4 M draws, which was more than the sort. Fusing collapses
+    that to one pass over memory. MLX retraces per shape, and diagnostics see
+    only a handful."""
+    return _norm_ppf_mx(p)
 
 
 def _norm_ppf_mx(p: mx.array) -> mx.array:
@@ -134,6 +269,9 @@ def _norm_ppf_mx(p: mx.array) -> mx.array:
     return mx.where(p > hi, -_tail(q_hi), out)
 
 
+_norm_ppf_mx_compiled = mx.compile(_norm_ppf_mx_compiled)
+
+
 def _split_chains(x: np.ndarray) -> np.ndarray:
     """Split each chain in half: (N, M) -> (N//2, 2M). Drops an odd step."""
     n = (x.shape[0] // 2) * 2
@@ -155,15 +293,16 @@ def _rhat_single(x: np.ndarray) -> float:
     return float(np.sqrt(var_plus / w))
 
 
-def split_rhat(chain: np.ndarray) -> np.ndarray:
+def split_rhat(chain: np.ndarray,
+               memory_budget: int = _DEFAULT_BUDGET) -> np.ndarray:
     """Split rank-normalized R-hat per parameter. chain: (N, M[, dim])."""
     single = chain.ndim == 2
     if single:
         chain = chain[..., None]
-    z = _rank_normalize_all(chain)
     out = np.empty(chain.shape[-1])
-    for d in range(chain.shape[-1]):
-        out[d] = _rhat_single(_split_chains(z[..., d]))
+    for sl, z in _score_groups(chain, memory_budget):
+        for j, d in enumerate(range(sl.start, sl.stop)):
+            out[d] = _rhat_single(_split_chains(z[..., j]))
     return out[0:1] if single else out
 
 
@@ -190,6 +329,49 @@ def _autocov(x: np.ndarray) -> np.ndarray:
     f = np.fft.rfft(xc, n=nfft, axis=0)
     acov = np.fft.irfft(f * np.conjugate(f), n=nfft, axis=0)[:n].real
     return acov / n
+
+
+def _acov_chain_mean(x: np.ndarray,
+                     memory_budget: int = _DEFAULT_BUDGET) -> np.ndarray:
+    """Autocovariance averaged over chains, accumulated chunk by chunk.
+
+    Bulk ESS uses the chain *average* of the autocovariance and its lag-0
+    entry -- never the per-chain curves -- so the full ``(N, M, dim)``
+    spectrum :func:`_autocov` builds was never needed. Summing over chunks of
+    chains instead caps the working set at ``memory_budget`` whatever ``M``
+    and ``dim`` are, which is the difference between 21 GB and a few hundred
+    megabytes on a 16-parameter, 16k-draw, 512-chain fit.
+
+    x: (N, M) or (N, M, dim). Returns (N,) or (N, dim), biased (1/N).
+    """
+    single = x.ndim == 2
+    if single:
+        x = x[..., None]
+    n, m, dim = x.shape
+    nfft = int(2 ** np.ceil(np.log2(2 * n)))
+    if x.size < 1 << 18:
+        # small enough that a GPU launch is not worth it; host float64
+        xc = x - x.mean(axis=0)
+        f = np.fft.rfft(xc, n=nfft, axis=0)
+        acov = np.fft.irfft(f * np.conjugate(f), n=nfft, axis=0)[:n].real / n
+        out = acov.mean(axis=1)
+        return out[:, 0] if single else out
+    # one chain in flight costs the half-spectrum (nfft/2+1 complex64), the
+    # product and the inverse transform, over every parameter in the slice;
+    # ~6 x nfft x 4 bytes per (chain, parameter) with MLX's own workspace
+    per_chain = max(1, nfft * 4 * 6 * dim)
+    step = max(1, min(m, int(memory_budget // per_chain)))
+    total = np.zeros((n, dim), dtype=np.float64)
+    for s0 in range(0, m, step):
+        blk = mx.array(np.ascontiguousarray(x[:, s0:s0 + step],
+                                            dtype=np.float32))
+        blk = blk - mx.mean(blk, axis=0)
+        f = mx.fft.rfft(blk, n=nfft, axis=0)
+        acov = mx.fft.irfft(f * mx.conjugate(f), n=nfft, axis=0)[:n]
+        total += np.array(mx.sum(acov, axis=1), dtype=np.float64)
+        del blk, f, acov
+    out = total / (n * m)
+    return out[:, 0] if single else out
 
 
 def _ess_single(x: np.ndarray) -> float:
@@ -226,22 +408,24 @@ def _ess_single(x: np.ndarray) -> float:
     return float(n * m / tau)
 
 
-def _ess_batched(x: np.ndarray) -> np.ndarray:
+def _ess_batched(x: np.ndarray,
+                 memory_budget: int = _DEFAULT_BUDGET) -> np.ndarray:
     """Bulk ESS for every parameter at once. x: (N, M, dim), split chains.
 
-    Same Geyer initial monotone sequence as :func:`_ess_single`; only the
-    autocovariance is batched (one FFT over all parameters instead of one
-    per parameter).
+    Same Geyer initial monotone sequence as :func:`_ess_single`; the
+    autocovariance is batched over parameters and accumulated over chunks of
+    chains, so peak memory is set by ``memory_budget`` rather than by
+    ``N x M x dim``.
     """
     n, m, dim = x.shape
     if n < 4:
         return np.full(dim, np.nan)
-    acov = _autocov(x)                       # (N, M, dim), FFT along axis 0
-    w = (acov[0] * n / (n - 1)).mean(axis=0)                 # (dim,)
+    acov = _acov_chain_mean(x, memory_budget)          # (N, dim), chain mean
+    w = acov[0] * n / (n - 1)                                # (dim,)
     var_plus = w * (n - 1) / n
     if m > 1:
         var_plus = var_plus + x.mean(axis=0).var(axis=0, ddof=1)
-    rho = 1.0 - (w - acov.mean(axis=1)) / var_plus            # (N, dim)
+    rho = 1.0 - (w - acov) / var_plus                         # (N, dim)
     rho[0] = 1.0
 
     out = np.empty(dim)
@@ -262,16 +446,17 @@ def _ess_batched(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def ess_bulk(chain: np.ndarray) -> np.ndarray:
+def ess_bulk(chain: np.ndarray,
+             memory_budget: int = _DEFAULT_BUDGET) -> np.ndarray:
     """Rank-normalized bulk ESS per parameter. chain: (N, M[, dim])."""
     single = chain.ndim == 2
     if single:
         chain = chain[..., None]
-    z = _rank_normalize_all(chain)
-    zs = np.concatenate(
-        [z[: z.shape[0] // 2], z[z.shape[0] // 2 : (z.shape[0] // 2) * 2]],
-        axis=1)                                    # split chains, all params
-    out = _ess_batched(zs)
+    out = np.empty(chain.shape[-1])
+    half = chain.shape[0] // 2
+    for sl, z in _score_groups(chain, memory_budget):
+        zs = np.concatenate([z[:half], z[half:2 * half]], axis=1)
+        out[sl] = _ess_batched(zs, memory_budget)
     return out[0:1] if single else out
 
 
@@ -323,21 +508,36 @@ class Diagnostics:
         return "\n".join(lines)
 
 
-def diagnose(chain: np.ndarray, names: list[str] | None = None) -> Diagnostics:
+def diagnose(chain: np.ndarray, names: list[str] | None = None,
+             memory_budget: int = _DEFAULT_BUDGET) -> Diagnostics:
     """R-hat and bulk ESS in a single pass.
 
     Prefer this to calling :func:`split_rhat` and :func:`ess_bulk`
     separately: rank normalization is ~85% of the work and this shares it
     between the two statistics instead of repeating it.
+
+    ``memory_budget`` (bytes, default 2 GiB) caps the working set of the
+    sort and FFT stages; peak device memory lands at about twice it. Parameters are scored in groups that fit it and the
+    chain-averaged autocovariance is accumulated over chunks of chains, so
+    peak memory is set by the budget rather than by ``N x M x dim``. The
+    results do not depend on it: R-hat is bit-identical and ESS agrees to
+    float64 round-off (a budget 8192x smaller moves it by ~1e-15 relative,
+    from reassociating the sum over chain chunks). Raise it to trade memory
+    for fewer, larger GPU dispatches.
     """
     if chain.ndim == 2:
         chain = chain[..., None]
     dim = chain.shape[-1]
-    z = _rank_normalize_all(chain)
-    rhat = np.array([_rhat_single(_split_chains(z[..., d])) for d in range(dim)])
-    half = z.shape[0] // 2
-    zs = np.concatenate([z[:half], z[half : 2 * half]], axis=1)
-    return Diagnostics(rhat=rhat, ess_bulk=_ess_batched(zs),
+    rhat = np.empty(dim)
+    ess = np.empty(dim)
+    half = chain.shape[0] // 2
+    for sl, z in _score_groups(chain, memory_budget):
+        for j, d in enumerate(range(sl.start, sl.stop)):
+            rhat[d] = _rhat_single(_split_chains(z[..., j]))
+        zs = np.concatenate([z[:half], z[half:2 * half]], axis=1)
+        ess[sl] = _ess_batched(zs, memory_budget)
+        del z, zs
+    return Diagnostics(rhat=rhat, ess_bulk=ess,
                        names=names or [f"p{d}" for d in range(dim)])
 
 

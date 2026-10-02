@@ -387,3 +387,58 @@ normalization that dominates the work. Measured at 400 draws × 2048
 chains × 8 parameters: 1685 ms → 109 ms. Worth knowing because on cheap
 targets the diagnostics used to cost several times the sampling run they
 described.
+
+### At large draw counts
+
+Past a couple of million draws the diagnostics used to cost more memory
+than the sampling did, and the ranking became the whole bill. Both are
+fixed; measured on an M2 Max at 512 chains, against an AR(1) target:
+
+| draws × chains × dim | before | after |
+|---|---|---|
+| 16,400 × 512 × 8 | 11.0 s, 11.3 GB device | **1.1 s, 3.8 GB** |
+| 16,400 × 512 × 16 | 22.8 s, 22.6 GB device | **2.4 s, 3.8 GB** |
+| 16,400 × 512 × 105 | ~130 s (one parameter at a time) | **16.2 s, 3.8 GB** |
+| 4,000 × 512 × 8 | 0.23 s, 1.2 GB | 0.23 s, 1.2 GB |
+
+R-hat and ESS are unchanged: against an exact float64 per-parameter
+reference, max |ΔR̂| is 7×10⁻¹⁰ and max relative ΔESS is 1×10⁻⁷.
+
+Two things were wrong. **Memory** grew as draws × chains × dim, because
+`_autocov` took the FFT of every chain of every parameter at once — but
+bulk ESS only ever uses the autocovariance *averaged over chains*, so that
+average is now accumulated over chunks of chains and parameters are scored
+in groups. Peak is set by `memory_budget` (default 2 GiB; the observed
+device peak is about twice it) rather than by the problem size, so 105
+parameters cost no more than 8.
+
+**Speed** was MLX's `argsort`, and the interesting part is *why*:
+
+```python
+x = mx.array(np.random.standard_normal((2_095_105, 2)).astype("f4"))
+o = np.array(mx.argsort(x, axis=0))
+np.array_equal(np.sort(o[:, 0]), np.arange(len(o)))   # False
+```
+
+A strided multi-column `argsort(axis=0)` stops returning a permutation
+above `1023 × 2048 = 2,095,104` rows — a tile counter, not a row counter,
+and the same number at dim 2, 3, 8 and 105. A *contiguous 1-D* sort is
+exact to at least 2²⁷ rows. The failure is silent: just past the limit
+indices repeat, and further past it they come back as 2143289344, the bit
+pattern of float32 NaN.
+
+anvil previously guarded on `rows > 2**21`, which was wrong in both
+directions — it let the corrupt multi-column sort run for rows in
+(2,095,104, 2²¹], which is exactly where **512 chains × 4096 draws**
+lands, and it sent every safe single-column sort above 2²¹ to a numpy
+fallback 55× slower than the GPU. Ranking now goes parameter by parameter
+through the 1-D sort (20 ms against numpy's 1.14 s at 8.4 M draws), which
+is both correct at every size and the whole speedup.
+
+MLX's sort is stable, so the ranks are bit-identical to
+`np.argsort(kind="stable")` — verified with ties as the rule rather than
+the exception (3 M draws taking 8 distinct values). The normal scores are
+evaluated on the GPU in float32, except for the outermost 10⁻⁴ of each
+tail, which is redone on the host in float64 because that is where the
+quantile function is steep enough for float32 to lose 0.03 — those ranks
+are known a priori, so only their positions come back from the device.
