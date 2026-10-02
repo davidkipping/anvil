@@ -2,9 +2,15 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "anvil/__init__.py"
+
 [project]
 name = "anvil-mcmc"
-version = "0.1.0.dev0"
+# the version lives in anvil/__init__.py (see [tool.hatch.version] below):
+# one source of truth, because two drifted and a downstream package could
+# not tell a stale install from a current one
+dynamic = ["version"]
 description = "MCMC sampling engine optimized for Apple Silicon via MLX: thousands of parallel chains on the GPU, float64 anchoring on the CPU."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -208,3 +208,10 @@ python -m venv .venv
 ```
 
 Requires macOS on Apple Silicon, Python ≥ 3.10, MLX ≥ 0.30.
+
+`VERSIONS.md` records what changed in each version. If you depend on anvil
+from another package, feature-detect the capability you need
+(`"resume" in inspect.signature(anvil.run).parameters`) rather than
+comparing version strings — but check `anvil.__version__` against
+`VERSIONS.md` if an API you expect appears to be missing, since a
+non-editable install can be stale.
