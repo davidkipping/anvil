@@ -398,7 +398,7 @@ fixed; measured on an M2 Max at 512 chains, against an AR(1) target:
 |---|---|---|
 | 16,400 × 512 × 8 | 11.0 s, 11.3 GB device | **1.1 s, 3.8 GB** |
 | 16,400 × 512 × 16 | 22.8 s, 22.6 GB device | **2.4 s, 3.8 GB** |
-| 16,400 × 512 × 105 | ~130 s (one parameter at a time) | **16.2 s, 3.8 GB** |
+| 16,400 × 512 × 105 | ~130 s (one parameter at a time) | **17.3 s, 3.8 GB** |
 | 4,000 × 512 × 8 | 0.23 s, 1.2 GB | 0.23 s, 1.2 GB |
 
 R-hat and ESS are unchanged: against an exact float64 per-parameter

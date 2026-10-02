@@ -198,7 +198,11 @@ def _rank_normalize_all(chain: np.ndarray) -> np.ndarray:
                                             dtype=np.float32))
         out = np.empty((rows, dim), dtype=np.float64)
         for d in range(dim):
-            out[:, d] = _rank_scores_1d(mx.contiguous(blk[:, d]), rows)
+            # a strided 1-D view sorts correctly and identically to an
+            # explicit copy of it (checked column by column at 2.2 M rows,
+            # above the multi-column limit), so no mx.contiguous() -- which
+            # also keeps this working on the mlx>=0.30 this package declares
+            out[:, d] = _rank_scores_1d(blk[:, d], rows)
         return out.reshape(n, m, dim)
     flat = mx.array(np.ascontiguousarray(
         chain.reshape(n * m, dim), dtype=np.float32))
