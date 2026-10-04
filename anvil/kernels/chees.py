@@ -296,6 +296,11 @@ class ChEESHMC(Kernel):
             self.dense = dense
             self._compile_kernels()
 
+    def retrace(self) -> None:
+        # _leapfrog and _finish both close over self.target, so their traced
+        # graphs hold whatever it contained at the first call
+        self._compile_kernels()
+
     @classmethod
     def refresh(cls, state, u, target) -> ChainState:
         # one forward+backward pass, exactly as init does: the cached

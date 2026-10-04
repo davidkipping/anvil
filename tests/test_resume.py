@@ -360,9 +360,15 @@ def test_resuming_a_moved_state_matches_a_run_started_there(kernel_name):
     np.testing.assert_array_equal(a.get_log_prob(), b.get_log_prob())
 
 
-def test_a_hand_moved_state_keeps_a_stale_cache_and_samples_differently():
-    """What with_positions exists to prevent: setting u and leaving
-    log_prob/grad describing where the chain used to be."""
+def test_a_hand_moved_state_is_repaired_rather_than_sampled_stale():
+    """Setting u and leaving log_prob/grad describing where the chain used to
+    be is the brittle way to move chains. It used to sample a different
+    answer, silently; since run() recomputes the cached log-density on
+    resume (see tests/test_stale_target.py) it is repaired instead, and
+    matches the with_positions path exactly.
+
+    with_positions is still the contract: it validates the move, and it is
+    what a kernel whose refresh() cannot rebuild its state needs."""
     from dataclasses import replace
 
     target, u0, _, _ = _setup()
@@ -373,16 +379,17 @@ def test_a_hand_moved_state_keeps_a_stale_cache_and_samples_differently():
     refreshed = rs.with_positions(new, target)
     stale = replace(rs, state={**rs.state, "u": new})      # the brittle version
 
-    # the cache really is wrong, by far more than the ~1-unit scale of a
-    # Metropolis accept decision for a typical chain (a few chains always
-    # happen to land at a similar density, which is the insidious part)
+    # the hand-written cache really is wrong, by far more than the ~1-unit
+    # scale of a Metropolis accept decision for a typical chain -- which is
+    # what makes repairing it at run start worth the one extra evaluation
     gap = np.abs(np.array(stale.state["log_prob"])
                  - np.array(refreshed.state["log_prob"]))
     assert np.median(gap) > 1.0, np.median(gap)
-    # ... and it changes the sampling, silently: same shapes, no error
+
     a = run(ChEESHMC(target), target, resume=refreshed, n_samples=10)
     b = run(ChEESHMC(target), target, resume=stale, n_samples=10)
-    assert not np.array_equal(a.get_chain(), b.get_chain())
+    np.testing.assert_array_equal(a.get_chain(), b.get_chain())
+    np.testing.assert_array_equal(a.get_log_prob(), b.get_log_prob())
 
 
 def test_a_kernel_that_caches_more_must_say_how_to_refresh_it():

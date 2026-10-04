@@ -294,6 +294,45 @@ along in `kernel_ckpt`: ChEES's Halton jitter index, the ensemble's
 move-mixing draw count. Restarting either of those would replay a sequence
 the first segment had already used.
 
+(changing-target)=
+### Changing the target between segments
+
+The other half of a Gibbs scheme is a block the target *holds* rather than
+samples — and so is a tempering β, a swapped dataset, or a retrained
+surrogate. Change it between `run` calls and anvil picks it up; change it
+during a run and it will not.
+
+The reason is worth knowing, because the failure mode is silent.
+`mx.compile` treats everything a traced function reads that is not an
+argument as a trace-time constant: arrays held on the target, Python floats,
+closure variables. A kernel that compiles at construction — `ChEESHMC` and
+`EnsembleKernel` both do — therefore went on returning the log-density of
+the target it first traced. A *large* change then froze the chains (the
+stale proposal scores far below the fresh current point, so nothing is
+accepted); a *small* change was worse, because acceptance, R-hat and ESS all
+stayed healthy while the chains sampled the previous target. Measured on a
+unit Gaussian whose mean moved 0 → 0.5 between segments: draws centred on
+0.000 instead of 0.500, with 85% of chains moving.
+
+`run` now calls {meth}`~anvil.kernels.base.Kernel.retrace` at the start of
+every call, discarding those graphs, and a resume also recomputes the cached
+log-density so neither half of the Metropolis comparison can be stale. For
+an unchanged target both are no-ops in effect — asserted bit-identical
+against a freshly constructed kernel — and 100 consecutive retraced segments
+showed no drift in time or memory. A kernel that compiles its own graphs
+(`self_compiled = True`) must override `retrace()`; the base implementation
+warns if it has not.
+
+Two limits to know:
+
+- A target changed **during** a run is not picked up until the next call.
+  `reanchor_every` is not a workaround: it refreshes the cached log-density
+  while the compiled proposal keeps the old target, which leaves the
+  Metropolis step comparing two different distributions.
+- `RandomWalkMetropolis` was never affected, because it lets the engine
+  compile its step, and the engine does that afresh on every call. That is
+  the distinction the fix follows.
+
 ### Moving the chains between segments
 
 A resume does not have to continue from where the chains stopped.

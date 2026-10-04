@@ -174,6 +174,10 @@ class EnsembleKernel(Kernel):
         self._moves_drawn += 1
         return self._compiled[i](key, state, params)
 
+    def retrace(self) -> None:
+        # one compiled step per move, each closing over self.target
+        self._compiled = [mx.compile(self._make_step(m)) for m, _ in self.moves]
+
     def checkpoint(self) -> dict[str, float]:
         return {"move_draws": float(self._moves_drawn)}
 

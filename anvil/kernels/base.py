@@ -14,6 +14,7 @@ plus kernel-specific extras (e.g. "diverged" for HMC).
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import mlx.core as mx
@@ -67,6 +68,31 @@ class Kernel:
         ``init`` on a resume, so a kernel that caches ``target`` (all of
         them do) must not rely on ``init`` having run."""
         self.target = target
+
+    def retrace(self) -> None:
+        """Discard compiled graphs so the next step re-reads the target.
+
+        ``mx.compile`` freezes everything a traced function reads that is
+        *not* an argument: arrays held on the target, Python floats, closure
+        variables. A kernel that compiles once at construction therefore goes
+        on sampling the target **as it was when it was first traced** --
+        which, if the target changed in between, is a converged,
+        healthy-looking run of the wrong distribution rather than a crash.
+        The engine calls this at the start of every :func:`anvil.run`, so a
+        target that changes between runs is handled by default.
+
+        Kernels the engine compiles itself (``self_compiled = False``) need
+        nothing here: ``run`` wraps ``step`` afresh each call. Kernels that
+        compile their own graphs must override this, and are warned if they
+        do not."""
+        if self.self_compiled and type(self).retrace is Kernel.retrace:
+            warnings.warn(
+                f"{type(self).__name__} sets self_compiled=True but does not "
+                f"override retrace(), so whatever its compiled graphs read "
+                f"from the target is frozen at the first trace. If the target "
+                f"can change between runs, this samples the old one silently.",
+                stacklevel=2,
+            )
 
     @classmethod
     def refresh(cls, state: ChainState, u: mx.array,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import os
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -154,6 +155,12 @@ class ResumeState:
         The key stream is untouched: ``iteration`` and ``seed`` are carried
         over, so the next segment draws exactly the keys it would have drawn
         without the move. Randomness for the move itself is the caller's.
+
+        **The target may also have changed**, which is the other half of a
+        Gibbs scheme: a block the target *holds* rather than samples. That is
+        safe between runs — ``run`` retraces the kernel and recomputes the
+        cached log-density on every call — but only between them. Change the
+        target before the ``run`` that should see it, never from inside one.
         """
         u = (u.astype(mx.float32) if isinstance(u, mx.array)
              else mx.array(np.asarray(u, dtype=np.float32)))
@@ -340,13 +347,30 @@ def run(
 
     ``reanchor_every`` > 0 recomputes the cached log_prob of the current
     states through the target's float64 path every that many iterations
-    (requires ``target.log_prob_hi``). Note this is insurance for
-    log-densities that can go *stale* — a surrogate retrained mid-run, or
-    any non-deterministic evaluation — NOT a remedy for float32 rounding:
-    cached values are always fresh evaluations of a deterministic
+    (requires ``target.log_prob_hi``). It is NOT a remedy for float32
+    rounding: cached values are always fresh evaluations of a deterministic
     function, so rounding cannot accumulate, and re-anchoring does not
-    change the distribution being sampled. It is expensive (the float64
-    path can cost ~1000x the float32 one); default off.
+    change the distribution being sampled. Its use is a log-density whose
+    *evaluation* is not deterministic. It is expensive (the float64 path can
+    cost ~1000x the float32 one); default off.
+
+    It is also **not** a way to pick up a target that changes mid-run, which
+    an earlier version of this docstring suggested: re-anchoring refreshes
+    the cached log-density while the kernel's compiled proposal keeps the
+    target it was traced with, so the Metropolis step would then compare two
+    different targets. Measured, not reasoned: with the target's mean moved
+    from 0 to 0.5 by a callback and ``reanchor_every=10``, the draws came
+    back centred on 0.026. See the paragraph below.
+
+    **A target that changes between runs** — a Gibbs block the target holds
+    rather than samples, a tempering beta, a swapped dataset, a retrained
+    surrogate — is handled: ``run`` calls :meth:`~anvil.kernels.base.Kernel.retrace`
+    at the start of every call, which discards the compiled graphs that froze
+    the target at their first trace, and a resume also recomputes the cached
+    log-density. Both are no-ops in effect for an unchanged target, so draws
+    are bit-identical. A target changed *during* a run is not picked up until
+    the next ``run`` call, so drive such a scheme as a sequence of segments
+    (see :meth:`ResumeState.with_positions`) rather than from a callback.
 
     ``resume``: a :class:`Results` (or a :class:`ResumeState` from
     :func:`load_state`) to *continue* rather than start. The chains pick up
@@ -413,6 +437,9 @@ def run(
         seed = 0 if seed is None else int(seed)
         keys = KeyStream(seed)
         iter0 = 0
+        # a kernel object reused across runs holds compiled graphs that froze
+        # the target as it was at their first trace; init() does not retrace
+        kernel.retrace()
         state = kernel.init(keys.init_key(), u0, target)
         adapt_state = kernel.init_adapt(state)
         params = kernel.make_params(adapt_state, warmup=True)
@@ -440,6 +467,22 @@ def run(
         state, params, adapt_state = dict(rs.state), dict(rs.params), None
         kernel.attach(target, state, params)
         kernel.restore(rs.kernel_ckpt)
+        # The target may have changed since this state was written -- a Gibbs
+        # block it holds rather than samples, a tempering beta, a swapped
+        # dataset, a retrained surrogate. Two things would otherwise be stale,
+        # and both are silent rather than loud: the kernel's compiled graphs
+        # (which froze the target at their first trace) and the cached
+        # log-density in the state. Retrace, then recompute the cache. For an
+        # unchanged target both are exactly what they already were, so draws
+        # are bit-identical.
+        kernel.retrace()
+        try:
+            state = kernel.refresh(state, state["u"], target)
+        except NotImplementedError as exc:
+            warnings.warn(
+                f"resuming without refreshing the cached log-density, which "
+                f"is stale if the target changed since the state was written: "
+                f"{exc}", stacklevel=2)
         mx.eval(*state.values(), *params.values())
     if compile_step and not kernel.self_compiled:
         step = mx.compile(kernel.step)

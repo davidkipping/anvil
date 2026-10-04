@@ -86,12 +86,12 @@ Metal GPUs have no float64. Sampling correctness in float32 is a
      |fp32 - fp64| max        : 0.0079
      OK: fp32 error is far below the ~1-unit scale of Metropolis ...
    ```
-5. **Re-anchor only when the density can go stale.**
+5. **Re-anchor only for a non-deterministic evaluation.**
    `run(..., reanchor_every=N)` refreshes cached log-probabilities through
    the float64 path. Float32 rounding does *not* drift (cached values are
-   fresh evaluations of a deterministic function), so this is insurance
-   for adaptive/surrogate densities, not for rounding — and it is
-   expensive. Default off.
+   fresh evaluations of a deterministic function), so this is not insurance
+   for rounding — and it is expensive. Default off. It is also *not* how you
+   pick up a target that changed: see "Changing the target between runs".
 
 ## Performance
 
@@ -135,6 +135,32 @@ Rules of thumb from profiling:
   order-of-magnitude better per-draw efficiency on smooth targets; the
   stretch move is the safer pick for kinky or plateau-ridden posteriors
   (transit ingress/egress edges, box-like models).
+
+## Changing the target between runs
+
+A target may hold state its log-density reads but the sampler never sees: a
+Gibbs block sampled elsewhere, a tempering β, a swapped dataset, a retrained
+surrogate. Change it between `run` calls and anvil picks it up:
+
+```python
+target.conditional = new_block            # whatever your log_prob reads
+res2 = anvil.run(kernel, target, resume=res.resume_state().with_positions(u, target),
+                 n_samples=400)
+```
+
+This needs saying because getting it wrong is silent. `mx.compile` freezes
+everything a traced function reads that is not an argument, so a kernel that
+compiles once kept sampling the target it first traced — and a *small*
+change still accepts normally and converges, to the old posterior, with
+healthy R-hat and ESS. `run` now calls `kernel.retrace()` on every call and
+recomputes the cached log-density on resume; for an unchanged target both are
+no-ops in effect, so draws are bit-identical. Custom kernels that compile
+their own graphs must override `retrace()`, and are warned if they do not.
+
+The limit: a target changed *during* a run (from a `callback`) is not picked
+up until the next `run` call, and `reanchor_every` does not help — it
+refreshes the cache while the compiled proposal keeps the old target. Drive
+such a scheme as a sequence of segments.
 
 ## Extending a run
 

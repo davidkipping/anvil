@@ -113,9 +113,15 @@ posterior.
    position and compilation (verified) — so there is no drift mechanism
    for float32 rounding to exploit, and re-anchoring does not change the
    distribution the chain samples. It is genuine insurance where the
-   log-density really can go stale: a surrogate/emulator that is retrained
-   mid-run (see {mod}`anvil.surrogate`), or any non-deterministic
-   evaluation. For a deterministic float32 likelihood it is expensive
+   log-density's *evaluation* is not deterministic.
+
+   It is **not** a way to pick up a surrogate retrained mid-run, which this
+   guide used to claim. Re-anchoring refreshes the cached log-density while
+   the kernel's compiled proposal still holds the target it was traced with,
+   so the Metropolis step compares two different targets. Measured: with the
+   target's mean moved by a callback and `reanchor_every=10`, the draws came
+   back centred on the *old* mean. A target that changes must change between
+   `run` calls — see {ref}`changing-target` — not inside one. For a deterministic float32 likelihood it is expensive
    (a float64 pass can cost 1000× a float32 one for a GPU-kernel model)
    and unnecessary; the default is off.
 
