@@ -113,7 +113,9 @@ class EnsembleKernel(Kernel):
         self._seed = int(seed)
         self._chooser = _pyrandom.Random(seed ^ 0x5EED)
         self._moves_drawn = 0
-        self.retrace()                      # the single compile site
+        # the base implementation by name: a subclass override may read
+        # attributes it assigns only after super().__init__() returns
+        EnsembleKernel.retrace(self)
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
@@ -174,8 +176,10 @@ class EnsembleKernel(Kernel):
         self._moves_drawn += 1
         return self._compiled[i](key, state, params)
 
-    def retrace(self) -> None:
+    def retrace(self, target=None) -> None:
         # one compiled step per move, each closing over self.target
+        if target is not None:
+            self.target = target
         self._compiled = [mx.compile(self._make_step(m)) for m, _ in self.moves]
 
     def checkpoint(self) -> dict[str, float]:

@@ -69,8 +69,9 @@ class Kernel:
         them do) must not rely on ``init`` having run."""
         self.target = target
 
-    def retrace(self) -> None:
-        """Discard compiled graphs so the next step re-reads the target.
+    def retrace(self, target: LogDensity | None = None) -> None:
+        """Bind ``target`` and discard compiled graphs, so nothing the kernel
+        computes from here on can see a target that predates this run.
 
         ``mx.compile`` freezes everything a traced function reads that is
         *not* an argument: arrays held on the target, Python floats, closure
@@ -78,17 +79,22 @@ class Kernel:
         on sampling the target **as it was when it was first traced** --
         which, if the target changed in between, is a converged,
         healthy-looking run of the wrong distribution rather than a crash.
-        The engine calls this at the start of every :func:`anvil.run`, so a
-        target that changes between runs is handled by default.
 
-        Any kernel that holds an ``mx.compile`` wrapper reading the target
-        must override this, whatever its ``self_compiled`` says -- that flag
-        only tells the engine not to wrap ``step``; a kernel can leave it
-        False and still compile an inner helper at construction, and such a
-        helper is just as frozen. The warning below catches the
-        ``self_compiled = True`` case only, because that is the one the base
-        class can see. Kernels with no compiled graphs of their own need
-        nothing here: ``run`` wraps ``step`` afresh each call."""
+        **Contract.** This is the *first* call :func:`anvil.run` makes on the
+        kernel, before ``init`` on a fresh run and before ``attach`` on a
+        resume, with this run's target. After it returns, ``self.target`` is
+        that target and no compiled graph the kernel holds predates it, so
+        ``init``/``attach`` may compute through compiled helpers safely and an
+        override may read ``self.target`` eagerly. Any kernel holding an
+        ``mx.compile`` wrapper that reads the target must override this,
+        whatever its ``self_compiled`` says -- that flag only tells the
+        engine not to wrap ``step``; an inner helper compiled at construction
+        is just as frozen. The warning below catches the ``self_compiled``
+        case only, because that is the one the base class can see. Kernels
+        with no compiled graphs of their own need nothing beyond this
+        default: ``run`` wraps ``step`` afresh each call."""
+        if target is not None:
+            self.target = target
         if self.self_compiled and type(self).retrace is Kernel.retrace:
             warnings.warn(
                 f"{type(self).__name__} sets self_compiled=True but does not "

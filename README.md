@@ -152,7 +152,7 @@ This needs saying because getting it wrong is silent. `mx.compile` freezes
 everything a traced function reads that is not an argument, so a kernel that
 compiles once kept sampling the target it first traced — and a *small*
 change still accepts normally and converges, to the old posterior, with
-healthy R-hat and ESS. `run` now calls `kernel.retrace()` on every call and
+healthy R-hat and ESS. `run` now calls `kernel.retrace(target)` first on every call and
 recomputes the cached log-density on resume; for an unchanged target both are
 no-ops in effect, so draws are bit-identical. Custom kernels that compile
 their own graphs must override `retrace()`, and are warned if they do not.

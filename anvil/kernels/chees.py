@@ -296,9 +296,14 @@ class ChEESHMC(Kernel):
             self.dense = dense
             self._compile_kernels()
 
-    def retrace(self) -> None:
+    def retrace(self, target=None) -> None:
         # _leapfrog and _finish both close over self.target, so their traced
-        # graphs hold whatever it contained at the first call
+        # graphs hold whatever it contained at the first call. init() and
+        # attach() also recompile when the preconditioner type flips; that is
+        # kept for kernels driven without run() (tests do), and costs nothing
+        # here because mx.compile is lazy -- a discarded wrapper never traced.
+        if target is not None:
+            self.target = target
         self._compile_kernels()
 
     @classmethod

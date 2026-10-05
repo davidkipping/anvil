@@ -374,7 +374,7 @@ def run(
     **A target that changes between runs** — a Gibbs block the target holds
     rather than samples, a tempering beta, a swapped dataset, a retrained
     surrogate — is handled: ``run`` calls :meth:`~anvil.kernels.base.Kernel.retrace`
-    at the start of every call, which discards the compiled graphs that froze
+    with the target as its first act on every call, which discards the compiled graphs that froze
     the target at their first trace, and a resume also recomputes the cached
     log-density. Both are no-ops in effect for an unchanged target, so draws
     are bit-identical. A target changed *during* a run is not picked up until
@@ -446,13 +446,12 @@ def run(
         seed = 0 if seed is None else int(seed)
         keys = KeyStream(seed)
         iter0 = 0
+        # First thing, before init: bind this run's target and discard any
+        # compiled graph that froze a previous one. A kernel object reused
+        # across runs would otherwise sample the target it first traced, and
+        # init() itself may compute through a compiled helper.
+        kernel.retrace(target)
         state = kernel.init(keys.init_key(), u0, target)
-        # A kernel object reused across runs holds compiled graphs that froze
-        # the target as it was at their first trace, and init() does not
-        # retrace. Retrace only once init has bound the target, so a kernel
-        # whose retrace reads self.target eagerly sees this run's target --
-        # the same order as attach-then-retrace on a resume.
-        kernel.retrace()
         adapt_state = kernel.init_adapt(state)
         params = kernel.make_params(adapt_state, warmup=True)
     else:
@@ -477,6 +476,7 @@ def run(
         keys = KeyStream(seed)
         iter0 = int(rs.iteration)
         state, params, adapt_state = dict(rs.state), dict(rs.params), None
+        kernel.retrace(target)                 # before attach, same reason
         kernel.attach(target, state, params)
         kernel.restore(rs.kernel_ckpt)
         # The target may have changed since this state was written -- a Gibbs
@@ -484,12 +484,11 @@ def run(
         # dataset, a retrained surrogate. Two things would otherwise be stale,
         # and both are silent rather than loud: the kernel's compiled graphs
         # (which froze the target at their first trace) and the cached
-        # log-density in the state. Retrace, then recompute the cache. For an
-        # unchanged target both reproduce what the compiled step left, so a
-        # resumed segment equals the uninterrupted run bit for bit -- asserted
-        # in tests/test_stale_target.py for every built-in kernel and for the
-        # chunked transit likelihood, not assumed.
-        kernel.retrace()
+        # log-density in the state. The graphs were retraced above; now
+        # recompute the cache. For an unchanged target both reproduce what the
+        # compiled step left, so a resumed segment equals the uninterrupted
+        # run bit for bit -- asserted in tests/test_resume.py for every
+        # built-in kernel and for the chunked transit likelihood, not assumed.
         try:
             state = kernel.refresh(state, state["u"], target)
         except NotImplementedError as exc:
@@ -502,8 +501,9 @@ def run(
             warnings.warn(
                 f"resuming without refreshing the cached log-density. If the "
                 f"target changed since this state was written, the chains may "
-                f"freeze or sample stale; pass resume=rs.with_positions(u, "
-                f"target) or implement refresh() for this kernel. ({exc})",
+                f"freeze or sample stale. The remedy is to implement "
+                f"refresh() for this kernel -- with_positions() goes through "
+                f"the same refresh() and would raise. ({exc})",
                 stacklevel=2)
         mx.eval(*state.values(), *params.values())
     if compile_step and not kernel.self_compiled:

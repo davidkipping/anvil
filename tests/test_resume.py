@@ -76,6 +76,50 @@ def test_resume_recovers_the_same_posterior_as_one_long_run(kernel_name):
     assert not np.array_equal(first.get_chain(), second.get_chain())
 
 
+@pytest.mark.parametrize("kernel_name", ["rwm", "ensemble", "chees"])
+def test_a_resumed_segment_equals_the_uninterrupted_run_bit_for_bit(kernel_name):
+    """The exact form of the statistical test above: W+N then resume N must
+    equal W+2N bit for bit. Same keys (iters_consumed offsets them), same
+    frozen parameters -- the only thing that could differ is the cache run()
+    recomputes eagerly on resume against what the compiled step had left."""
+    target, u0, _, _ = _setup()
+    make = _kernels(target)[kernel_name]
+    W, N = 40, 15
+    whole = run(make(), target, u0, n_warmup=W, n_samples=2 * N, seed=7)
+    first = run(make(), target, u0, n_warmup=W, n_samples=N, seed=7)
+    second = run(make(), target, resume=first, n_samples=N)
+    np.testing.assert_array_equal(
+        np.concatenate([first.get_chain(), second.get_chain()]),
+        whole.get_chain())
+    np.testing.assert_array_equal(
+        np.concatenate([first.get_log_prob(), second.get_log_prob()]),
+        whole.get_log_prob())
+
+
+def test_the_chunked_transit_likelihood_resumes_bit_for_bit_too():
+    """Eager vs compiled evaluation is where a reduction could in principle
+    round differently; the chunked tree reduction is the project's own
+    hardest case, so it is pinned rather than inferred from the Gaussian.
+    The stored log-density is asserted as well as the chain: a 1-ulp
+    difference in the refreshed cache would show there long before it
+    flipped an accept decision in 15 draws."""
+    from anvil.targets import make_transit_target
+
+    target = make_transit_target(n_data=20_000, seed=0).target
+    u0 = mx.array(np.random.default_rng(2).standard_normal((64, target.dim))
+                  .astype(np.float32) * 0.01)
+    W, N = 40, 15
+    whole = run(ChEESHMC(target), target, u0, n_warmup=W, n_samples=2 * N, seed=7)
+    first = run(ChEESHMC(target), target, u0, n_warmup=W, n_samples=N, seed=7)
+    second = run(ChEESHMC(target), target, resume=first, n_samples=N)
+    np.testing.assert_array_equal(
+        np.concatenate([first.get_chain(), second.get_chain()]),
+        whole.get_chain())
+    np.testing.assert_array_equal(
+        np.concatenate([first.get_log_prob(), second.get_log_prob()]),
+        whole.get_log_prob())
+
+
 def test_resume_does_not_replay_the_first_segment_keys():
     """The iteration offset is the whole point: drop it and the resumed
     segment redraws the keys warmup already used."""

@@ -314,8 +314,8 @@ stayed healthy while the chains sampled the previous target. Measured on a
 unit Gaussian whose mean moved 0 → 0.5 between segments: draws centred on
 0.000 instead of 0.500, with 85% of chains moving.
 
-`run` now calls {meth}`~anvil.kernels.base.Kernel.retrace` at the start of
-every call, discarding those graphs, and a resume also recomputes the cached
+`run` now calls {meth}`~anvil.kernels.base.Kernel.retrace` with the target as
+the first thing it does on every call, discarding those graphs, and a resume also recomputes the cached
 log-density so neither half of the Metropolis comparison can be stale. For
 an unchanged target both are no-ops in effect — asserted bit-identical
 against a freshly constructed kernel — and 100 consecutive retraced segments
@@ -323,9 +323,10 @@ showed no drift in time or memory. A kernel that compiles its own graphs
 (`self_compiled = True`) must override `retrace()`; the base implementation
 warns if it has not.
 
-Two costs that are deliberate: `run` retraces *after* `init` (or `attach`)
-has bound the target, so a kernel whose `retrace` reads `self.target`
-eagerly sees the right one; and a segment driven through `with_positions`
+Two costs that are deliberate: `retrace(target)` is the *first* call `run`
+makes on the kernel — before `init` or `attach` — so it binds this run's
+target and nothing the kernel then computes, compiled helper or not, can see
+a graph that predates it; and a segment driven through `with_positions`
 evaluates the target twice — once there, once at the start of `run` —
 rather than trusting an "already fresh" tag that would be wrong the moment
 the target changes between the two calls. One evaluation per segment
