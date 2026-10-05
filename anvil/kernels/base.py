@@ -81,10 +81,14 @@ class Kernel:
         The engine calls this at the start of every :func:`anvil.run`, so a
         target that changes between runs is handled by default.
 
-        Kernels the engine compiles itself (``self_compiled = False``) need
-        nothing here: ``run`` wraps ``step`` afresh each call. Kernels that
-        compile their own graphs must override this, and are warned if they
-        do not."""
+        Any kernel that holds an ``mx.compile`` wrapper reading the target
+        must override this, whatever its ``self_compiled`` says -- that flag
+        only tells the engine not to wrap ``step``; a kernel can leave it
+        False and still compile an inner helper at construction, and such a
+        helper is just as frozen. The warning below catches the
+        ``self_compiled = True`` case only, because that is the one the base
+        class can see. Kernels with no compiled graphs of their own need
+        nothing here: ``run`` wraps ``step`` afresh each call."""
         if self.self_compiled and type(self).retrace is Kernel.retrace:
             warnings.warn(
                 f"{type(self).__name__} sets self_compiled=True but does not "

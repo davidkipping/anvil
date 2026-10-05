@@ -323,6 +323,14 @@ showed no drift in time or memory. A kernel that compiles its own graphs
 (`self_compiled = True`) must override `retrace()`; the base implementation
 warns if it has not.
 
+Two costs that are deliberate: `run` retraces *after* `init` (or `attach`)
+has bound the target, so a kernel whose `retrace` reads `self.target`
+eagerly sees the right one; and a segment driven through `with_positions`
+evaluates the target twice — once there, once at the start of `run` —
+rather than trusting an "already fresh" tag that would be wrong the moment
+the target changes between the two calls. One evaluation per segment
+against the hundreds × L the segment performs.
+
 Two limits to know:
 
 - A target changed **during** a run is not picked up until the next call.

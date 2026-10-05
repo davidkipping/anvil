@@ -142,15 +142,24 @@ class ResumeState:
         still one Markov chain, so its segments pool exactly as resumed
         segments already do.
 
-        What this exists to prevent is the hand-written version: writing
-        ``state["u"]`` and leaving the cached ``log_prob`` (and, for ChEES,
-        ``grad``) describing where the chain *used* to be. That resumes from
-        a stale cache — a wrong answer that no diagnostic flags, because
-        every array still has the right shape and the chain still moves.
-        The recomputation goes through the kernel's
-        :meth:`~anvil.kernels.base.Kernel.refresh`, so a kernel that caches
-        something this layout does not know about raises rather than
+        Writing ``state["u"]`` by hand and leaving the cached ``log_prob``
+        (and, for ChEES, ``grad``) describing where the chain *used* to be
+        once resumed from a stale cache -- a wrong answer no diagnostic flags.
+        Since 0.4.0 ``run`` recomputes the cache on every resume, so that
+        mistake is repaired rather than sampled. What this method still adds
+        is validation -- shape, finite positions, a finite target at them --
+        and it is the path a kernel needs when its ``refresh`` cannot rebuild
+        its state from a saved one by name alone. The recomputation goes
+        through :meth:`~anvil.kernels.base.Kernel.refresh`, so a kernel that
+        caches something this layout does not know about raises rather than
         silently copying it.
+
+        One evaluation of the target happens here and one more at the start
+        of the ``run`` that consumes the result. That is deliberate: skipping
+        the second on a "already fresh" tag would be wrong the moment the
+        target is changed *after* this call and before ``run``, which is a
+        natural ordering in a Gibbs loop. It costs one target evaluation per
+        segment against the hundreds times L the segment itself performs.
 
         The key stream is untouched: ``iteration`` and ``seed`` are carried
         over, so the next segment draws exactly the keys it would have drawn
@@ -437,10 +446,13 @@ def run(
         seed = 0 if seed is None else int(seed)
         keys = KeyStream(seed)
         iter0 = 0
-        # a kernel object reused across runs holds compiled graphs that froze
-        # the target as it was at their first trace; init() does not retrace
-        kernel.retrace()
         state = kernel.init(keys.init_key(), u0, target)
+        # A kernel object reused across runs holds compiled graphs that froze
+        # the target as it was at their first trace, and init() does not
+        # retrace. Retrace only once init has bound the target, so a kernel
+        # whose retrace reads self.target eagerly sees this run's target --
+        # the same order as attach-then-retrace on a resume.
+        kernel.retrace()
         adapt_state = kernel.init_adapt(state)
         params = kernel.make_params(adapt_state, warmup=True)
     else:
@@ -473,16 +485,26 @@ def run(
         # and both are silent rather than loud: the kernel's compiled graphs
         # (which froze the target at their first trace) and the cached
         # log-density in the state. Retrace, then recompute the cache. For an
-        # unchanged target both are exactly what they already were, so draws
-        # are bit-identical.
+        # unchanged target both reproduce what the compiled step left, so a
+        # resumed segment equals the uninterrupted run bit for bit -- asserted
+        # in tests/test_stale_target.py for every built-in kernel and for the
+        # chunked transit likelihood, not assumed.
         kernel.retrace()
         try:
             state = kernel.refresh(state, state["u"], target)
         except NotImplementedError as exc:
+            # The kernel's graphs have been retraced against the current
+            # target but its cache has not: if the target changed, the first
+            # Metropolis comparison of this segment pits a stale current
+            # log-density against fresh proposals -- a large change can
+            # freeze the chains, since only an acceptance repairs the cache.
+            # If the target did not change there is nothing to repair.
             warnings.warn(
-                f"resuming without refreshing the cached log-density, which "
-                f"is stale if the target changed since the state was written: "
-                f"{exc}", stacklevel=2)
+                f"resuming without refreshing the cached log-density. If the "
+                f"target changed since this state was written, the chains may "
+                f"freeze or sample stale; pass resume=rs.with_positions(u, "
+                f"target) or implement refresh() for this kernel. ({exc})",
+                stacklevel=2)
         mx.eval(*state.values(), *params.values())
     if compile_step and not kernel.self_compiled:
         step = mx.compile(kernel.step)

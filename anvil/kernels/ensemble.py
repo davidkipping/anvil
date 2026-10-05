@@ -113,7 +113,7 @@ class EnsembleKernel(Kernel):
         self._seed = int(seed)
         self._chooser = _pyrandom.Random(seed ^ 0x5EED)
         self._moves_drawn = 0
-        self._compiled = [mx.compile(self._make_step(m)) for m, _ in self.moves]
+        self.retrace()                      # the single compile site
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
