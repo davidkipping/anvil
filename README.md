@@ -3,6 +3,8 @@
 MCMC sampling engine optimized for Apple Silicon, built on
 [MLX](https://github.com/ml-explore/mlx).
 
+Documentation: <https://anvil-mcmc.readthedocs.io>
+
 **The premise.** On Apple Silicon the GPU wins by running **thousands of
 parallel chains** over **data-heavy likelihoods** (10⁴–10⁶ points) in
 well-conditioned float32, while the CPU — which has float64 — owns offsets,

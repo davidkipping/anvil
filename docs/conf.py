@@ -38,3 +38,4 @@ exclude_patterns = ["_build"]
 
 html_theme = "furo"
 html_title = "anvil"
+html_baseurl = "https://anvil-mcmc.readthedocs.io/en/latest/"
