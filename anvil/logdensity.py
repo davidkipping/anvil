@@ -23,7 +23,13 @@ class LogDensity:
     supports_grad: bool = True
 
     def log_prob(self, u: mx.array) -> mx.array:
-        """Batched log density: (n_chains, dim) -> (n_chains,)."""
+        """Batched log density: (n_chains, dim) -> (n_chains,).
+
+        Where the model cannot be evaluated, do not return a constant: it is
+        a flat region samplers drift across, and a value as large as -1e30
+        rounds the log-Jacobian away in float32. Slope it back towards
+        feasibility, relatively, under ``stop_gradient``. See "What to
+        return when the model fails" in the samplers guide."""
         raise NotImplementedError
 
     def log_prob_and_grad(self, u: mx.array) -> tuple[mx.array, mx.array]:

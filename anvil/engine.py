@@ -591,6 +591,16 @@ def run(
                     "elapsed": el, "eta": eta,
                     "step_size": _step_size_of(params)})
 
+    # End-of-warmup snapshot for warmup_report's lost-chain check: a chain
+    # sitting far below the ensemble in log-probability, or at a non-finite
+    # position, is lost, and no amount of warmup length fixes that.
+    warmup_trace = ({k: np.array(v) for k, v in trace.items()}
+                    if trace["iter"] else None)
+    if warmup_trace is not None:
+        warmup_trace["log_prob"] = np.array(state["log_prob"])
+        warmup_trace["u_finite"] = np.array(
+            mx.all(mx.isfinite(state["u"]), axis=-1))
+
     if resume is None:
         params = kernel.make_params(adapt_state, warmup=False)
         mx.eval(*params.values())
@@ -691,8 +701,7 @@ def run(
         accept_fraction=np.array(accept_sum) / max(1, total_iters),
         final_state=state,
         final_params=params,
-        warmup_trace=({k: np.array(v) for k, v in trace.items()}
-                      if trace["iter"] else None),
+        warmup_trace=warmup_trace,
         extras={
             "n_divergent": int(np.array(divergent_sum).sum()),
             # per-chain resolution: a chain that both sits low in

@@ -136,6 +136,58 @@ A sensible expensive-posterior workflow: burn in with the stretch move
 from a wide initialization, then hand the tightened ensemble to ChEES-HMC
 for production draws — both kernels share the same state layout.
 
+(model-failure)=
+## What to return when the model fails
+
+Most real targets have corners where the model cannot be evaluated — an
+unphysical geometry, a solver that does not converge, a float32 overflow.
+What the log-density returns there matters more than it looks, and two
+choices that seem harmless are not.
+
+**A constant failure value is a flat region, not a rejection.** Returning,
+say, `-1e30` everywhere the model fails makes that region perfectly flat,
+and samplers accept moves *within* a flat region. The stretch move's
+acceptance on a flat density is `min(1, z^(d-1))`, so outward moves are
+always taken: a walker that lands there drifts outwards until it reaches
+float32's largest finite number and stays. Measured on a 4-D Gaussian that
+fails beyond radius 25, with half of 64 walkers started at radius 30: 13
+were lost, pinned near 3×10³⁸.
+
+**A failure value much larger than the Jacobian swallows it.**
+`TransformedLogDensity` adds the target's value and the log-Jacobian in
+float32, and float32's resolution near `1e30` is about `7e22`. The Jacobian —
+which correctly prefers smaller `|u|` — and any explicit prior are rounded
+away, so the failure region has no direction at all.
+
+**What to do instead.** If the target returns a finite failure value, make
+it *slope back towards feasibility*, make the slope *relative* so float32 can
+resolve it at that magnitude, and `stop_gradient` it, since its true
+derivative is of the same enormous order and would wreck an HMC trajectory:
+
+```python
+failed = -1e30 * (1.0 + mx.stop_gradient(mx.log1p(mx.mean(v * v, axis=-1))))
+logp = mx.where(model_ok, model_logp, failed)
+```
+
+The slope is only ever selected on failed evaluations, so wherever the model
+succeeds, values and gradients are unchanged. On the example above it takes
+lost walkers from 13 to 0. Returning `-inf` instead is also valid — every
+move into or between failed states is then rejected exactly — but under
+ChEES a non-finite state is a divergence, and a chain that starts there can
+only leave if a proposal happens to land somewhere finite.
+
+**What anvil does about it.** Since 0.6.0 no kernel accepts a proposal at a
+non-finite position, whatever the target returns there; a chain that ends
+warmup far below the ensemble in log-probability makes
+{func}`~anvil.warmup_report` return `LOST CHAINS`, naming them, instead of a
+verdict about warmup length (it used to say `TOO SHORT` — advice that only
+lets lost chains drift further — or even `OK`); and
+`anvil.diagnose(chain, log_prob=results.get_log_prob())` lists them next to
+R-hat, so a bad R-hat arrives with its likely cause.
+{func}`anvil.diagnostics.lost_chains` is the check itself. anvil reports lost
+chains; it does not silently re-seed them, because that would also hide a
+target that fails over much of its prior.
+
 ## Gradients and autodiff
 
 Any likelihood written end-to-end in MLX ops is differentiable via

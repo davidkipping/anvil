@@ -35,7 +35,7 @@ this project out at least once:
 | call | question |
 |---|---|
 | {func}`~anvil.diagnostics.diagnose` | did it converge, and how many effective samples? |
-| {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed? |
+| {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed — or are some chains lost? |
 | {func}`~anvil.diagnostics.whitened_shape` | correlated, or curved? (predicts whether `dense=True` pays) |
 | {func}`~anvil.precision.validate_precision` | is the float32 likelihood accurate enough to trust? |
 | {func}`~anvil.precision.certify` | how much did float32 bias the posterior, and what is it corrected? |

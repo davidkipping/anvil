@@ -54,7 +54,8 @@ class RandomWalkMetropolis(Kernel):
         log_uniform = mx.log(
             mx.random.uniform(shape=log_ratio.shape, key=k_acc, dtype=u.dtype)
         )
-        accepted = log_uniform < log_ratio
+        # never accept an overflowed position, whatever the target says there
+        accepted = (log_uniform < log_ratio) & mx.all(mx.isfinite(prop), axis=-1)
         new_state = tree_where(
             accepted, {"u": prop, "log_prob": lp_prop}, state
         )

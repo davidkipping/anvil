@@ -153,8 +153,15 @@ class EnsembleKernel(Kernel):
                 lp = self.target.log_prob(prop)
                 log_ratio = extra + lp - logps[h]
                 accept_prob = mx.minimum(1.0, mx.exp(log_ratio))
+                # A position that has overflowed is never a valid state,
+                # whatever the target returns there. A stretch move from a
+                # far-out walker overflows to inf in float32 while a target
+                # that reports failure as a finite constant still scores it
+                # finitely -- so without this the move is accepted and the
+                # walker is lost for good (anvil-gp, 2026-10-11: 13/64).
                 accept = (
-                    mx.log(mx.random.uniform(shape=(K,), key=k_acc)) < log_ratio
+                    (mx.log(mx.random.uniform(shape=(K,), key=k_acc)) < log_ratio)
+                    & mx.all(mx.isfinite(prop), axis=-1)
                 )
                 halves[h] = mx.where(accept[:, None], prop, S)
                 logps[h] = mx.where(accept, lp, logps[h])

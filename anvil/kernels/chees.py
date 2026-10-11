@@ -151,7 +151,8 @@ class ChEESHMC(Kernel):
         accept_prob = mx.minimum(1.0, mx.exp(dH_safe))
         diverged = (~mx.isfinite(dH) | (dH < -self.div_threshold)) & ~stuck
         log_u = mx.log(mx.random.uniform(shape=dH.shape, key=key))
-        accept = (log_u < dH_safe) & ~diverged
+        # never accept an overflowed position, whatever the target says there
+        accept = (log_u < dH_safe) & ~diverged & mx.all(mx.isfinite(q1), axis=-1)
         acc = accept[:, None]
         new_state = {
             "u": mx.where(acc, q1, q0),
@@ -205,7 +206,8 @@ class ChEESHMC(Kernel):
         accept_prob = mx.minimum(1.0, mx.exp(dH_safe))
         diverged = (~mx.isfinite(dH) | (dH < -self.div_threshold)) & ~stuck
         log_u = mx.log(mx.random.uniform(shape=dH.shape, key=key))
-        accept = (log_u < dH_safe) & ~diverged
+        # never accept an overflowed position, whatever the target says there
+        accept = (log_u < dH_safe) & ~diverged & mx.all(mx.isfinite(q1), axis=-1)
         acc = accept[:, None]
         new_state = {
             "u": mx.where(acc, q1, q0),

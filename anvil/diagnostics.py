@@ -497,6 +497,47 @@ def nested_rhat(chain: np.ndarray, n_superchains: int) -> np.ndarray:
     return out[0:1] if single else out
 
 
+#: a log-probability below this is a target's "failed" sentinel, not a
+#: density -- the backstop for when half or more of the chains are lost and
+#: the median is itself a lost chain
+_LOST_FLOOR = -1e29
+
+
+def lost_chains(log_prob, positions_finite=None, n_mad: float = 10.0):
+    """Indices of chains that are lost rather than exploring.
+
+    A chain is lost if its log-probability is non-finite, below a fixed
+    floor (``-1e29``, where targets put "the model failed"), or far below the
+    rest of the ensemble -- more than ``n_mad`` robust standard deviations
+    under the median, measured with the median absolute deviation so the
+    lost chains cannot inflate the scale they are judged by -- or if its
+    position has overflowed.
+
+    The threshold does not need tuning in practice: a lost chain sits at its
+    target's failure value, many orders of magnitude out. For a healthy
+    d-dimensional Gaussian-like posterior the false-positive rate per chain
+    is ~1e-5. A chain stranded in a minor mode that is genuinely ten robust
+    sigmas worse than the bulk is flagged too, which is information.
+
+    ``log_prob``: (n_chains,) one value per chain, or (n_draws, n_chains),
+    in which case each chain's median over draws is used.
+    ``positions_finite``: optional (n_chains,) bool.
+    """
+    lp = np.asarray(log_prob, dtype=np.float64)
+    if lp.ndim == 2:
+        with np.errstate(invalid="ignore"):
+            lp = np.median(lp, axis=0)
+    bad = ~np.isfinite(lp) | (lp < _LOST_FLOOR)
+    if positions_finite is not None:
+        bad |= ~np.asarray(positions_finite, dtype=bool)
+    ok = lp[~bad]
+    if ok.size:
+        med = np.median(ok)
+        mad = 1.4826 * np.median(np.abs(ok - med))
+        bad |= lp < med - n_mad * max(mad, 1e-12)
+    return np.flatnonzero(bad)
+
+
 @dataclass
 class Diagnostics:
     """Convergence summary for one chain array."""
@@ -504,16 +545,26 @@ class Diagnostics:
     rhat: np.ndarray
     ess_bulk: np.ndarray
     names: list[str]
+    #: chains flagged by :func:`lost_chains` -- from non-finite draws always,
+    #: and from log-probabilities when ``diagnose(log_prob=...)`` is given
+    lost: np.ndarray | None = None
 
     def __str__(self) -> str:
         lines = [f"{'param':>10s} {'rhat':>8s} {'ess_bulk':>10s}"]
         for i, n in enumerate(self.names):
             lines.append(f"{n:>10s} {self.rhat[i]:>8.4f} {self.ess_bulk[i]:>10.0f}")
+        if self.lost is not None and len(self.lost):
+            shown = ", ".join(map(str, self.lost[:12])) + (
+                ", ..." if len(self.lost) > 12 else "")
+            lines.append(f"  LOST CHAINS: {len(self.lost)} ({shown}) -- far "
+                         "below the ensemble or at a non-finite position; "
+                         "R-hat above is measuring them, not the posterior")
         return "\n".join(lines)
 
 
 def diagnose(chain: np.ndarray, names: list[str] | None = None,
-             memory_budget: int = _DEFAULT_BUDGET) -> Diagnostics:
+             memory_budget: int = _DEFAULT_BUDGET,
+             log_prob: np.ndarray | None = None) -> Diagnostics:
     """R-hat and bulk ESS in a single pass.
 
     Prefer this to calling :func:`split_rhat` and :func:`ess_bulk`
@@ -528,6 +579,12 @@ def diagnose(chain: np.ndarray, names: list[str] | None = None,
     float64 round-off (a budget 8192x smaller moves it by ~1e-15 relative,
     from reassociating the sum over chain chunks). Raise it to trade memory
     for fewer, larger GPU dispatches.
+
+    ``log_prob`` (e.g. ``results.get_log_prob()``, (n_draws, n_chains)):
+    optional. When given, :attr:`Diagnostics.lost` also lists chains whose
+    log-probability sits far below the ensemble's -- the usual cause of a
+    bad R-hat that R-hat itself cannot name. Chains with non-finite draws
+    are reported either way.
     """
     if chain.ndim == 2:
         chain = chain[..., None]
@@ -541,8 +598,15 @@ def diagnose(chain: np.ndarray, names: list[str] | None = None,
         zs = np.concatenate([z[:half], z[half:2 * half]], axis=1)
         ess[sl] = _ess_batched(zs, memory_budget)
         del z, zs
+    # Lost chains make R-hat large for a reason R-hat cannot name. Non-finite
+    # draws are always checked; pass log_prob (results.get_log_prob()) to
+    # also catch chains stranded at a target's finite failure value.
+    finite = np.all(np.isfinite(chain), axis=(0, 2))
+    lost = (lost_chains(log_prob, positions_finite=finite)
+            if log_prob is not None else np.flatnonzero(~finite))
     return Diagnostics(rhat=rhat, ess_bulk=ess,
-                       names=names or [f"p{d}" for d in range(dim)])
+                       names=names or [f"p{d}" for d in range(dim)],
+                       lost=lost)
 
 
 def summary(chain: np.ndarray, names: list[str] | None = None) -> str:
@@ -605,6 +669,7 @@ class WarmupReport:
     final_accept: float
     noise_floor: float          # relative sd of the spread estimate itself
     suggestion: str
+    lost: tuple[int, ...] = ()  # chains lost at the end of warmup
 
     def __str__(self) -> str:
         at = "never" if self.settled_at is None else f"iteration {self.settled_at}"
@@ -658,6 +723,35 @@ def warmup_report(results, settle_tol: float = 0.05) -> WarmupReport:
     eps = tr["step_size"]
     noise = 1.0 / np.sqrt(2.0 * max(n_chains - 1, 1))
     tol = max(settle_tol, 3.0 * noise)
+
+    # Lost chains first, before any verdict. A chain stranded at the
+    # target's failure value or at an overflowed position makes the spread
+    # drift (TOO SHORT -- actively harmful advice: longer warmup only lets it
+    # drift further) or level off (OK -- with the chain still lost). Neither
+    # verdict would mention it, so this check owns the answer when it fires.
+    if "log_prob" in tr:
+        lost = lost_chains(tr["log_prob"], positions_finite=tr.get("u_finite"))
+    else:   # a trace from before 0.6.0: positions are all we have
+        lost = np.array([], dtype=int)
+    if lost.size or not np.all(np.isfinite(sd)):
+        shown = ", ".join(map(str, lost[:12])) + (", ..." if lost.size > 12 else "")
+        return WarmupReport(
+            verdict="LOST CHAINS", settled_at=None, n_warmup=n_warm,
+            n_chains=n_chains, final_accept=accept, noise_floor=noise,
+            lost=tuple(int(i) for i in lost),
+            suggestion=(
+                (f"{lost.size} of {n_chains} chains ({shown}) ended warmup far "
+                 "below the ensemble in log-probability or at a non-finite "
+                 "position" if lost.size else
+                 "the cross-chain spread is non-finite, so some chain has "
+                 "overflowed")
+                + ". Longer warmup will not recover them -- they are not "
+                "converging slowly, they are somewhere the target cannot "
+                "guide them back from. Usually the target returns a constant "
+                "for a failed evaluation, which is a flat region; see "
+                "'What to return when the model fails' in the samplers guide, "
+                "then re-initialize those chains"),
+        )
 
     # reference: the last third of probes, which is the best estimate of
     # the stationary spread available from this run
