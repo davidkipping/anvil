@@ -1,4 +1,4 @@
-"""anvil + MetalPlanet: fiducial hot-Jupiter fit, both sampling modes.
+"""anvil + Elome: fiducial hot-Jupiter fit, both sampling modes.
 
 The test case: a 3-day hot Jupiter transiting a Sun-like star at impact
 parameter b = 0.5 (r = 0.103, a/R* = 8.75 from Kepler's third law),
@@ -7,8 +7,8 @@ quadratic limb darkening sampled in Kipping (2013) (q1, q2), observed for
 
 Pipeline demonstrated:
   1. float64 CPU world: absolute BJD-scale times, data synthesis through
-     MetalPlanet's own float64 path, epoch-centering preprocessing;
-  2. float32 GPU world: MetalPlanet's fused Metal transit kernel behind
+     Elome's own float64 path, epoch-centering preprocessing;
+  2. float32 GPU world: Elome's fused Metal transit kernel behind
      anvil's chunked likelihood;
   3. the precision harness (trust check) before any sampling;
   4. BOTH sampler modes on identical data, each configured to actually
@@ -18,10 +18,10 @@ Pipeline demonstrated:
      it does, via anvil.whitened_shape;
   5. posteriors reported in absolute physical units, and a summary figure.
 
-Requires: pip install -e ".[test]" matplotlib, and MetalPlanet
-(pip install -e ../MetalPlanet).
+Requires: pip install -e ".[test]" matplotlib, and Elome (formerly
+Elome; pip install -e from a clone of github.com/davidkipping/Elome).
 
-Run:  .venv/bin/python examples/metalplanet_hotjupiter.py
+Run:  .venv/bin/python examples/elome_hotjupiter.py
 """
 
 import time
@@ -32,9 +32,9 @@ import numpy as np
 import anvil
 from anvil.kernels.chees import ChEESHMC
 from anvil.kernels.ensemble import DEMove, EnsembleKernel, StretchMove
-from metalplanet.anvil import PARAM_NAMES, make_quad_transit_flux
-from metalplanet.ld import q_to_u_np, u_to_q_np
-from metalplanet.orbit import epoch_center_times
+from elome.anvil import PARAM_NAMES, make_quad_transit_flux
+from elome.ld import q_to_u_np, u_to_q_np
+from elome.orbit import epoch_center_times
 
 # ---------------------------------------------------------------- truth
 T_REF = 2_457_000.0          # BJD zero-point — hopeless in float32
@@ -230,7 +230,7 @@ ax.plot((t_dense - T0_TRUE) * 24, 1.0 + dev_med, color=BLUE, lw=2,
 ax.set_xlim(-4, 4)
 ax.set_xlabel("hours from mid-transit")
 ax.set_ylabel("relative flux")
-ax.set_title("anvil + MetalPlanet — 3 d hot Jupiter, b = 0.5, "
+ax.set_title("anvil + Elome — 3 d hot Jupiter, b = 0.5, "
              f"{N_DATA:,} pts @ {YERR*1e6:.0f} ppm", color=INK)
 ax.legend(frameon=False, loc="lower right")
 ax.grid(alpha=0.15)
@@ -251,5 +251,5 @@ for j, (name, i) in enumerate(show):
         axm.set_ylabel("posterior density")
         axm.legend(frameon=False, fontsize=8)
 
-fig.savefig("examples/metalplanet_hotjupiter.png", dpi=150)
-print("\nfigure saved: examples/metalplanet_hotjupiter.png")
+fig.savefig("examples/elome_hotjupiter.png", dpi=150)
+print("\nfigure saved: examples/elome_hotjupiter.png")

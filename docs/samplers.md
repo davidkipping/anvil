@@ -52,7 +52,7 @@ The natural fix is a dense (full-covariance) mass matrix, and on
 correlated posteriors it works exactly as theory predicts — measured on
 a correlated Gaussian, L collapses from 36 to 1 and ESS per gradient
 improves **40×**. Whether it rescues a *transit* posterior depends on the system. For the
-hot Jupiter in `examples/metalplanet_hotjupiter.py` it does: that
+hot Jupiter in `examples/elome_hotjupiter.py` it does: that
 posterior is correlated but essentially uncurved (max whitened skew
 0.07), and dense takes it from 38 leapfrog steps per draw to 3, a
 measured 6.8× in ESS/s. For a longer-baseline warm Jupiter it does not:

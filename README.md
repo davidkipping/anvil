@@ -125,7 +125,8 @@ reaches ~60% ESS per draw (see `tests/test_chees.py`).
 
 For a science-grade worked example on a real transit model, including a
 converged head-to-head and a curvature read-out explaining the result,
-run `examples/metalplanet_hotjupiter.py`.
+run `examples/elome_hotjupiter.py` (Elome, formerly MetalPlanet, is the
+transit model).
 
 Rules of thumb from profiling:
 
