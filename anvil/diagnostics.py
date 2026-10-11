@@ -742,23 +742,42 @@ def warmup_report(results, settle_tol: float = 0.05) -> WarmupReport:
         lost = np.array([], dtype=int)
     if lost.size or not np.all(np.isfinite(sd)):
         shown = ", ".join(map(str, lost[:12])) + (", ..." if lost.size > 12 else "")
+        if lost.size:
+            lp_end = np.asarray(tr["log_prob"], dtype=np.float64)
+            if "log_prob_eager" in tr:
+                lp_end = np.minimum(lp_end, np.asarray(tr["log_prob_eager"],
+                                                       dtype=np.float64))
+            hard = (~np.isfinite(lp_end[lost]) | (lp_end[lost] < _LOST_FLOOR))
+            if "u_finite" in tr:
+                hard |= ~np.asarray(tr["u_finite"], dtype=bool)[lost]
+            bulk = np.median(np.asarray(tr["log_prob"])[
+                np.setdiff1d(np.arange(n_chains), lost)]) \
+                if lost.size < n_chains else float("nan")
+        if lost.size and hard.any():
+            why = (f"{lost.size} of {n_chains} chains ({shown}) ended warmup "
+                   "at a non-finite position or a failed evaluation of the "
+                   "target. Longer warmup will not recover them -- they are "
+                   "somewhere the target cannot guide them back from. Usually "
+                   "the target returns a constant for a failed evaluation, "
+                   "which is a flat region; see 'What to return when the "
+                   "model fails' in the samplers guide, then re-initialize "
+                   "those chains")
+        elif lost.size:
+            why = (f"{lost.size} of {n_chains} chains ({shown}) ended warmup "
+                   f"far below the rest in log-probability (worst "
+                   f"{lp_end[lost].min():.4g} against a bulk near {bulk:.4g}) "
+                   "although every evaluation was finite. They are stranded "
+                   "in a much lower-density region -- typically a secondary "
+                   "mode, or chains that never left a bad start -- and longer "
+                   "warmup will not move them. Compare their positions with "
+                   "the bulk, and check for multimodality before pooling")
+        else:
+            why = ("the cross-chain spread is non-finite, so some chain has "
+                   "overflowed")
         return WarmupReport(
             verdict="LOST CHAINS", settled_at=None, n_warmup=n_warm,
             n_chains=n_chains, final_accept=accept, noise_floor=noise,
-            lost=tuple(int(i) for i in lost),
-            suggestion=(
-                (f"{lost.size} of {n_chains} chains ({shown}) ended warmup far "
-                 "below the ensemble in log-probability or at a non-finite "
-                 "position" if lost.size else
-                 "the cross-chain spread is non-finite, so some chain has "
-                 "overflowed")
-                + ". Longer warmup will not recover them -- they are not "
-                "converging slowly, they are somewhere the target cannot "
-                "guide them back from. Usually the target returns a constant "
-                "for a failed evaluation, which is a flat region; see "
-                "'What to return when the model fails' in the samplers guide, "
-                "then re-initialize those chains"),
-        )
+            lost=tuple(int(i) for i in lost), suggestion=why)
 
     # reference: the last third of probes, which is the best estimate of
     # the stationary spread available from this run

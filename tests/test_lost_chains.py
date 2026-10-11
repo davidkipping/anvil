@@ -170,3 +170,25 @@ def test_extras_lost_chains_matches_the_constant_failure_run(constant_run):
     final = np.array(res.final_state["log_prob"])
     np.testing.assert_array_equal(res.extras["lost_chains"],
                                   np.flatnonzero(final <= FAIL / 2))
+
+
+def test_stranded_finite_chains_are_not_blamed_on_a_failed_evaluation():
+    """Chains far below the bulk with every evaluation finite are a
+    secondary mode or a bad start, not a failed model; the message must not
+    send the reader to the target's failure value."""
+    import types
+
+    rng = np.random.default_rng(0)
+    lp = -467.0 + 1.9 * rng.standard_normal(64)
+    lp[:9] = rng.uniform(-556, -511, 9)
+    n = 40
+    tr = {"iter": np.arange(1, n + 1) * 5, "sd": np.ones((n, 2)),
+          "mean": np.zeros((n, 2)), "accept": np.full(n, 0.6),
+          "step_size": np.full(n, 0.01), "log_prob": lp,
+          "log_prob_eager": lp.copy(), "u_finite": np.ones(64, bool)}
+    res = types.SimpleNamespace(warmup_trace=tr, n_chains=64, n_warmup=200)
+    rep = anvil.warmup_report(res)
+    assert rep.verdict == "LOST CHAINS" and len(rep.lost) == 9
+    assert "secondary mode" in rep.suggestion
+    assert "failed evaluation" not in rep.suggestion.split("although")[0]
+    assert "constant for a failed evaluation" not in rep.suggestion
