@@ -31,6 +31,13 @@ class Kernel:
     #: kernels that manage their own mx.compile (e.g. host-side move
     #: mixing) set this so the engine does not wrap step() again
     self_compiled: bool = False
+    #: set by the engine from ``run(compile_step=...)`` before ``retrace``;
+    #: a self-compiling kernel consults it so the flag means the same thing
+    #: for every kernel
+    compile_step: bool = True
+    #: set once MLX has refused to compile this kernel's graphs (see
+    #: :mod:`anvil.compile`); later retraces then skip the attempt
+    compile_refused: bool = False
 
     def init(self, key: mx.array, u0: mx.array, target: LogDensity) -> ChainState:
         """Build the initial chain state (caches log_prob etc.)."""

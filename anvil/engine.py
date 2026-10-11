@@ -18,6 +18,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from .compile import CompiledOrEager
 from .kernels.base import Kernel
 from .logdensity import LogDensity
 from .rng import KeyStream
@@ -395,6 +396,17 @@ def run(
     (pass one explicitly to override). ``accept_fraction`` and the
     divergence counts describe the resumed segment alone.
 
+    ``compile_step``: whether step graphs are ``mx.compile``d (default
+    True). It reaches every kernel, including those that compile their own
+    graphs. If MLX refuses a graph -- its compiler fuses a long elementwise
+    chain into one Metal kernel and raises ``[compile] Too many
+    inputs/outputs fused ...`` rather than splitting it -- the run warns once
+    and continues uncompiled: the sampled distribution is the same (draws
+    differ at float32 round-off, since fused kernels and compiled random
+    draws round differently), each step is slower and evaluated eagerly,
+    and ``results.extras["compile_refused"]`` records that it happened. Pass
+    False to skip the attempt on a target known to be refused.
+
     ``archive`` (a :class:`~anvil.surrogate.TrainingArchive`) records
     every stored (u, log_prob) frame as future emulator training data —
     this happens on already-evaluated host copies, off the hot path.
@@ -450,6 +462,7 @@ def run(
         # compiled graph that froze a previous one. A kernel object reused
         # across runs would otherwise sample the target it first traced, and
         # init() itself may compute through a compiled helper.
+        kernel.compile_step = compile_step
         kernel.retrace(target)
         state = kernel.init(keys.init_key(), u0, target)
         adapt_state = kernel.init_adapt(state)
@@ -476,6 +489,7 @@ def run(
         keys = KeyStream(seed)
         iter0 = int(rs.iteration)
         state, params, adapt_state = dict(rs.state), dict(rs.params), None
+        kernel.compile_step = compile_step
         kernel.retrace(target)                 # before attach, same reason
         kernel.attach(target, state, params)
         kernel.restore(rs.kernel_ckpt)
@@ -506,8 +520,11 @@ def run(
                 f"the same refresh() and would raise. ({exc})",
                 stacklevel=2)
         mx.eval(*state.values(), *params.values())
-    if compile_step and not kernel.self_compiled:
-        step = mx.compile(kernel.step)
+    if compile_step and not kernel.self_compiled and not kernel.compile_refused:
+        def _refused():
+            kernel.compile_refused = True
+        step = CompiledOrEager(kernel.step, name=f"{type(kernel).__name__}.step",
+                               on_refusal=_refused)
     else:
         step = kernel.step
 
@@ -683,6 +700,10 @@ def run(
             # boundary, whereas one that sits low with healthy acceptance is
             # in a secondary mode. The scalar above cannot tell those apart.
             "divergent_per_chain": np.array(divergent_sum),
+            # True if MLX refused to compile a step graph and the run
+            # continued uncompiled (see anvil.compile); results are the
+            # same, speed is not, and a caller may want to know
+            "compile_refused": bool(kernel.compile_refused),
         },
         seed=seed,
         iters_consumed=iter0 + n_warmup + total_iters,

@@ -23,6 +23,7 @@ import warnings
 
 import mlx.core as mx
 
+from ..compile import CompiledOrEager
 from ..logdensity import LogDensity
 from ..state import ChainState
 from .base import Kernel, StepInfo
@@ -180,7 +181,16 @@ class EnsembleKernel(Kernel):
         # one compiled step per move, each closing over self.target
         if target is not None:
             self.target = target
-        self._compiled = [mx.compile(self._make_step(m)) for m, _ in self.moves]
+        enabled = self.compile_step and not self.compile_refused
+
+        def refused():
+            self.compile_refused = True
+
+        self._compiled = [
+            CompiledOrEager(self._make_step(m),
+                            name=f"the {type(m).__name__} ensemble step",
+                            enabled=enabled, on_refusal=refused)
+            for m, _ in self.moves]
 
     def checkpoint(self) -> dict[str, float]:
         return {"move_draws": float(self._moves_drawn)}

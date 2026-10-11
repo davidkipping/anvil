@@ -152,6 +152,48 @@ forward+backward pass. Caveats that matter in practice:
   with `float(...)`): it silently forces evaluation and breaks
   `mx.compile`.
 
+### When MLX refuses to compile the step
+
+MLX fuses long elementwise chains into one Metal kernel, and past a certain
+length that kernel needs more argument buffers than Metal provides. Instead
+of splitting the fusion, MLX raises
+
+```
+RuntimeError: [compile] Too many inputs/outputs fused in the Metal Compiled
+primitive which exhausted the available argument buffers for the kernel.
+```
+
+The target is fine — it evaluates correctly uncompiled, value and gradient —
+and the error is raised at *evaluation* rather than at the compiled call,
+which is why it used to surface mid-warmup after setup had been paid for.
+`run` now catches exactly this, warns once, and continues with the step
+uncompiled, evaluating each call so the unfused graph never spans more than
+one step (without that, L leapfrog steps of a large target exceed Metal's
+buffer limit — measured). Each step is slower, and
+`results.extras["compile_refused"]` records that it happened.
+
+What the fallback promises is the same *distribution*, not the same draws.
+ChEES is bit-identical compiled or not, because it draws its momentum
+outside the compiled leapfrog. Kernels that draw inside their compiled step
+— the ensemble moves, random-walk Metropolis — are not, and the reason is
+MLX's: `mx.random.normal` with the same key returns values 6×10⁻⁶ apart
+compiled versus eager. One step agrees to round-off with no accept decision
+flipped; over a run the draws diverge the way any float32 perturbation
+does, and the posterior agrees. Both are asserted in
+`tests/test_compile_fallback.py`. A kernel
+remembers the refusal, so later runs and resumes do not pay for the failed
+trace again. If you know a target is refused, `compile_step=False` skips the
+attempt.
+
+`compile_step=False` now reaches every kernel. Before, it only governed the
+kernels the engine compiles itself (`RandomWalkMetropolis`); `ChEESHMC` and
+`EnsembleKernel` compiled their own graphs regardless, so the flag was a
+silent no-op for exactly the kernels most likely to hit this. Measured on
+the target that provoked it (a six-generator collapsed limb-darkening model
+at 128 chains): ChEES failed identically with and without the flag; only
+the global `mx.disable_compile()` worked. That is fixed, and the flag means
+one thing everywhere.
+
 ## Measured performance
 
 Benchmark (M2 Max, 6-parameter transit over 10⁵ points, all runs

@@ -134,6 +134,11 @@ Rules of thumb from profiling:
   on a cheap analytic posterior will not beat the CPU.
 - Data-heavy likelihood evaluations are memory-bandwidth-bound; `mx.compile`
   fusion (automatic inside kernel steps) is worth ~5× over eager ops.
+- A very large per-chain graph can exceed Metal's fused-kernel argument
+  limit, which MLX reports as `[compile] Too many inputs/outputs fused`.
+  `run` falls back to the uncompiled step with a warning — same
+  distribution, draws differ at float32 round-off, slower — and
+  `compile_step=False` skips the attempt for every kernel.
 - ChEES-HMC costs L gradient evaluations per step but repays with an
   order-of-magnitude better per-draw efficiency on smooth targets; the
   stretch move is the safer pick for kinky or plateau-ridden posteriors

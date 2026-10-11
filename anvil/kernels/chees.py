@@ -51,6 +51,7 @@ from ..adaptation.moments import (
     update_dense_moments,
     update_moments,
 )
+from ..compile import CompiledOrEager
 from ..halton import halton_jitter
 from ..logdensity import LogDensity
 from ..state import ChainState
@@ -102,12 +103,21 @@ class ChEESHMC(Kernel):
         self._compile_kernels()
 
     def _compile_kernels(self):
-        if self.dense:
-            self._leapfrog_c = mx.compile(self._leapfrog_dense)
-            self._finish_c = mx.compile(self._finish_dense)
-        else:
-            self._leapfrog_c = mx.compile(self._leapfrog)
-            self._finish_c = mx.compile(self._finish)
+        # compile_step=False, or a refusal MLX has already handed us, means
+        # the plain functions; otherwise compiled, with the fallback armed
+        enabled = self.compile_step and not self.compile_refused
+
+        def refused():
+            self.compile_refused = True
+
+        leapfrog = self._leapfrog_dense if self.dense else self._leapfrog
+        finish = self._finish_dense if self.dense else self._finish
+        self._leapfrog_c = CompiledOrEager(
+            leapfrog, name="the ChEES-HMC leapfrog step", enabled=enabled,
+            on_refusal=refused)
+        self._finish_c = CompiledOrEager(
+            finish, name="the ChEES-HMC accept/reject step", enabled=enabled,
+            on_refusal=refused)
 
     # -- pure compiled pieces ---------------------------------------------
 
