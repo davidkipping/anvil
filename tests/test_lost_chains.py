@@ -114,3 +114,59 @@ def test_lost_chains_still_works_when_most_chains_are_lost():
 def test_lost_chains_uses_per_chain_medians_for_draw_arrays():
     lp = np.full((50, 8), -2.0); lp[:, 5] = FAIL; lp[0, 2] = FAIL  # one bad draw
     assert lost_chains(lp).tolist() == [5]
+
+
+# -- a record that disagrees with the target at a float32 feasibility edge --
+#
+# anvil-gp saw ChEES chains whose recorded log-probability was -17,000 while
+# the target evaluated eagerly at their positions gave the failure value
+# -6.8e30: compiled and eager evaluation differ at the edge. The record is
+# then a feasible value and every check that reads it is blind.
+
+class _EdgeTarget(anvil.LogDensity):
+    """A target whose compiled and eager evaluations disagree on a region:
+    eager reports failure there, compiled reports an ordinary value."""
+    dim = 2
+
+    def __init__(self):
+        self.eager_mode = True
+
+    def log_prob(self, u):
+        base = -0.5 * mx.sum(u * u, axis=-1)
+        in_edge = u[:, 0] > 5.0
+        failed = mx.full(base.shape, -1e30, dtype=base.dtype)
+        # mx.compile traces with tracers: emulate the disagreement by
+        # keying on a flag that differs between the two evaluations
+        return mx.where(in_edge, failed if self.eager_mode else base - 17000.0, base)
+
+
+def test_lost_at_end_catches_a_chain_whose_record_is_wrong():
+    from anvil.engine import _eager_log_prob, _lost_at_end
+    from anvil.kernels.chees import ChEESHMC
+
+    t = _EdgeTarget()
+    k = ChEESHMC(t)
+    u = mx.array(np.random.default_rng(0).standard_normal((64, 2)).astype(np.float32))
+    u = mx.concatenate([u[:61], mx.array([[6.0, 0.0]] * 3, dtype=mx.float32)])
+    t.eager_mode = False                       # the record is written "compiled"
+    st = k.init(mx.random.key(0), u, t)
+    rec = np.array(st["log_prob"])
+    assert np.all(rec > -1e5)                  # the record sees nothing wrong
+    t.eager_mode = True                        # the eager re-evaluation sees it
+    assert (_eager_log_prob(k, st, t)[61:] <= -1e29).all()
+    assert _lost_at_end(k, st, t).tolist() == [61, 62, 63]
+
+
+def test_a_healthy_run_reports_no_lost_chains_in_extras():
+    t = _target(sloped=True)
+    res = anvil.run(EnsembleKernel(t, seed=2), t, _u0() * 0.0 + 0.3,
+                    n_warmup=50, n_samples=20, seed=3)
+    assert res.extras["lost_chains"].size == 0
+    assert "log_prob_eager" in res.warmup_trace
+
+
+def test_extras_lost_chains_matches_the_constant_failure_run(constant_run):
+    _, res = constant_run
+    final = np.array(res.final_state["log_prob"])
+    np.testing.assert_array_equal(res.extras["lost_chains"],
+                                  np.flatnonzero(final <= FAIL / 2))

@@ -184,7 +184,19 @@ verdict about warmup length (it used to say `TOO SHORT` — advice that only
 lets lost chains drift further — or even `OK`); and
 `anvil.diagnose(chain, log_prob=results.get_log_prob())` lists them next to
 R-hat, so a bad R-hat arrives with its likely cause.
-{func}`anvil.diagnostics.lost_chains` is the check itself. anvil reports lost
+{func}`anvil.diagnostics.lost_chains` is the check itself. The check judges an *eager* re-evaluation of
+the target at the final positions as well as the record the kernel keeps,
+because the two can disagree: at a float32 feasibility edge a compiled graph
+and its eager twin round differently enough to decide between an ordinary
+value and a failure. Measured on a Gaussian-process likelihood, a chain whose
+record said −17,000 evaluated to −6.8×10³⁰ at the same position, so a check
+reading only the record was blind to it. `results.extras["lost_chains"]`
+carries the same judgement for the end of a run. One limit worth knowing: the
+relative test measures distance from the median, so an ensemble split close
+to half-and-half between a stranded group and a healthy one can put the
+median between them and flag neither; the fixed `-1e29` floor catches only
+chains at a failure *sentinel*, not stranded-but-finite ones. A shared step
+size collapsed to ~1e-8 is the other tell. anvil reports lost
 chains; it does not silently re-seed them, because that would also hide a
 target that fails over much of its prior.
 

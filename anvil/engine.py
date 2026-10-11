@@ -321,6 +321,31 @@ class Results:
         self.resume_state().save(path)
 
 
+def _eager_log_prob(kernel, state, target) -> np.ndarray:
+    """The target's log-density at the current positions, evaluated EAGERLY
+    -- not read from the state, which holds what the kernel's compiled step
+    last computed. The two can disagree: at a float32 feasibility edge a
+    compiled graph and its eager twin round differently enough to decide
+    between an ordinary value and a failure (measured: -17,000 compiled,
+    -6.8e30 eager, same position, on anvil-gp's GP likelihood). A chain whose
+    record is wrong is invisible to any check that reads the record."""
+    try:
+        fresh = kernel.refresh(state, state["u"], target)
+    except NotImplementedError:
+        return np.array(state["log_prob"])
+    return np.array(fresh["log_prob"])
+
+
+def _lost_at_end(kernel, state, target) -> np.ndarray:
+    from .diagnostics import lost_chains
+    rec = np.array(state["log_prob"])
+    finite = np.array(mx.all(mx.isfinite(state["u"]), axis=-1))
+    both = np.union1d(lost_chains(rec, positions_finite=finite),
+                      lost_chains(_eager_log_prob(kernel, state, target),
+                                  positions_finite=finite))
+    return both.astype(int)
+
+
 def _as_resume_state(obj) -> ResumeState:
     if isinstance(obj, ResumeState):
         return obj
@@ -598,6 +623,7 @@ def run(
                     if trace["iter"] else None)
     if warmup_trace is not None:
         warmup_trace["log_prob"] = np.array(state["log_prob"])
+        warmup_trace["log_prob_eager"] = _eager_log_prob(kernel, state, target)
         warmup_trace["u_finite"] = np.array(
             mx.all(mx.isfinite(state["u"]), axis=-1))
 
@@ -713,6 +739,11 @@ def run(
             # continued uncompiled (see anvil.compile); results are the
             # same, speed is not, and a caller may want to know
             "compile_refused": bool(kernel.compile_refused),
+            # chains lost at the end of the run, judged on an EAGER
+            # re-evaluation at their final positions as well as the record
+            # (see _eager_log_prob): the record alone misses chains whose
+            # compiled and eager values disagree. Indices into the chains.
+            "lost_chains": _lost_at_end(kernel, state, target),
         },
         seed=seed,
         iters_consumed=iter0 + n_warmup + total_iters,

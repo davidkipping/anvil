@@ -730,7 +730,14 @@ def warmup_report(results, settle_tol: float = 0.05) -> WarmupReport:
     # drift further) or level off (OK -- with the chain still lost). Neither
     # verdict would mention it, so this check owns the answer when it fires.
     if "log_prob" in tr:
+        # judge the eager re-evaluation as well as the record: they disagree
+        # at a float32 feasibility edge, and a chain whose record is a
+        # feasible value while its position is not is invisible to a check
+        # that only reads the record
         lost = lost_chains(tr["log_prob"], positions_finite=tr.get("u_finite"))
+        if "log_prob_eager" in tr:
+            lost = np.union1d(lost, lost_chains(
+                tr["log_prob_eager"], positions_finite=tr.get("u_finite")))
     else:   # a trace from before 0.6.0: positions are all we have
         lost = np.array([], dtype=int)
     if lost.size or not np.all(np.isfinite(sd)):
