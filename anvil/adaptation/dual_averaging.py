@@ -32,9 +32,28 @@ def init_dual_averaging(eps0: float) -> DualAveragingState:
     )
 
 
-def harmonic_mean(a: mx.array, floor: float = 1e-10) -> mx.array:
-    """Harmonic mean of per-chain acceptance probabilities."""
-    return 1.0 / mx.mean(1.0 / (a + floor))
+def harmonic_mean(a: mx.array, floor: float = 1e-10,
+                  include: mx.array | None = None) -> mx.array:
+    """Harmonic mean of per-chain acceptance probabilities.
+
+    ``include`` (bool, per chain) restricts the mean to those chains. It
+    exists for one case: a chain whose acceptance is zero at *every* step
+    size -- one sitting at a non-finite log-density or a target's failure
+    sentinel. The harmonic mean is meant to let a straggler pull the step
+    size down until it mixes, but such a chain never mixes, so it pins the
+    statistic near ``n_chains * floor`` and dual averaging shrinks the step
+    without limit: measured, ONE such chain of 64 took ChEES from 1e-2 to
+    7e-7. When every chain is included, or none is, the plain harmonic mean
+    over all chains is returned unchanged, bit for bit.
+    """
+    full = 1.0 / mx.mean(1.0 / (a + floor))
+    if include is None:
+        return full
+    w = include.astype(a.dtype)
+    n = mx.sum(w)
+    masked = n / mx.maximum(mx.sum(w / (a + floor)), 1e-30)
+    use_full = (n == a.shape[0]) | (n == 0)
+    return mx.where(use_full, full, masked)
 
 
 def update_dual_averaging(

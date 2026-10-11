@@ -196,7 +196,27 @@ relative test measures distance from the median, so an ensemble split close
 to half-and-half between a stranded group and a healthy one can put the
 median between them and flag neither; the fixed `-1e29` floor catches only
 chains at a failure *sentinel*, not stranded-but-finite ones. A shared step
-size collapsed to ~1e-8 is the other tell. anvil reports lost
+size collapsed to ~1e-8 is the other tell.
+
+**Why one chain can collapse the step size, and what is and is not
+guarded.** ChEES adapts one step size for all chains from the *harmonic*
+mean of their acceptance, which deliberately lets the worst chain pull the
+step down until it mixes. Two cases follow:
+
+- A chain at a non-finite log-density or a failure sentinel (≤ −1e29)
+  accepts nothing at *any* step size, so it pinned the statistic near zero
+  forever. Measured: one such chain of 64, with a `-inf` failure value, drove
+  the step size to exactly 0 and froze every chain. Since 0.7.0 such chains
+  are left out of the statistic; the step size then matches a clean run, and
+  the stranded chain itself usually escapes. Healthy runs are bit-identical.
+- A *finite* chain in a pathologically rough region — measured on a
+  Gaussian-process likelihood near its float32 feasibility edge — does
+  accept, but only at a step size around 1e-7, and the harmonic mean
+  faithfully shrinks the step for all 64 chains to serve it. This is not
+  guarded: excluding it would need a statistic that stops honouring the
+  worst chain, which would also weaken the straggler protection the funnel
+  relies on. If one or two chains sit thousands of log-units below the bulk
+  and the step size has collapsed, re-initialize those chains. anvil reports lost
 chains; it does not silently re-seed them, because that would also hide a
 target that fails over much of its prior.
 

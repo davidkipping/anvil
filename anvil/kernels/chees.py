@@ -53,6 +53,10 @@ from ..adaptation.moments import (
 )
 from ..compile import CompiledOrEager
 from ..halton import halton_jitter
+
+#: a log-density at or below this is a target's "model failed" sentinel, not
+#: a density (the same floor anvil.diagnostics.lost_chains uses)
+_FAILURE_FLOOR = -1e29
 from ..logdensity import LogDensity
 from ..state import ChainState
 from .base import Kernel, StepInfo
@@ -347,8 +351,15 @@ class ChEESHMC(Kernel):
         )
 
     def adapt(self, a: ChEESAdaptState, state, info: StepInfo, t: int):
+        # A chain at a non-finite log-density or a failure sentinel accepts
+        # nothing at any step size, so it must not steer the step size: it
+        # would drive it to zero for everyone (see harmonic_mean). Judged on
+        # the kernel's own state, on device, with no tuning -- a finite
+        # straggler, however far behind, is never excluded.
+        lp = state["log_prob"]
+        live = mx.isfinite(lp) & (lp > _FAILURE_FLOOR)
         da = update_dual_averaging(
-            a.da, harmonic_mean(info["accept_prob"]), t,
+            a.da, harmonic_mean(info["accept_prob"], include=live), t,
             target=self.target_accept,
         )
         grad = chees_gradient(

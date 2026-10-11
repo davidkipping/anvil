@@ -192,3 +192,50 @@ def test_stranded_finite_chains_are_not_blamed_on_a_failed_evaluation():
     assert "secondary mode" in rep.suggestion
     assert "failed evaluation" not in rep.suggestion.split("although")[0]
     assert "constant for a failed evaluation" not in rep.suggestion
+
+
+# -- a structurally dead chain must not steer the shared step size ----------
+#
+# ChEES adapts one step size from the harmonic mean of per-chain acceptance,
+# so a single chain with acceptance zero at every step size pinned the
+# statistic near zero and dual averaging shrank the step without limit
+# (measured on anvil-gp's GP target: one chain of 64 took it from 1e-2 to
+# 7e-7). Chains at a non-finite log-density or a failure sentinel are now
+# left out of that statistic; finite stragglers never are.
+
+def test_harmonic_mean_include_is_exact_when_all_or_none_are_included():
+    from anvil.adaptation.dual_averaging import harmonic_mean
+    a = mx.array(np.random.default_rng(0).uniform(0.05, 1.0, 64).astype(np.float32))
+    full = float(harmonic_mean(a).item())
+    for mask in (np.ones(64, bool), np.zeros(64, bool)):
+        assert float(harmonic_mean(a, include=mx.array(mask)).item()) == full
+    m = np.ones(64, bool); m[:5] = False
+    want = 1.0 / np.mean(1.0 / (np.array(a)[m] + 1e-10))
+    assert abs(float(harmonic_mean(a, include=mx.array(m)).item()) - want) < 1e-5
+
+
+def test_one_chain_at_minus_inf_no_longer_collapses_the_step_size():
+    """Without the exclusion this run's step size underflows to exactly 0
+    and freezes every chain; with it, the dead chain even recovers."""
+    from anvil.kernels.chees import ChEESHMC
+
+    def mlp(v):
+        r2 = mx.sum(v * v, axis=-1)
+        return mx.where(mx.sqrt(r2) < RADIUS, -0.5 * r2,
+                        mx.full(r2.shape, -np.inf, dtype=v.dtype))
+    t = anvil.TransformedLogDensity(
+        mlp, anvil.Transform([anvil.ParamSpec(f"x{i}") for i in range(DIM)]))
+    rng = np.random.default_rng(5)
+    u0 = (0.3 * rng.standard_normal((64, DIM))).astype(np.float32)
+    clean = anvil.run(ChEESHMC(t), t, mx.array(u0), n_warmup=200,
+                      n_samples=10, seed=3)
+    u0[0] = 15.0                                   # one chain at -inf
+    one_bad = anvil.run(ChEESHMC(t), t, mx.array(u0), n_warmup=200,
+                        n_samples=10, seed=3)
+    eps_clean = float(clean.final_params["step_size"].item())
+    eps_bad = float(one_bad.final_params["step_size"].item())
+    assert eps_bad > 0.5 * eps_clean, (eps_bad, eps_clean)
+    # and with a usable step size the dead chain escapes into the bulk
+    # (without the exclusion: step 0, every chain frozen, chain 0 at -inf)
+    assert np.isfinite(float(one_bad.final_state["log_prob"][0].item()))
+    assert 0 not in one_bad.extras["lost_chains"]
