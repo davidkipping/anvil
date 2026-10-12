@@ -497,6 +497,11 @@ def nested_rhat(chain: np.ndarray, n_superchains: int) -> np.ndarray:
     return out[0:1] if single else out
 
 
+#: a finite chain far below the bulk is "climbing" -- converging, not lost --
+#: if over the last third of warmup it closed at least this fraction of its
+#: gap to the bulk median. A stranded chain closes ~none of it.
+_CLIMB_FRACTION = 0.25
+
 #: a log-probability below this is a target's "failed" sentinel, not a
 #: density -- the backstop for when half or more of the chains are lost and
 #: the median is itself a lost chain
@@ -670,6 +675,7 @@ class WarmupReport:
     noise_floor: float          # relative sd of the spread estimate itself
     suggestion: str
     lost: tuple[int, ...] = ()  # chains lost at the end of warmup
+    climbing: tuple[int, ...] = ()  # far below the bulk but still closing in
 
     def __str__(self) -> str:
         at = "never" if self.settled_at is None else f"iteration {self.settled_at}"
@@ -756,28 +762,82 @@ def warmup_report(results, settle_tol: float = 0.05) -> WarmupReport:
         if lost.size and hard.any():
             why = (f"{lost.size} of {n_chains} chains ({shown}) ended warmup "
                    "at a non-finite position or a failed evaluation of the "
-                   "target. Longer warmup will not recover them -- they are "
-                   "somewhere the target cannot guide them back from. Usually "
-                   "the target returns a constant for a failed evaluation, "
-                   "which is a flat region; see 'What to return when the "
-                   "model fails' in the samplers guide, then re-initialize "
-                   "those chains")
+                   "target. Longer warmup is unlikely to recover them -- a "
+                   "constant failure value is a flat region they drift across "
+                   "rather than climb out of (a -inf one can let them escape). "
+                   "Usually the target returns that constant; see 'What to "
+                   "return when the model fails' in the samplers guide, then "
+                   "re-initialize those chains")
+        elif lost.size and "log_prob_hist" in tr and np.asarray(
+                tr["log_prob_hist"]).ndim == 2 and len(tr["log_prob_hist"]) >= 3:
+            # finite and far below the bulk: stranded, or merely still
+            # climbing? A single end-of-warmup snapshot cannot say; the
+            # per-probe history can. A chain that closed a quarter of its
+            # gap to the bulk over the last third of warmup is converging.
+            H = np.asarray(tr["log_prob_hist"], dtype=np.float64)
+            ref = max(1, 2 * len(H) // 3)
+            keep = np.setdiff1d(np.arange(n_chains), lost)
+            med = np.median(H[-1][keep]) if keep.size else np.median(H[-1])
+            gap = med - H[ref][lost]
+            gain = H[-1][lost] - H[ref][lost]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                frac = np.where(gap > 0, gain / gap, 0.0)
+            rising = frac >= _CLIMB_FRACTION
+            climbing, stranded = lost[rising], lost[~rising]
+            if not stranded.size:
+                cshown = ", ".join(map(str, climbing[:12])) + (
+                    ", ..." if climbing.size > 12 else "")
+                return WarmupReport(
+                    verdict="TOO SHORT", settled_at=None, n_warmup=n_warm,
+                    n_chains=n_chains, final_accept=accept, noise_floor=noise,
+                    climbing=tuple(int(i) for i in climbing),
+                    suggestion=(
+                        f"{climbing.size} of {n_chains} chains ({cshown}) ended "
+                        f"warmup far below the rest in log-probability but were "
+                        f"still climbing toward it, closing "
+                        f"{np.median(frac[rising]):.0%} of their gap over the "
+                        f"last third of warmup (worst {H[-1][climbing].min():.4g} "
+                        f"against a bulk near {med:.4g}). They are converging, "
+                        f"not lost: longer warmup should bring them in; try at "
+                        f"least {2 * n_warm} iterations"))
+            lost = stranded
+            lost_climbing = tuple(int(i) for i in climbing)
+            lp_end = lp_end[stranded]
+            why = (f"{stranded.size} of {n_chains} chains "
+                   f"({', '.join(map(str, stranded[:12]))}"
+                   f"{', ...' if stranded.size > 12 else ''}) ended warmup far "
+                   f"below the rest in log-probability (worst "
+                   f"{lp_end.min():.4g} against a bulk near {med:.4g}) although "
+                   "every evaluation was finite, and closed none of the gap over "
+                   "the last third of warmup. They look stranded in a much "
+                   "lower-density region -- typically a secondary mode, or "
+                   "chains that never left a bad start -- but a flat last "
+                   "third does not rule out a late jump: chains still listed "
+                   "in results.extras['lost_chains'] AFTER sampling are the "
+                   "ones that stayed there. Compare their positions with the "
+                   "bulk, and check for multimodality before pooling"
+                   + (f". ({climbing.size} further chains were still climbing "
+                      "and are not counted)" if climbing.size else ""))
+            bulk = med
         elif lost.size:
             why = (f"{lost.size} of {n_chains} chains ({shown}) ended warmup "
                    f"far below the rest in log-probability (worst "
                    f"{lp_end[lost].min():.4g} against a bulk near {bulk:.4g}) "
-                   "although every evaluation was finite. They are stranded "
-                   "in a much lower-density region -- typically a secondary "
-                   "mode, or chains that never left a bad start -- and longer "
-                   "warmup will not move them. Compare their positions with "
-                   "the bulk, and check for multimodality before pooling")
+                   "although every evaluation was finite. They are either "
+                   "stranded in a much lower-density region (a secondary "
+                   "mode, or chains that never left a bad start) or still "
+                   "descending -- this trace has no per-probe history to "
+                   "tell which. results.extras['lost_chains'] after "
+                   "sampling shows which stayed. Compare their positions "
+                   "with the bulk, and re-run with more warmup to see")
         else:
             why = ("the cross-chain spread is non-finite, so some chain has "
                    "overflowed")
         return WarmupReport(
             verdict="LOST CHAINS", settled_at=None, n_warmup=n_warm,
             n_chains=n_chains, final_accept=accept, noise_floor=noise,
-            lost=tuple(int(i) for i in lost), suggestion=why)
+            lost=tuple(int(i) for i in lost),
+            climbing=locals().get("lost_climbing", ()), suggestion=why)
 
     # reference: the last third of probes, which is the best estimate of
     # the stationary spread available from this run

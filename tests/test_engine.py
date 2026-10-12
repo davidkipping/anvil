@@ -140,7 +140,8 @@ def test_warmup_trace_is_recorded_and_disableable():
     # per-probe series, plus the end-of-warmup snapshot the lost-chain
     # check reads (one value per chain, not per probe)
     assert sorted(tr) == ["accept", "iter", "log_prob", "log_prob_eager",
-                          "mean", "sd", "step_size", "u_finite"]
+                          "log_prob_hist", "mean", "sd", "step_size",
+                          "u_finite"]
     assert len(tr["iter"]) == 20 and tr["iter"][-1] == 100
     assert tr["sd"].shape == (20, 4) and tr["mean"].shape == (20, 4)
     assert np.all(np.isfinite(tr["accept"]))

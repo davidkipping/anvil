@@ -283,7 +283,9 @@ class Results:
     final_state: ChainState
     final_params: dict[str, mx.array]
     #: cheap per-probe record of the warmup phase, for warmup_report():
-    #: keys "iter", "sd", "mean", "accept", "step_size"
+    #: keys "iter", "sd", "mean", "accept", "step_size", "log_prob_hist"
+    #: (per-probe, per-chain), plus end-of-warmup "log_prob",
+    #: "log_prob_eager" and "u_finite" (per-chain)
     warmup_trace: dict[str, np.ndarray] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
     #: effective RNG seed, and total iterations drawn from its key stream
@@ -583,7 +585,8 @@ def run(
     probe_every = (max(1, n_warmup // warmup_probes)
                    if warmup_probes and n_warmup else 0)
     trace: dict[str, list] = {k: [] for k in
-                              ("iter", "sd", "mean", "accept", "step_size")}
+                              ("iter", "sd", "mean", "accept", "step_size",
+                               "log_prob_hist")}
     t_phase = time.perf_counter()
     for t in range(n_warmup):
         state, info = step(keys.key(iter0 + t), state, params)
@@ -598,6 +601,9 @@ def run(
             trace["sd"].append(np.array(mx.std(u, axis=0)))
             trace["mean"].append(np.array(mx.mean(u, axis=0)))
             trace["accept"].append(float(mx.mean(info["accept_prob"]).item()))
+            # each chain's log-probability at this probe: lets warmup_report
+            # tell a chain still climbing toward the bulk from one stranded
+            trace["log_prob_hist"].append(np.array(state["log_prob"]))
             trace["step_size"].append(
                 float(params["step_size"].item())
                 if "step_size" in params else float("nan"))

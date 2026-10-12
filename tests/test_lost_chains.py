@@ -59,7 +59,8 @@ def test_warmup_report_names_the_lost_chains_instead_of_a_length_verdict(
         rep = anvil.warmup_report(res)
     assert rep.verdict == "LOST CHAINS", rep
     assert len(rep.lost) > 0
-    assert "longer warmup will not" in rep.suggestion.lower()
+# "unlikely", not "will not": a -inf failure value lets chains escape
+    assert "longer warmup is unlikely" in rep.suggestion.lower()
     # exactly the chains sitting at the failure value
     lp_end = res.warmup_trace["log_prob"]
     np.testing.assert_array_equal(sorted(rep.lost), np.flatnonzero(lp_end <= FAIL / 2))
@@ -239,3 +240,78 @@ def test_one_chain_at_minus_inf_no_longer_collapses_the_step_size():
     # (without the exclusion: step 0, every chain frozen, chain 0 at -inf)
     assert np.isfinite(float(one_bad.final_state["log_prob"][0].item()))
     assert 0 not in one_bad.extras["lost_chains"]
+
+
+
+# -- climbing vs stranded: the per-probe history decides --------------------
+#
+# anvil-gp measured chains flagged LOST that were simply still descending at
+# the end of warmup and joined the bulk within the same run; "longer warmup
+# will not recover them" was false for those. A single snapshot cannot tell
+# the two apart; the per-chain history can.
+
+def _trace(final, earlier, n_probes=30):
+    """A synthetic warmup trace whose chains move linearly from `earlier`
+    (at the start of the last third) to `final`, finite throughout."""
+    import types
+    n_chains = len(final)
+    ref = max(1, 2 * n_probes // 3)
+    H = np.empty((n_probes, n_chains))
+    for k in range(n_probes):
+        if k <= ref:
+            H[k] = earlier
+        else:
+            H[k] = earlier + (final - earlier) * (k - ref) / (n_probes - 1 - ref)
+    tr = {"iter": np.arange(1, n_probes + 1) * 10, "sd": np.ones((n_probes, 2)),
+          "mean": np.zeros((n_probes, 2)), "accept": np.full(n_probes, 0.65),
+          "step_size": np.full(n_probes, 0.1), "log_prob_hist": H,
+          "log_prob": final, "log_prob_eager": final.copy(),
+          "u_finite": np.ones(n_chains, bool)}
+    return types.SimpleNamespace(warmup_trace=tr, n_chains=n_chains,
+                                 n_warmup=300)
+
+
+def test_chains_still_climbing_are_not_called_lost():
+    rng = np.random.default_rng(0)
+    bulk = -1225.0 + 1.3 * rng.standard_normal(64)
+    final = bulk.copy(); earlier = bulk.copy()
+    final[5] = -1274.0; earlier[5] = -1400.0          # closing most of 175
+    rep = anvil.warmup_report(_trace(final, earlier))
+    assert rep.verdict == "TOO SHORT", rep
+    assert rep.climbing == (5,) and rep.lost == ()
+    assert "converging" in rep.suggestion and "not lost" in rep.suggestion
+
+
+def test_chains_that_closed_none_of_the_gap_are_still_lost():
+    rng = np.random.default_rng(0)
+    bulk = -467.0 + 1.9 * rng.standard_normal(64)
+    final = bulk.copy(); final[:9] = rng.uniform(-556, -511, 9)
+    rep = anvil.warmup_report(_trace(final, final.copy()))   # flat history
+    assert rep.verdict == "LOST CHAINS" and len(rep.lost) == 9
+    assert "closed none of the gap" in rep.suggestion
+    # a flat last third does not rule out a late jump: send the reader to the
+    # end-of-run list, which is the decisive one
+    assert "after sampling" in rep.suggestion.lower()
+    assert "will not move them" not in rep.suggestion
+
+
+def test_a_mix_reports_only_the_stranded_as_lost():
+    rng = np.random.default_rng(0)
+    bulk = -467.0 + 1.9 * rng.standard_normal(64)
+    final = bulk.copy(); earlier = bulk.copy()
+    final[:3] = -540.0; earlier[:3] = -540.0           # stranded
+    final[3:5] = -520.0; earlier[3:5] = -600.0         # climbing hard, still far
+    rep = anvil.warmup_report(_trace(final, earlier))
+    assert rep.verdict == "LOST CHAINS"
+    assert sorted(rep.lost) == [0, 1, 2]
+    assert "2 further chains were still climbing" in rep.suggestion
+
+
+def test_a_failed_evaluation_is_lost_however_it_got_there():
+    """The history never rescues a chain at the failure value."""
+    rng = np.random.default_rng(0)
+    final = -467.0 + 1.9 * rng.standard_normal(64); earlier = final.copy()
+    final[7] = -1e30; earlier[7] = -2e30
+    rep = anvil.warmup_report(_trace(final, earlier))
+    assert rep.verdict == "LOST CHAINS" and rep.lost == (7,)
+    assert "failed evaluation" in rep.suggestion

@@ -216,7 +216,15 @@ step down until it mixes. Two cases follow:
   guarded: excluding it would need a statistic that stops honouring the
   worst chain, which would also weaken the straggler protection the funnel
   relies on. If one or two chains sit thousands of log-units below the bulk
-  and the step size has collapsed, re-initialize those chains. anvil reports lost
+  and the step size has collapsed, re-initialize those chains. `warmup_report` also uses each chain's log-probability *history*: a chain
+far below the bulk that closed at least a quarter of its gap over the last
+third of warmup is reported as still climbing (verdict `TOO SHORT`, since
+longer warmup should bring it in), not lost. The distinction has a limit: a
+chain with a flat last third can still jump into the bulk later — measured on
+a Gaussian-process target, two chains flagged as stranded at the end of
+warmup were back in the bulk by the end of the run. So treat the warmup
+verdict as a warning and `results.extras["lost_chains"]`, judged after
+sampling, as the decisive list. anvil reports lost
 chains; it does not silently re-seed them, because that would also hide a
 target that fails over much of its prior.
 
