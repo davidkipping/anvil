@@ -14,7 +14,7 @@ regime the measured advantage over a tuned CPU emcee workflow is one to
 two orders of magnitude in effective samples per second on a single
 M2 Max.
 
-## Two sampler families, one engine
+## Two sampler families and an optimizer, one engine
 
 - **ChEES-HMC** — Hamiltonian Monte Carlo with cross-chain adaptation of
   step size, trajectory length, and preconditioning — diagonal by
@@ -25,6 +25,10 @@ M2 Max.
   differential-evolution moves with detailed-balance-correct red-black
   updates. Gradient-free, affine-invariant, robust; near-drop-in for
   emcee workflows.
+- **Optimization** — {func}`~anvil.optimize`: maximum likelihood, MAP or
+  the density's mode, from many starts at once (L-BFGS then damped Newton,
+  or differential evolution without gradients). The best fit, its Laplace
+  covariance, and starts for the samplers.
 
 ## Answering the questions a run raises
 
@@ -34,6 +38,7 @@ this project out at least once:
 
 | call | question |
 |---|---|
+| {func}`~anvil.optimize` | what is the best fit, and is there more than one? |
 | {func}`~anvil.diagnostics.diagnose` | did it converge, and how many effective samples? |
 | {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed — or are some chains lost? |
 | {func}`~anvil.diagnostics.whitened_shape` | correlated, or curved? (predicts whether `dense=True` pays) |
@@ -54,5 +59,6 @@ quickstart
 precision
 priors
 samplers
+optimize
 api
 ```

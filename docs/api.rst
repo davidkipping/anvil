@@ -13,6 +13,12 @@ Engine
 .. automodule:: anvil.engine
    :members: run, Results, ResumeState, load_state
 
+Optimization
+------------
+
+.. automodule:: anvil.optimize
+   :members: optimize, OptimizeResult
+
 Kernels
 -------
 

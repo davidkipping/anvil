@@ -12,7 +12,7 @@ large constants, preprocessing, re-anchoring, and diagnostics. Unified
 memory makes the split free: no transfers, and MLX lets float64 CPU
 operations live inside the same lazy graph as float32 GPU work.
 
-## Two sampler families, one engine
+## Two sampler families and an optimizer, one engine
 
 - **ChEES-HMC** (flagship) — Hamiltonian Monte Carlo with cross-chain
   adaptation of step size (dual averaging on the harmonic-mean acceptance),
@@ -28,6 +28,12 @@ operations live inside the same lazy graph as float32 GPU work.
   half-ensemble updates. Gradient-free, affine-invariant, near-drop-in for
   emcee workflows; the right choice for likelihoods with kinks, plateaus,
   or suspect gradients.
+- **Optimization** — `anvil.optimize(target)`: the maximum likelihood (or
+  MAP, or the density's mode) from many starts at once, as one batched call
+  per step. L-BFGS for the large moves, then damped Newton with a
+  finite-difference Hessian to finish; differential evolution without
+  gradients. Returns the best fit, its Laplace covariance, any rival optima,
+  and starts for the samplers (`res.ball(n)`, `res.laplace_starts(n)`).
 
 ## Quick start
 
@@ -179,6 +185,23 @@ float32 graph, so existing fits are bit-identical; the normalising constants
 live on the host as float64 (`target.log_norm_const`), and
 `transform.prior_transform(cube)` gives the MultiNest/dynesty hypercube
 interface. See the priors guide.
+
+## Best fits
+
+```python
+res = anvil.optimize(target)                 # MLE: likelihood only
+res = anvil.optimize(target, objective="map")  # + declared priors, model units
+print(res)                                   # best fit +/- Laplace sd, flags
+```
+
+A sampler's `log_prob` lives in the unbounded space anvil samples in and
+includes the log-Jacobian of the bounded-parameter maps, so its maximum is
+neither the MLE nor the MAP; `optimize` leaves the Jacobian out. On
+Elome's transit model (curvature condition number ~8e6), L-BFGS alone
+stops short of the optimum; the default `"mixed"` method reaches it from
+98% of 128 starts in 0.6 s. Convergence is judged by the Newton decrement,
+which float32 resolves where differences of the log-likelihood cannot. See
+the optimization guide.
 
 ## Extending a run
 

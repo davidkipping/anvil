@@ -328,6 +328,26 @@ class TransformedLogDensity(LogDensity):
             lp = lp + self.transform.log_prior(v)
         return lp
 
+    def log_likelihood(self, u: mx.array) -> mx.array:
+        """``model_log_prob`` alone at ``u``: no Jacobian and no declared
+        prior. This is what :func:`anvil.optimize` maximises for
+        ``objective="mle"``. A prior written into ``model_log_prob`` itself,
+        rather than declared on a :class:`ParamSpec`, is part of it."""
+        return self._fn(self.transform.to_model(u))
+
+    def log_likelihood_hi(self, u: mx.array) -> mx.array:
+        """Float64 CPU-path twin of :meth:`log_likelihood` (requires
+        ``model_log_prob_hi``)."""
+        if self._fn_hi is None:
+            raise NotImplementedError(
+                "no float64 path: pass model_log_prob_hi= to "
+                "TransformedLogDensity (e.g. ChunkedGaussianLogLike.hi)"
+            )
+        u_np = np.array(u, dtype=np.float64)
+        with mx.stream(mx.cpu):
+            return self._fn_hi(mx.array(self.transform.model_np(u_np),
+                                        dtype=mx.float64))
+
     @property
     def log_norm_const(self) -> float:
         """Float64 constant that turns a stored log_prob into the absolute

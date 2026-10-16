@@ -20,7 +20,8 @@ divergences.
 - Requires an MLX-differentiable log density (autodiff is automatic; see
   the gradient notes below).
 - **Initialize tightly** — a small ball (~10⁻³ in scaled units) around a
-  preliminary optimizer fit. On likelihoods with flat plateaus (e.g. a
+  preliminary optimizer fit: `anvil.optimize(target).ball(n)`, or
+  `.laplace_starts(n)` for a curved posterior (see {doc}`optimize`). On likelihoods with flat plateaus (e.g. a
   transit model where a chain's proposed transits miss the data
   entirely), wide initializations strand chains at zero gradient, which
   collapses the shared step size and stalls the run.
