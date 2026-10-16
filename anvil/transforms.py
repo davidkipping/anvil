@@ -28,6 +28,7 @@ import mlx.core as mx
 import numpy as np
 
 from .logdensity import LogDensity
+from .priors import ImproperFlat, LogUniform, Prior, Uniform
 
 
 @dataclass
@@ -54,12 +55,24 @@ class ParamSpec:
     scale: float = 1.0
     report_offset: float = 0.0
     report_scale: float = 1.0
+    #: a :class:`~anvil.priors.Prior`, in model units (the units of lo/hi).
+    #: None means the implied default: Uniform on a finite box, and an
+    #: improper flat density otherwise. Declared last so positional
+    #: construction (``ParamSpec("q1", 0.0, 1.0)``) keeps working.
+    prior: Prior | None = None
 
     def __post_init__(self):
         if not self.hi > self.lo:
             raise ValueError(f"{self.name}: hi must exceed lo")
         if not self.scale > 0:
             raise ValueError(f"{self.name}: scale must be positive")
+        if self.prior is not None:
+            if isinstance(self.prior, LogUniform) and self.report_offset != 0.0:
+                raise ValueError(
+                    f"{self.name}: LogUniform is a prior on the model quantity "
+                    f"itself and cannot sit on an offset "
+                    f"(report_offset={self.report_offset})")
+            self.prior.bind(self.lo, self.hi, self.name)   # validate now
 
 
 class Transform:
@@ -106,6 +119,86 @@ class Transform:
         # float64 host-side reporting constants
         self._rep_off = np.array([s.report_offset for s in specs], dtype=np.float64)
         self._rep_scale = np.array([s.report_scale for s in specs], dtype=np.float64)
+
+        # Priors, imposed by addition: each spec's map is unchanged, and the
+        # log-posterior gains the prior's v-dependent term in the graph plus a
+        # float64 host normaliser outside it. See anvil.priors.
+        self.priors: list[Prior] = [self._resolve_prior(s) for s in specs]
+        #: True when every parameter has a normalisable prior (no improper
+        #: flat density on an unbounded or half-bounded spec)
+        self.is_proper: bool = all(p.is_proper for p in self.priors)
+        #: sum of the priors' float64 normalising constants. Adding it (and
+        #: the likelihood's own constants) to a stored log_prob gives the
+        #: absolute log posterior density. Meaningful only when is_proper.
+        self.log_prior_norm: float = float(sum(p.log_norm for p in self.priors))
+        self._prior_cols = [i for i, p in enumerate(self.priors)
+                            if p.has_in_graph_term]
+        #: False when no prior adds anything to the graph (only flat ones):
+        #: then TransformedLogDensity's graph is exactly what it was before
+        #: priors existed, and so are its draws.
+        self.has_prior_terms: bool = bool(self._prior_cols)
+
+    @staticmethod
+    def _resolve_prior(spec: ParamSpec) -> Prior:
+        if spec.prior is None:
+            if math.isfinite(spec.lo) and math.isfinite(spec.hi):
+                return Uniform().bind(spec.lo, spec.hi, spec.name)
+            return ImproperFlat().bind(spec.lo, spec.hi, spec.name)
+        return spec.prior.bind(spec.lo, spec.hi, spec.name)
+
+    # -- priors -----------------------------------------------------------
+
+    def log_prior(self, v: mx.array) -> mx.array:
+        """(n, dim) model space -> (n,): the v-dependent part of the log
+        prior, in the float32 graph (dtype follows ``v``). Zero when
+        ``has_prior_terms`` is False -- callers skip it then."""
+        out = None
+        for i in self._prior_cols:
+            t = self.priors[i].log_pdf(v[:, i])
+            out = t if out is None else out + t
+        return out if out is not None else mx.zeros(v.shape[:1], dtype=v.dtype)
+
+    def log_prior_np(self, v: np.ndarray) -> np.ndarray:
+        """Float64 twin of :meth:`log_prior`, summed over every parameter
+        (so ``-inf`` outside any prior's support)."""
+        v = np.atleast_2d(np.asarray(v, dtype=np.float64))
+        return sum(p.log_pdf_np(v[:, i]) for i, p in enumerate(self.priors))
+
+    def prior_transform(self, cube: np.ndarray) -> np.ndarray:
+        """Map points of the unit hypercube ``(n, dim)`` to model space
+        through each prior's inverse CDF -- the interface nested samplers
+        (MultiNest, dynesty) expect, and how :meth:`sample_prior` draws.
+        Requires every prior to be proper."""
+        if not self.is_proper:
+            bad = [s.name for s, p in zip(self.specs, self.priors) if not p.is_proper]
+            raise ValueError(f"improper prior on {bad}: give those parameters "
+                             "a finite box or an explicit prior")
+        cube = np.atleast_2d(np.asarray(cube, dtype=np.float64))
+        return np.stack([p.ppf_np(cube[:, i]) for i, p in enumerate(self.priors)],
+                        axis=-1)
+
+    def sample_prior_model(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        """``n`` float64 prior draws in model space, ``(n, dim)``."""
+        v = self.prior_transform(rng.uniform(size=(n, self.dim)))
+        # keep draws strictly inside each box, so the inverse map to u is
+        # finite (a uniform draw of exactly 0 would map to u = -inf)
+        lo = np.array([s.lo for s in self.specs]); hi = np.array([s.hi for s in self.specs])
+        return np.clip(v, np.nextafter(lo, np.inf), np.nextafter(hi, -np.inf))
+
+    def sample_prior(self, n: int, rng: np.random.Generator) -> mx.array:
+        """``n`` prior draws mapped to u-space, as a float32 ``mx.array``
+        ready for ``run(u0=...)``. Not used as a default anywhere: a prior
+        draw is rarely a good start for a data-dominated posterior."""
+        u = self.from_model_np(self.sample_prior_model(n, rng))
+        return mx.array(u.astype(np.float32))
+
+    @property
+    def prior_mean(self) -> np.ndarray:
+        return np.array([p.mean for p in self.priors], dtype=np.float64)
+
+    @property
+    def prior_sd(self) -> np.ndarray:
+        return np.array([p.sd for p in self.priors], dtype=np.float64)
 
     # -- in-graph (fp32, batched, differentiable) -------------------------
 
@@ -215,16 +308,37 @@ class TransformedLogDensity(LogDensity):
     """
 
     def __init__(self, model_log_prob, transform: Transform,
-                 supports_grad: bool = True, model_log_prob_hi=None):
+                 supports_grad: bool = True, model_log_prob_hi=None,
+                 model_log_norm: float = 0.0):
         self._fn = model_log_prob
         self._fn_hi = model_log_prob_hi
         self.transform = transform
         self.dim = transform.dim
         self.supports_grad = supports_grad
+        #: float64 host constant the likelihood keeps out of its graph (e.g.
+        #: a ChunkedGaussianLogLike's log_offset_const + log_norm_const)
+        self.model_log_norm = float(model_log_norm)
 
     def log_prob(self, u: mx.array) -> mx.array:
         v = self.transform.to_model(u)
-        return self._fn(v) + self.transform.log_det_jac(u)
+        lp = self._fn(v) + self.transform.log_det_jac(u)
+        # appended only when some prior has a v-dependent term: with flat
+        # priors alone the graph -- and so every draw -- is exactly as before
+        if self.transform.has_prior_terms:
+            lp = lp + self.transform.log_prior(v)
+        return lp
+
+    @property
+    def log_norm_const(self) -> float:
+        """Float64 constant that turns a stored log_prob into the absolute
+        log posterior density: ``res.get_log_prob() + target.log_norm_const``
+        = log L(v) + log p(v) + log|dv/du|. The priors' normalisers plus
+        ``model_log_norm``; meaningful only when :attr:`is_proper`."""
+        return self.transform.log_prior_norm + self.model_log_norm
+
+    @property
+    def is_proper(self) -> bool:
+        return self.transform.is_proper
 
     @property
     def has_hi(self) -> bool:
@@ -241,8 +355,16 @@ class TransformedLogDensity(LogDensity):
         with mx.stream(mx.cpu):
             # dtype= is REQUIRED (see precision.py): without it the
             # float64 parameters and Jacobian silently round to float32.
-            v64 = mx.array(self.transform.model_np(u_np), dtype=mx.float64)
+            v_np = self.transform.model_np(u_np)
+            v64 = mx.array(v_np, dtype=mx.float64)
             lp = self._fn_hi(v64)
             jac = mx.array(self.transform.log_det_jac_np(u_np),
                            dtype=mx.float64)
-            return lp + jac
+            out = lp + jac
+            if self.transform.has_prior_terms:
+                # computed in float64 from the float64 v, never cast up
+                # from float32, so the precision harness compares like
+                # with like
+                out = out + mx.array(self.transform.log_prior_np(v_np),
+                                     dtype=mx.float64)
+            return out

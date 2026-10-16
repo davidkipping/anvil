@@ -64,6 +64,9 @@ included automatically via {class}`anvil.TransformedLogDensity`), and to
 reinstate float64 physical units (absolute epochs, baselines) on output.
 See {doc}`precision` — the transform layer is half of the float32 story.
 
+Each parameter can also carry an explicit prior — `Uniform` (the default on a
+box), `LogUniform` or `Gaussian` — via `ParamSpec(prior=...)`; see {doc}`priors`.
+
 ## A complete worked problem
 
 `examples/transit_lightcurve.py` fits a 6-parameter transit model to a

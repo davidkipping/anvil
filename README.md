@@ -170,6 +170,16 @@ up until the next `run` call, and `reanchor_every` does not help — it
 refreshes the cache while the compiled proposal keeps the old target. Drive
 such a scheme as a sequence of segments.
 
+## Priors
+
+Each parameter can declare a normalised prior — `Uniform` (the default on a
+box), `LogUniform`, or `Gaussian` (truncated automatically on a bounded
+parameter) — via `ParamSpec(prior=...)`. A flat prior changes nothing in the
+float32 graph, so existing fits are bit-identical; the normalising constants
+live on the host as float64 (`target.log_norm_const`), and
+`transform.prior_transform(cube)` gives the MultiNest/dynesty hypercube
+interface. See the priors guide.
+
 ## Extending a run
 
 Short of effective samples? Extend the same chains rather than start over:

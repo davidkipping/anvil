@@ -75,7 +75,7 @@ posterior.
    contributions on the transit targets: the summation accounts for only
    2–40% of the total, the rest being per-datum model arithmetic and
    parameter representation. Reduction tricks are the smallest lever
-   here; conditioning (rules 1–3) is the large one.
+   here; conditioning (rules 1–3) is the large one. State priors on the same offsets ({doc}`priors`).
 
    `chunk_size` (default 16384) does have a second, non-accuracy role
    worth knowing: the chunk loop unrolls into a single graph, so in

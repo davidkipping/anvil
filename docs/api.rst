@@ -34,6 +34,10 @@ Log densities and transforms
 .. automodule:: anvil.transforms
    :members: ParamSpec, Transform, TransformedLogDensity
 
+.. automodule:: anvil.priors
+   :members: Prior, Uniform, LogUniform, Gaussian, TruncatedGaussian,
+             ImproperFlat
+
 Precision
 ---------
 

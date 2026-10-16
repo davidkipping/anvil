@@ -12,11 +12,14 @@ from .emcee_api import EnsembleSampler, HMCSampler
 from .engine import Results, ResumeState, load_state, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
 from .logdensity import FunctionLogDensity, LogDensity
+from . import priors
+from .priors import (Gaussian, ImproperFlat, LogUniform, Prior,
+                     TruncatedGaussian, Uniform)
 from .precision import (Certificate, PrecisionPolicy, certify,
                         validate_precision)
 from .transforms import ParamSpec, Transform, TransformedLogDensity
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 __all__ = [
     "ChEESHMC",
@@ -27,6 +30,13 @@ __all__ = [
     "FunctionLogDensity",
     "LogDensity",
     "ParamSpec",
+    "Prior",
+    "Uniform",
+    "LogUniform",
+    "Gaussian",
+    "TruncatedGaussian",
+    "ImproperFlat",
+    "priors",
     "Certificate",
     "Diagnostics",
     "PrecisionPolicy",

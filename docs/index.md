@@ -52,6 +52,7 @@ carry a run across process boundaries.
 
 quickstart
 precision
+priors
 samplers
 api
 ```
