@@ -124,8 +124,15 @@ Per start, the result records:
   - `"failed"`: the objective was non-finite at the start.
 - `decrement`: the gain a Newton step still predicted, in nats.
 
-`optima` lists the distinct optima the starts found. The printed summary warns
-when a second optimum lies within 10 nats of the best.
+`optima` lists the distinct optima the starts found. Starts count as one
+optimum when the objective does not dip between them, so starts held at
+different depths on one bound, or spread across one broad peak, are not
+reported as rivals. The printed summary warns when a second optimum lies
+within 10 nats of the best.
+
+The best point is the highest start. `converged` says whether it is
+certified: it converged itself, or a converged start within `tol` below it
+lies on the same peak.
 
 `at_bound` marks parameters whose optimum is on a bound, a common case for a
 maximum-likelihood fit. The point is moved onto the bound, and the

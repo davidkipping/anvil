@@ -337,3 +337,107 @@ def test_elome_lbfgs_does_not_claim_false_convergence():
     short = (lbfgs.values < top - 0.05) & (mixed.values > top - 0.01)
     assert short.sum() > 50
     assert not np.any(lbfgs.status[short] == "converged")
+
+
+# -- 0.9.1: review fixes ----------------------------------------------------
+
+def test_lbfgs_takes_steps_far_shorter_than_its_grid():
+    # posterior sd 1e-4 in a unit box: ~4e-4 in u, 25 times below the
+    # shortest step the line search used to try along the unit gradient,
+    # so before 0.9.1 no L-BFGS start could move at all
+    t = TransformedLogDensity(lambda v: -0.5 * ((v[:, 0] - 0.5) / 1e-4) ** 2,
+                              Transform([ParamSpec("p", 0.0, 1.0)]))
+    u0 = 0.01 * np.random.default_rng(0).standard_normal((16, 1))
+    r = optimize(t, u0, method="lbfgs")
+    assert np.all(r.status == "converged")
+    assert r.model[0] == pytest.approx(0.5, abs=2e-5)
+    # beside a well-scaled parameter the problem is ill-conditioned (1e6),
+    # which is what "mixed" is for
+    specs = [ParamSpec("p", 0.0, 1.0), ParamSpec("q", -5.0, 5.0)]
+    t2 = TransformedLogDensity(
+        lambda v: -0.5 * ((v[:, 0] - 0.5) / 1e-4) ** 2 - 0.5 * (v[:, 1] - 1.0) ** 2,
+        Transform(specs))
+    u0 = np.random.default_rng(0).standard_normal((16, 2)) * [0.01, 1.0]
+    r = optimize(t2, u0)
+    assert np.all(r.status == "converged")
+    assert r.model[0] == pytest.approx(0.5, abs=2e-5)
+    assert r.model[1] == pytest.approx(1.0, abs=0.02)
+
+
+def test_optimum_beside_an_infeasible_edge_still_converges():
+    # the optimum (u = 0, sd 0.01) is 5e-4 from a wall: a central-difference
+    # point 1e-3 out lands past it
+    def lp(u):
+        q = -0.5 * mx.sum((u / 0.01) ** 2, axis=-1)
+        return mx.where(u[:, 0] > 5e-4, -mx.inf, q)
+    t = FunctionLogDensity(lp, 2)
+    u0 = -0.02 + 0.005 * np.random.default_rng(0).standard_normal((16, 2))
+    r = optimize(t, u0, objective="density")
+    assert r.converged
+    assert not np.any(r.status == "failed")
+    np.testing.assert_allclose(r.u, [0.0, 0.0], atol=1e-4)
+    assert r.cov_u is not None
+    np.testing.assert_allclose(np.sqrt(np.diag(r.cov_u)), [0.01, 0.01], rtol=0.05)
+
+
+def test_best_point_is_certified_by_converged_starts_at_its_peak():
+    from anvil.optimize import _Evaluator, _certified
+    t = FunctionLogDensity(lambda u: -0.5 * mx.sum(u * u, axis=-1)
+                           + 3.0 * mx.exp(-0.5 * mx.sum((u - 6.0) ** 2, axis=-1) / 0.01), 2)
+    ev = _Evaluator(t.log_prob, compile_step=False, max_rows=64)
+    no = np.zeros(2, bool)
+    # the highest start stalled 0.008 below the peak at the origin; a
+    # converged one sits 0.009 below that, on the same peak
+    X = np.array([[0.1, 0.06], [0.13, 0.03], [3.0, 3.0]])
+    F = ev.value(X)
+    status = np.array(["stalled", "converged", "converged"], dtype=object)
+    assert F[0] > F[1] > F[0] - 1e-2
+    assert _certified(ev, X, F, status, 0, 1e-2, no, no)
+    # a converged start as high but on another peak certifies nothing
+    X2 = np.array([[0.1, 0.06], [6.0, 6.0]])
+    F2 = ev.value(X2)
+    F2[1] = F2[0] - 1e-3
+    assert not _certified(ev, X2, F2, status[:2], 0, 1e-2, no, no)
+
+
+def test_one_optimum_on_a_bound_is_counted_once():
+    specs = [ParamSpec("p", 0.0, 1.0), ParamSpec("q", 0.0, 1.0)]
+    t = TransformedLogDensity(
+        lambda v: 5.0 * v[:, 0] - 0.5 * ((v[:, 1] - 0.3) / 0.05) ** 2,
+        Transform(specs))
+    r = optimize(t, np.random.default_rng(0).standard_normal((32, 2)), max_iter=300)
+    assert r.at_bound[0]
+    assert len(r.optima) == 1
+    assert r.optima[0]["n_starts"] > 16
+    assert "multimodality" not in str(r)
+
+
+def test_one_broad_optimum_is_counted_once():
+    # sd 3 in u: converged starts sit well over 0.05 apart
+    t = FunctionLogDensity(lambda u: -0.5 * mx.sum((u / 3.0) ** 2, axis=-1), 2)
+    r = optimize(t, 10 * np.random.default_rng(0).standard_normal((64, 2)),
+                 objective="density", method="lbfgs")
+    assert len(r.optima) == 1
+
+
+def test_de_partners_are_distinct():
+    from anvil.optimize import _de_partners
+    rng = np.random.default_rng(0)
+    for n in (4, 5, 64):
+        for _ in range(200):
+            r1, r2 = _de_partners(rng, n)
+            i = np.arange(n)
+            assert np.all((r1 != i) & (r2 != i) & (r1 != r2))
+            assert r1.min() >= 0 and r2.max() < n
+
+
+def test_result_keeps_no_compiled_graph():
+    from anvil.optimize import _Evaluator
+    t, mu, _ = correlated_gaussian(3, rho=0.5, seed=0)
+    r = optimize(t, mu + np.random.default_rng(0).standard_normal((8, 3)),
+                 objective="density")
+    held = [v for v in vars(r).values()
+            if isinstance(getattr(v, "__self__", None), _Evaluator)
+            or isinstance(v, _Evaluator)]
+    assert held == []
+    assert np.array(r.laplace_starts(16)).shape == (16, 3)

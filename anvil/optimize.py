@@ -61,6 +61,12 @@ _METHODS = ("mixed", "lbfgs", "newton", "de")
 #: step scales tried per start by the line search, all in one batched call
 #: (cuRobo's parallel line search) rather than a host sync per trial
 _ALPHAS = np.array([4.0, 2.0, 1.0, 0.5, 0.25, 0.1, 0.03, 0.01])
+#: when no step scale helps, a start's next grid is this much shorter: the
+#: grid's own span, so successive grids tile the scales without gaps. A
+#: direction with no history is the unit gradient, and a posterior far
+#: narrower than 0.01 in u (a tight parameter in a wide box) needs steps the
+#: first grid never tries
+_ALPHA_SHRINK = _ALPHAS[-1] / _ALPHAS[0]
 #: |u| past which a bounded side counts as reached: tanh(7.5) = 1 - 6e-7, so
 #: the parameter is within ~3e-7 of the box width of its bound, and dv/du --
 #: hence the gradient -- has all but vanished
@@ -147,6 +153,26 @@ class _Evaluator:
         return np.where(ok, f, -np.inf), np.where(ok[:, None], g, 0.0), ok
 
 
+class _EagerValue:
+    """The objective, uncompiled, for :meth:`OptimizeResult.laplace_starts`.
+    A result kept around must not hold the search's compiled graphs: they
+    cost memory, and ``mx.compile`` froze the target as it was when traced,
+    so a target changed since would be scored as it was."""
+
+    def __init__(self, f, max_rows: int):
+        self.f = f
+        self.max_rows = int(max_rows)
+
+    def __call__(self, X: np.ndarray) -> np.ndarray:
+        out = []
+        for s in range(0, X.shape[0], self.max_rows):
+            v = self.f(mx.array(X[s:s + self.max_rows].astype(np.float32)))
+            mx.eval(v)
+            out.append(np.array(v, dtype=np.float64))
+        f = np.concatenate(out) if out else np.zeros(0)
+        return np.where(np.isfinite(f), f, -np.inf)
+
+
 # -- objective -------------------------------------------------------------
 
 def _objective(target: LogDensity, objective: str):
@@ -218,8 +244,8 @@ class OptimizeResult:
     are proper), the absolute log density for ``"density"``.
 
     Per start: ``u_all``, ``values``, ``status`` (``"converged"``,
-    ``"saddle"``, ``"stalled"``, ``"max_iter"``, ``"failed"``),
-    ``n_iter``, ``decrement`` (the Newton decrement, in nats, at the end;
+    ``"saddle"``, ``"stalled"``, ``"max_iter"``, ``"failed"`` -- the
+    objective was not finite at the start), ``n_iter``, ``decrement`` (the Newton decrement, in nats, at the end;
     NaN where none was computed).
 
     ``at_bound``: per parameter, whether the best point sits on a bound
@@ -341,24 +367,59 @@ class OptimizeResult:
 
 # -- the optimisers --------------------------------------------------------
 
-def _fd_hessian(ev: _Evaluator, X: np.ndarray, steps: np.ndarray | None = None):
+#: step multipliers tried, in turn, for rows of the FD Hessian with a
+#: non-finite point: an optimum beside an infeasible edge (a grazing
+#: transit's b > 1 + k) puts a 1e-3 step past it
+_FD_RETRY = (1.0, 0.1, 0.01)
+
+
+def _fd_hessian(ev: _Evaluator, X: np.ndarray, steps: np.ndarray | None = None,
+                G: np.ndarray | None = None):
     """Hessian of the objective at each row of X by central differences of
     gradients. ``steps`` (m, d, d): row k of steps[i] is the k-th step
-    vector at X[i] (default ``_FD_STEP`` along each axis). Returns
-    (H (m, d, d) symmetric, ok (m,))."""
+    vector at X[i] (default ``_FD_STEP`` along each axis). Rows with a
+    non-finite point are retried with shorter steps; given the gradients
+    ``G`` at X, a step whose one side stays non-finite falls back to a
+    one-sided difference. Returns (H (m, d, d) symmetric, ok (m,))."""
     m, d = X.shape
     if steps is None:
         steps = np.broadcast_to(_FD_STEP * np.eye(d), (m, d, d))
-    P = np.concatenate([X[:, None, :] + steps, X[:, None, :] - steps], axis=1)
-    _, g, ok = ev.value_and_grad(P.reshape(m * 2 * d, d))
-    g = g.reshape(m, 2, d, d)
-    ok = ok.reshape(m, 2 * d).all(axis=1)
-    # (g(x + b_k) - g(x - b_k)) / 2 = H b_k, so these rows stack B^T H
-    HB = (g[:, 0] - g[:, 1]) / 2.0
-    H = np.linalg.solve(steps, HB)
-    H = 0.5 * (H + np.swapaxes(H, 1, 2))
-    ok &= np.isfinite(H).all(axis=(1, 2))
-    return np.where(ok[:, None, None], H, 0.0), ok
+    H = np.zeros((m, d, d))
+    ok = np.zeros(m, bool)
+    todo = np.arange(m)
+    for mult in _FD_RETRY:
+        B = mult * steps[todo]
+        # the points as the float32 graph sees them, and the steps actually
+        # taken, so the solve divides by what was evaluated
+        Xp = _f32(X[todo, None, :] + B)
+        Xm = _f32(X[todo, None, :] - B)
+        k = todo.size
+        _, g, gok = ev.value_and_grad(np.concatenate([Xp, Xm], axis=1).reshape(k * 2 * d, d))
+        g = g.reshape(k, 2, d, d)
+        gok = gok.reshape(k, 2, d)
+        Bp, Bm = Xp - X[todo, None, :], X[todo, None, :] - Xm
+        both = gok[:, 0] & gok[:, 1]
+        # (g(x + b+) - g(x - b-)) = H (b+ + b-): rows of B^T H, per step
+        HB = np.where(both[..., None], g[:, 0] - g[:, 1], 0.0)
+        BB = np.where(both[..., None], Bp + Bm, 0.0)
+        if G is not None:
+            Gt = G[todo, None, :]
+            plus, minus = gok[:, 0] & ~gok[:, 1], gok[:, 1] & ~gok[:, 0]
+            HB = np.where(plus[..., None], g[:, 0] - Gt, HB)
+            BB = np.where(plus[..., None], Bp, BB)
+            HB = np.where(minus[..., None], Gt - g[:, 1], HB)
+            BB = np.where(minus[..., None], Bm, BB)
+        have = (BB != 0).any(axis=2).all(axis=1)
+        with np.errstate(all="ignore"):
+            Ht = np.linalg.solve(np.where(have[:, None, None], BB, np.eye(d)), HB)
+        Ht = 0.5 * (Ht + np.swapaxes(Ht, 1, 2))
+        good = have & np.isfinite(Ht).all(axis=(1, 2))
+        H[todo[good]] = Ht[good]
+        ok[todo[good]] = True
+        todo = todo[~good]
+        if todo.size == 0:
+            break
+    return H, ok
 
 
 def _newton_direction(H, g, frozen):
@@ -491,6 +552,7 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
     newton_since = np.zeros(n, int)
     newton_F0 = F.copy()
     last_negdef = np.ones(n, bool)
+    step_scale = np.ones(n)
     mem = _LBFGS(n, d)
     tol_f32 = 4.0 * np.finfo(np.float32).eps
 
@@ -535,7 +597,7 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
         nw = (phase[idx] == 1) & ~done_now
         if nw.any():
             j = np.flatnonzero(nw)
-            H, hok = _fd_hessian(ev, Xa[j])
+            H, hok = _fd_hessian(ev, Xa[j], G=Ga[j])
             p, dec, negdef, w, V = _newton_direction(H, Ga[j], frz[j])
             decrement[idx[j]] = np.where(hok, dec, np.nan)
             last_negdef[idx[j]] = negdef
@@ -561,7 +623,9 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
             # stopped without climbing where the curvature says it could:
             # stationary or flat, but not a maximum
             status[idx[j][stalled]] = np.where(negdef[stalled], "stalled", "saddle")
-            status[idx[j][~hok]] = "failed"
+            # no Hessian even with shorter and one-sided steps: the start's
+            # value is finite, so it stops uncertified rather than failed
+            status[idx[j][~hok]] = "stalled"
             done_now[j[conv | stalled | ~hok]] = True
             # a converged start still takes the Newton step it has just
             # computed: with quadratic convergence that one step lands it far
@@ -577,7 +641,8 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
 
         # -- parallel line search: every step scale in one call
         K = _ALPHAS.size
-        cand = _f32(_clamp((Xg[:, None, :] + _ALPHAS[None, :, None] * Pg[:, None, :])
+        alphas = step_scale[gi][:, None] * _ALPHAS[None, :]
+        cand = _f32(_clamp((Xg[:, None, :] + alphas[:, :, None] * Pg[:, None, :])
                            .reshape(-1, d), lo_side, hi_side))
         Fc = ev.value(cand).reshape(-1, K)
         k = np.argmax(Fc, axis=1)
@@ -589,6 +654,10 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
         # direction is the gradient rather than the same failed one
         rej = gi[~accept]
         mem.reset(rej[phase[rej] == 0])
+        # and look shorter next time, or a rejected start repeats the same
+        # grid until its patience runs out
+        step_scale[rej] *= _ALPHA_SHRINK
+        step_scale[gi[accept]] = 1.0
 
         a_idx = np.flatnonzero(accept)
         if a_idx.size:
@@ -613,13 +682,28 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
         # so a start it calls converged must pass one Newton decrement
         c = np.flatnonzero(status == "converged")
         if c.size:
-            H, hok = _fd_hessian(ev, X[c])
+            H, hok = _fd_hessian(ev, X[c], G=G[c])
             _, dec, negdef, _, _ = _newton_direction(
                 H, G[c], _frozen(X[c], G[c], lo_side, hi_side))
             decrement[c] = np.where(hok, dec, np.nan)
             status[c[~(hok & (dec < tol) & negdef)]] = "stalled"
 
     return X, F, status, n_iter, decrement
+
+
+def _de_partners(rng, n):
+    """Two partners per member for rand/1: distinct from the member and from
+    each other. Drawn independently, r1 == r2 makes the difference vector
+    zero and the move a pure pull toward the best (a third of the time at
+    n = 4)."""
+    i = np.arange(n)
+    r1 = rng.integers(0, n - 1, size=n)
+    r1 += r1 >= i
+    r2 = rng.integers(0, n - 2, size=n)
+    lo, hi = np.minimum(i, r1), np.maximum(i, r1)
+    r2 += r2 >= lo
+    r2 += r2 >= hi
+    return r1, r2
 
 
 def _de_search(ev, X, rng, *, max_iter, tol, lo_side, hi_side, report):
@@ -636,10 +720,7 @@ def _de_search(ev, X, rng, *, max_iter, tol, lo_side, hi_side, report):
     for it in range(max_iter):
         b = int(np.argmax(F))
         fw = rng.uniform(0.5, 1.0, size=(n, 1))
-        r1 = rng.integers(0, n - 1, size=n)
-        r1 += r1 >= np.arange(n)
-        r2 = rng.integers(0, n - 1, size=n)
-        r2 += r2 >= np.arange(n)
+        r1, r2 = _de_partners(rng, n)
         V = X + fw * (X[b] - X) + fw * (X[r1] - X[r2])
         cross = rng.uniform(size=(n, d)) < cr
         cross[np.arange(n), rng.integers(0, d, size=n)] = True
@@ -659,7 +740,19 @@ def _de_search(ev, X, rng, *, max_iter, tol, lo_side, hi_side, report):
 
 # -- the entry point -------------------------------------------------------
 
-def _distinct_optima(U, F, max_optima=10):
+#: candidate optima merged by the midpoint test (pairs are one batched call)
+_MAX_CANDIDATES = 64
+
+
+def _distinct_optima(ev, U, F, lo_side, hi_side, max_optima=10):
+    """Distinct optima among the starts, best first.
+
+    Starts within 0.05 in u and 0.1 nats are one optimum. That alone splits
+    one optimum whose starts stop far apart in u -- on a bound, where any
+    |u| from 15 to the clamp is the bound, or on a broad peak -- so
+    candidates of nearly equal value are then merged when the objective does
+    not dip between them: a single peak has no valley at the midpoint, and
+    two separate ones do."""
     order = np.argsort(-F)
     reps: list[dict] = []
     for i in order:
@@ -671,7 +764,52 @@ def _distinct_optima(U, F, max_optima=10):
                 break
         else:
             reps.append({"value": float(F[i]), "u": U[i].copy(), "n_starts": 1})
+    reps = reps[:_MAX_CANDIDATES]
+    pairs = [(a, b) for a in range(len(reps)) for b in range(a + 1, len(reps))
+             if abs(reps[a]["value"] - reps[b]["value"]) < 0.1]
+    if pairs:
+        mid = np.array([0.5 * (reps[a]["u"] + reps[b]["u"]) for a, b in pairs])
+        fm = ev.value(_f32(_clamp(mid, lo_side, hi_side)))
+        parent = list(range(len(reps)))
+
+        def root(a):
+            while parent[a] != a:
+                a = parent[a]
+            return a
+        for (a, b), f in zip(pairs, fm):
+            if f >= min(reps[a]["value"], reps[b]["value"]) - 0.1:
+                ra, rb = root(a), root(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)   # keep the better one
+        merged: dict[int, dict] = {}
+        for a, r in enumerate(reps):
+            ra = root(a)
+            if ra in merged:
+                merged[ra]["n_starts"] += r["n_starts"]
+            else:
+                merged[ra] = dict(r)
+        reps = [merged[k] for k in sorted(merged)]
     return reps[:max_optima]
+
+
+def _certified(ev, X, F, status, b, tol, lo_side, hi_side):
+    """Whether the best start ``b`` sits on a certified maximum: it converged
+    itself, or a converged start within ``tol`` below it lies on the same
+    peak -- the objective does not dip between them. A start counts as
+    converged once under ``tol`` nats remain, so the highest start is often
+    a stalled one a little above a hundred converged ones at the same
+    optimum; picking a converged one instead would hand back a lower point
+    (0.008 nats lower on one of turin's fits), and reporting "NOT converged"
+    would be wrong."""
+    if status[b] == "converged":
+        return True
+    c = np.flatnonzero((status == "converged") & np.isfinite(F) & (F >= F[b] - tol))
+    if c.size == 0:
+        return False
+    c = c[np.argsort(-F[c])][:_RESCORE]
+    mid = _f32(_clamp(0.5 * (X[c] + X[b]), lo_side, hi_side))
+    fm = ev.value(mid)
+    return bool(np.any(fm >= np.minimum(F[c], F[b]) - tol))
 
 
 def _settle_bounds(ev, u, lo_side, hi_side):
@@ -718,7 +856,9 @@ def _laplace(ev, u, at_bound):
     eigenvectors at 0.3 sd (capped at 0.5 in u), as SquishierPlanet and
     turin do. Returns (H, cov) or (None, None) if not negative definite."""
     d = u.size
-    H, ok = _fd_hessian(ev, u[None])
+    _, g0, gok = ev.value_and_grad(u[None])
+    G = g0 if gok[0] else None
+    H, ok = _fd_hessian(ev, u[None], G=G)
     if not ok[0]:
         return None, None
     H = H[0]
@@ -730,7 +870,7 @@ def _laplace(ev, u, at_bound):
     sd = np.minimum(1.0 / np.sqrt(w), 0.5 / 0.3)
     B = _FD_STEP * np.eye(d)
     B[np.ix_(free, free)] = (V * (0.3 * sd)).T     # rows: step vectors
-    H2, ok2 = _fd_hessian(ev, u[None], B[None])
+    H2, ok2 = _fd_hessian(ev, u[None], B[None], G=G)
     if ok2[0]:
         A2 = -H2[0][np.ix_(free, free)]
         if (np.linalg.eigvalsh(A2) > 0).all():
@@ -849,6 +989,7 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
     if not np.isfinite(F).any():
         raise RuntimeError("every start failed: the objective is not finite "
                            "at any of them, or at any point they reached")
+    status = np.asarray(status, dtype=object)
     b = int(np.argmax(F))
     value = float(F[b])
     if f_hi is not None:
@@ -869,6 +1010,7 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
             value = float(F[b]) if f_hi is None else float(np.array(
                 f_hi(mx.array(u[None].astype(np.float32))), dtype=np.float64)[0])
     at_bound = _on_bound(u[None], lo_side, hi_side)[0]
+    converged = _certified(ev, X, F, status, b, tol, lo_side, hi_side)
 
     H = cov_u = cov_model = sd = None
     if hessian and target.supports_grad:
@@ -890,13 +1032,12 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
             sd = np.sqrt(np.diag(cov_u))
         names = [f"x{i}" for i in range(d)]
 
-    status = np.asarray(status, dtype=object)
     return OptimizeResult(
         objective=objective, method=method, names=names, u=u, model=model,
         physical=physical, value=value, log_value=value + offset,
-        converged=bool(status[b] == "converged"), status=status, u_all=X,
+        converged=converged, status=status, u_all=X,
         values=F, n_iter=n_iter, decrement=decrement, at_bound=at_bound,
         hessian_u=H, cov_u=cov_u, cov_model=cov_model, sd=sd,
-        optima=_distinct_optima(X, F), n_value_rows=ev.n_value_rows,
+        optima=_distinct_optima(ev, X, F, lo_side, hi_side), n_value_rows=ev.n_value_rows,
         n_grad_rows=ev.n_grad_rows, wall_time=time.perf_counter() - t0,
-        _value_fn=ev.value, _lo_side=lo_side, _hi_side=hi_side)
+        _value_fn=_EagerValue(f, max_rows), _lo_side=lo_side, _hi_side=hi_side)
