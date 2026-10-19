@@ -19,6 +19,13 @@ Optimization
 .. automodule:: anvil.optimize
    :members: optimize, OptimizeResult
 
+Evidence (optional)
+-------------------
+
+.. automodule:: anvil.evidence
+   :members: smc, SMCResult, bridge_evidence, laplace_evidence,
+             EvidenceResult, TemperedLogDensity
+
 Kernels
 -------
 

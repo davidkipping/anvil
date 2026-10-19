@@ -203,6 +203,26 @@ stops short of the optimum; the default `"mixed"` method reaches it from
 which float32 resolves where differences of the log-likelihood cannot. See
 the optimization guide.
 
+## Evidence (optional)
+
+```python
+res = anvil.smc(target)                 # ln Z, and posterior draws
+lnB = anvil.smc(round_planet).log_z - anvil.smc(oblate_planet).log_z
+```
+
+A separate call for comparing models; sampling never computes it. Tempered
+sequential Monte Carlo carries prior draws to the posterior through
+L^beta, with stretch and differential-evolution moves in one batched call
+per sweep, and multiplies up the evidence on the way. Mode masses come
+from the weights, not from chains crossing between modes, so it holds
+where MCMC cannot certify them. On a spherical transit fit it matched the
+reference to 0.02 nats in 77 s. On a narrow, curved posterior its moves
+stop being accepted late in the run and ln Z comes out a few tenths of a
+nat low (0.2-0.3 on an oblate-planet fit), whatever the population size;
+`smc` flags those stages and warns. `anvil.bridge_evidence` (seconds, from
+draws you already have) and `anvil.laplace_evidence` (a floor) are the
+cheap checks. See the evidence guide for the measurements.
+
 ## Extending a run
 
 Short of effective samples? Extend the same chains rather than start over:

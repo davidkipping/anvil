@@ -29,6 +29,9 @@ M2 Max.
   the density's mode, from many starts at once (L-BFGS then damped Newton,
   or differential evolution without gradients). The best fit, its Laplace
   covariance, and starts for the samplers.
+- **Evidence (optional)** — {func}`~anvil.smc`: ln Z by tempered sequential
+  Monte Carlo, for comparing models. A separate call; sampling never
+  computes it.
 
 ## Answering the questions a run raises
 
@@ -39,6 +42,7 @@ this project out at least once:
 | call | question |
 |---|---|
 | {func}`~anvil.optimize` | what is the best fit, and is there more than one? |
+| {func}`~anvil.smc` (optional) | which model does the data prefer? |
 | {func}`~anvil.diagnostics.diagnose` | did it converge, and how many effective samples? |
 | {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed — or are some chains lost? |
 | {func}`~anvil.diagnostics.whitened_shape` | correlated, or curved? (predicts whether `dense=True` pays) |
@@ -60,5 +64,6 @@ precision
 priors
 samplers
 optimize
+evidence
 api
 ```
