@@ -79,3 +79,14 @@ def test_flat_model_density_samples_uniform_within_bounds():
     width = hi - lo
     assert abs(mean - (lo + hi) / 2) < 0.05 * width
     assert abs(var - width**2 / 12) / (width**2 / 12) < 0.1
+
+
+def test_jacobian_np_matches_finite_differences_and_log_det():
+    t = Transform([ParamSpec("a", -2.0, 3.0), ParamSpec("b", lo=1.0),
+                   ParamSpec("c", hi=-1.0, scale=2.0), ParamSpec("d", loc=0.5, scale=3.0)])
+    u = 3.0 * np.random.default_rng(0).normal(size=(5, 4))
+    h, E = 1e-6, np.eye(4)
+    fd = np.stack([(t.model_np(u + h * E[k]) - t.model_np(u - h * E[k]))[:, k] / (2 * h)
+                   for k in range(4)], axis=1)
+    np.testing.assert_allclose(t.jacobian_np(u), fd, rtol=1e-6)
+    np.testing.assert_allclose(np.log(t.jacobian_np(u)).sum(-1), t.log_det_jac_np(u))

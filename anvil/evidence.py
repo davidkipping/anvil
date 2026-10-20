@@ -48,6 +48,7 @@ import mlx.core as mx
 import numpy as np
 
 from .compile import CompiledOrEager
+from .kernels.ensemble import DEMove, StretchMove
 from .logdensity import LogDensity
 from .rng import KeyStream
 from .transforms import TransformedLogDensity
@@ -56,13 +57,17 @@ from .transforms import TransformedLogDensity
 _STRETCH_A = 2.0
 #: sd of the groups' ln Z above which smc warns that groups are too small
 _GROUP_SPREAD_WARN = 0.5
-#: a stage that used all of max_moves, still ends with a coordinate
-#: correlated above _STALL_RHO with the stage's start, and accepted fewer
-#: than _STALL_ACCEPT of its moves has stalled. Both: a coordinate that
+#: a stage that ends with a coordinate still correlated above _STALL_RHO
+#: with the stage's start, having accepted fewer than _STALL_ACCEPT of its
+#: moves, has stalled -- however it ended: at max_moves, on the plateau
+#: test, or on the acceptance count. Both conditions: a coordinate that
 #: tells modes apart stays correlated however well particles move within
 #: their modes, which the acceptance rate tells apart
 _STALL_RHO = 0.9
 _STALL_ACCEPT = 0.05
+#: log L at or below this is a failed evaluation, as for the samplers
+#: (``kernels.chees``, ``diagnostics.lost_chains``): weight 0 at any beta
+_FAILURE_FLOOR = -1e29
 #: proposal-side ESS, as a fraction of the proposal draws, below which
 #: bridge sampling warns
 _BRIDGE_MIN_ESS = 0.01
@@ -81,11 +86,15 @@ def _require_proper(target) -> None:
             f"a finite box or an explicit prior")
 
 
-def _logmeanexp(a: np.ndarray) -> float:
+def _logsumexp(a: np.ndarray) -> float:
     m = np.max(a)
     if not np.isfinite(m):
         return -math.inf
-    return float(m + math.log(np.mean(np.exp(a - m))))
+    return float(m + math.log(np.sum(np.exp(a - m))))
+
+
+def _logmeanexp(a: np.ndarray) -> float:
+    return _logsumexp(a) - math.log(np.size(a))
 
 
 # -- tempering ---------------------------------------------------------------
@@ -112,14 +121,17 @@ class TemperedLogDensity(LogDensity):
 
 
 def _split(target: TransformedLogDensity, u: mx.array):
-    """(log L, log prior + log|dv/du|) from a single map to model space."""
+    """(log L, log prior + log|dv/du|) from a single map to model space.
+    A failed evaluation -- non-finite, or a sentinel at or below
+    ``_FAILURE_FLOOR`` -- is -inf: a finite sentinel times a tiny beta
+    would otherwise weigh as much as a real likelihood."""
     tr = target.transform
     v = tr.to_model(u)
     ll = target._fn(v)
     rest = tr.log_det_jac(u)
     if tr.has_prior_terms:
         rest = rest + tr.log_prior(v)
-    return mx.where(mx.isfinite(ll), ll, -mx.inf), rest
+    return mx.where(mx.isfinite(ll) & (ll > _FAILURE_FLOOR), ll, -mx.inf), rest
 
 
 # -- SMC ---------------------------------------------------------------------
@@ -134,9 +146,13 @@ class SMCResult:
     itself uncertain: err/se follows a t distribution with n_groups - 1
     degrees of freedom. With one population (the default) it is NaN.
 
-    ``stalled`` counts the stages that ran to ``max_moves`` with some
-    coordinate still correlated above 0.9 with the stage's start and fewer
-    than 5% of moves accepted: particles that stopped exploring, which
+    ``ancestors`` gives, per particle, the index of the particle it was
+    resampled from at the last stage: copies of one ancestor are not
+    independent draws, which :func:`bridge_evidence` takes into account.
+
+    ``stalled`` counts the stages that ended with some coordinate still
+    correlated above 0.9 with the stage's start and fewer than 5% of moves
+    accepted: particles that stopped exploring, which
     biases ln Z low.
 
     ``u`` holds the final particles in sampling space, equal-weight
@@ -165,6 +181,7 @@ class SMCResult:
     wall_time: float
     precision: dict | None = None
     stalled: int = 0
+    ancestors: np.ndarray | None = None
 
     @property
     def n_stages(self) -> int:
@@ -192,8 +209,9 @@ class SMCResult:
 
 
 class _Sweep:
-    """Red-black stretch-move sweeps for G independent groups of 2K
-    particles. A walker's partner comes from the other half of its own
+    """Red-black sweeps of stretch or DE moves (the ensemble sampler's
+    :class:`StretchMove` and :class:`DEMove`) for G independent groups of
+    2K particles. A walker's partner comes from the other half of its own
     group, never another group's, so the groups stay independent. Proposals
     are evaluated in blocks of at most ``max_rows`` rows, each its own GPU
     command: one command over thousands of expensive light curves ran long
@@ -201,7 +219,9 @@ class _Sweep:
     argument throughout, so nothing is retraced as it changes."""
 
     def __init__(self, target, G, K, d, a, max_rows, compile_step):
-        self.G, self.K, self.d, self.a = G, K, d, a
+        self.G, self.K, self.d = G, K, d
+        # the ensemble sampler's own proposals, applied group by group
+        self.stretch, self.de = StretchMove(a), DEMove()
         self.evaluate = CompiledOrEager(lambda u: _split(target, u),
                                         name="the SMC likelihood",
                                         enabled=compile_step)
@@ -223,27 +243,17 @@ class _Sweep:
             rs.append(r[:m])
         return mx.concatenate(lls), mx.concatenate(rs)
 
-    def _half(self, keys, S, LLs, Rs, C, beta, de):
-        G, K, d, a = self.G, self.K, self.d, self.a
-        j = mx.random.randint(0, K, shape=(G, K), key=keys[0])
-        Cp = mx.take_along_axis(C, j[..., None], axis=1)
-        if de:
-            # differential evolution, as DEMove: s + gamma (c1 - c2) + eps,
-            # gamma = 1 one time in ten to jump between modes; symmetric
-            j2 = (j + 1 + mx.random.randint(0, K - 1, shape=(G, K), key=keys[1])) % K
-            C2 = mx.take_along_axis(C, j2[..., None], axis=1)
-            gamma = mx.where(mx.random.uniform(shape=(G, K, 1), key=keys[3]) < 0.1,
-                             1.0, 2.38 / math.sqrt(2 * d))
-            Y = S + gamma * (Cp - C2) + 1e-5 * mx.random.normal(S.shape, key=keys[4])
-            log_q = 0.0
-        else:
-            z = ((a - 1.0) * mx.random.uniform(shape=(G, K), key=keys[1]) + 1.0) ** 2 / a
-            Y = Cp + z[..., None] * (S - Cp)
-            log_q = (d - 1) * mx.log(z)
+    def _half(self, key, S, LLs, Rs, C, beta, de):
+        G, K, d = self.G, self.K, self.d
+        move = self.de if de else self.stretch
+        ks = mx.random.split(key, G + 1)
+        props = [move.propose(ks[g], S[g], C[g]) for g in range(G)]
+        Y = mx.stack([p[0] for p in props])
+        log_q = mx.stack([p[1] for p in props])
         ll_y, r_y = self.values(Y.reshape(G * K, d))
         ll_y, r_y = ll_y.reshape(G, K), r_y.reshape(G, K)
         log_ratio = log_q + beta * ll_y + r_y - (beta * LLs + Rs)
-        ok = ((mx.log(mx.random.uniform(shape=(G, K), key=keys[2])) < log_ratio)
+        ok = ((mx.log(mx.random.uniform(shape=(G, K), key=ks[G])) < log_ratio)
               & mx.all(mx.isfinite(Y), axis=-1) & mx.isfinite(ll_y))
         out = (mx.where(ok[..., None], Y, S), mx.where(ok, ll_y, LLs),
                mx.where(ok, r_y, Rs), ok)
@@ -252,22 +262,25 @@ class _Sweep:
 
     def __call__(self, key, U, LL, R, beta, de=False):
         K = self.K
-        k = mx.random.split(key, 10)
-        A, LA, RA, okA = self._half(k[0:5], U[:, :K], LL[:, :K], R[:, :K], U[:, K:], beta, de)
-        B, LB, RB, okB = self._half(k[5:10], U[:, K:], LL[:, K:], R[:, K:], A, beta, de)
+        k = mx.random.split(key, 2)
+        A, LA, RA, okA = self._half(k[0], U[:, :K], LL[:, :K], R[:, :K], U[:, K:], beta, de)
+        B, LB, RB, okB = self._half(k[1], U[:, K:], LL[:, K:], R[:, K:], A, beta, de)
         acc = (mx.sum(okA, axis=1) + mx.sum(okB, axis=1)) / (2.0 * K)
         return (mx.concatenate([A, B], axis=1), mx.concatenate([LA, LB], axis=1),
                 mx.concatenate([RA, RB], axis=1), acc)
 
 
 def _next_beta(ll: np.ndarray, beta: float, ess: float) -> float:
-    """The largest increment whose weights L^dbeta keep an ESS of ess*n."""
+    """The largest increment whose weights L^dbeta keep an ESS of ``ess``
+    of the particles with a finite likelihood. Failed particles get weight
+    0 at any increment, so they cannot count against it: the first step
+    drops them however many there are."""
     fin = np.isfinite(ll)
+    llf = ll[fin]
 
     def frac(db):
-        lw = np.where(fin, db * ll, -np.inf)
-        m = lw.max()
-        w = np.exp(lw - m)
+        lw = db * llf
+        w = np.exp(lw - lw.max())
         return w.sum() ** 2 / (w * w).sum() / w.size
 
     hi = 1.0 - beta
@@ -280,7 +293,13 @@ def _next_beta(ll: np.ndarray, beta: float, ess: float) -> float:
             lo = mid
         else:
             hi = mid
-    return max(lo, 1e-300)
+    if lo == 0.0:
+        raise RuntimeError(
+            f"cannot raise beta from {beta:.3g}: log L spans "
+            f"{np.ptp(llf):.3g} among the particles, more than any step "
+            f"down to {2.0 ** -60 * (1 - beta):.1e} keeps an ESS of {ess}; "
+            f"a failed evaluation reported as a large finite value?")
+    return lo
 
 
 def _settled(hist: list[np.ndarray], target: float) -> bool:
@@ -334,8 +353,8 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     posterior they have not reached is under-counted. More particles do not
     fix it: on an oblate transit fit with no oblateness in the data, 8,192
     particles came out 0.21 nats low and 4,096 0.17 low. What does show it
-    is the stage that runs to ``max_moves`` with the particles still
-    correlated with where it began; ``smc`` counts those
+    is the stage that ends with the particles still correlated with where
+    it began and few moves accepted; ``smc`` counts those
     (``SMCResult.stalled``) and warns when there are any. A run without the
     warning is no proof of accuracy, but a run with it should not be trusted
     to better than a few tenths of a nat.
@@ -380,6 +399,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
 
     beta = np.zeros(G)
     log_z = np.zeros(G)
+    anc = np.arange(n_particles).reshape(G, n_g)
     betas, moves, accepts, decorr = [], [], [], []
     stalled = 0
     n_evals = n_particles
@@ -400,6 +420,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
             # share of every mode and a walker's partners come from its own
             idx = rng.permutation(_systematic(logw, rng))
             U[g], LL[g], R[g] = U[g][idx], LL[g][idx], R[g][idx]
+            anc[g] = g * n_g + idx
         betas.append(beta.copy())
 
         Ud, LLd, Rd = mx.array(U), mx.array(LL.astype(np.float32)), mx.array(R.astype(np.float32))
@@ -433,7 +454,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         LL = np.array(LLd, dtype=np.float64)
         R = np.array(Rd, dtype=np.float64)
         acc_prev = float(np.array(acc_sum).mean()) / M
-        if M >= max_moves and decorr[-1] > _STALL_RHO and acc_prev < _STALL_ACCEPT:
+        if decorr[-1] > _STALL_RHO and acc_prev < _STALL_ACCEPT:
             stalled += 1
         moves.append(M)
         accepts.append(acc_prev)
@@ -486,7 +507,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         physical=tr.to_physical(model), log_likelihood=LL, betas=betas,
         moves=moves, accept=accepts, decorrelation=decorr, n_evals=n_evals,
         wall_time=time.perf_counter() - t0, precision=precision,
-        stalled=stalled)
+        stalled=stalled, ancestors=anc.reshape(-1))
 
 
 # -- the cheap tier ------------------------------------------------------------
@@ -512,16 +533,18 @@ class EvidenceResult:
 
 
 def _draws_of(draws):
-    """Independent draws (n, d), or chains (n_draws, n_chains, d). Accepts
-    either array, a :class:`Results`, or an :class:`SMCResult`."""
+    """(draws, families): independent draws (n, d) or chains
+    (n_draws, n_chains, d), and for an :class:`SMCResult` each particle's
+    ancestor at the last resampling (else None). Accepts either array, a
+    :class:`Results`, or an :class:`SMCResult`."""
     if isinstance(draws, SMCResult):
-        return np.asarray(draws.u, dtype=np.float64)
+        return np.asarray(draws.u, dtype=np.float64), draws.ancestors
     if hasattr(draws, "get_chain"):
         draws = draws.get_chain()
     a = np.asarray(draws, dtype=np.float64)
     if a.ndim not in (2, 3):
         raise ValueError(f"draws must be (n, dim) or (n_draws, n_chains, dim); got {a.shape}")
-    return a
+    return a, None
 
 
 def _mvt(mu, L, nu):
@@ -530,8 +553,10 @@ def _mvt(mu, L, nu):
     c = (math.lgamma((nu + d) / 2) - math.lgamma(nu / 2)
          - 0.5 * d * math.log(nu * math.pi) - 0.5 * logdet)
 
+    Linv_T = np.linalg.inv(L).T          # d x d, once: a matmul per call
+
     def logpdf(x):
-        z = np.linalg.solve(L, (x - mu).T).T
+        z = (x - mu) @ Linv_T
         return c - 0.5 * (nu + d) * np.log1p(np.einsum("ij,ij->i", z, z) / nu)
 
     def sample(n, rng):
@@ -547,9 +572,11 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     """ln Z by Meng and Wong's optimal bridge sampling.
 
     ``draws`` are posterior draws in u: an array ``(n, dim)`` of independent
-    draws (an :class:`SMCResult` qualifies), or ``(n_draws, n_chains, dim)``
-    or a :class:`~anvil.Results`, whose autocorrelation the standard error
-    then accounts for. A Student-t proposal (``nu`` degrees of freedom) is
+    draws, an :class:`SMCResult`, or ``(n_draws, n_chains, dim)`` or a
+    :class:`~anvil.Results`, whose autocorrelation the standard error then
+    accounts for. SMC particles that share an ancestor are kept together
+    (all in the fitted half or all in the bridged half) and counted as one
+    cluster in the standard error. A Student-t proposal (``nu`` degrees of freedom) is
     fitted to a random half; the bridge uses the other half and
     ``n_proposal`` proposal draws (default: as many). One batched
     evaluation of the target; the iteration runs on the host.
@@ -566,8 +593,9 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
 
     _require_proper(target)
     t0 = time.perf_counter()
-    a = _draws_of(draws)
+    a, families = _draws_of(draws)
     rng = np.random.default_rng(seed)
+    fam_use = None
     if a.ndim == 3:
         # chains: fit on every other chain, bridge on the rest, so each
         # bridged chain keeps the time order its autocorrelation needs
@@ -577,6 +605,14 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
         use_chains = a[:, 1::2]
         layout = use_chains.shape[:2]
         use = use_chains.reshape(-1, a.shape[-1])
+    elif families is not None:
+        # whole families to one side, so the proposal is not fitted to the
+        # ancestors it is then tested against
+        ids = np.unique(families)
+        to_fit = np.isin(families, rng.permutation(ids)[: ids.size // 2])
+        fit, use = a[to_fit], a[~to_fit]
+        fam_use = families[~to_fit]
+        layout = None
     else:
         perm = rng.permutation(a.shape[0])
         fit, use = a[perm[: a.shape[0] // 2]], a[perm[a.shape[0] // 2:]]
@@ -596,14 +632,10 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     s1, s2 = n1 / (n1 + n2), n2 / (n1 + n2)
     ls1, ls2 = math.log(s1), math.log(s2)
 
-    def lse(a):
-        m = a.max()
-        return m + math.log(np.exp(a - m).sum())
-
     lr = float(np.median(l1[np.isfinite(l1)]))
     for _ in range(10_000):
-        num = lse(l2 - np.logaddexp(ls1 + l2, ls2 + lr)) - math.log(n2)
-        den = lse(-np.logaddexp(ls1 + l1, ls2 + lr)) - math.log(n1)
+        num = _logsumexp(l2 - np.logaddexp(ls1 + l2, ls2 + lr)) - math.log(n2)
+        den = _logsumexp(-np.logaddexp(ls1 + l1, ls2 + lr)) - math.log(n1)
         new = num - den
         done = abs(new - lr) < 1e-12
         lr = new
@@ -620,7 +652,7 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     def rel_var(lf):
         # var(f) / mean(f)^2 = mean(f^2) / mean(f)^2 - 1
         k = lf.size
-        return max(math.exp(lse(2 * lf) - math.log(k) - 2 * (lse(lf) - math.log(k))) - 1.0, 0.0)
+        return max(math.exp(_logsumexp(2 * lf) - math.log(k) - 2 * (_logsumexp(lf) - math.log(k))) - 1.0, 0.0)
 
     tau = 1.0
     if layout is not None:
@@ -628,6 +660,16 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
         ess = float(_ess_batched(series[..., None])[0])
         if np.isfinite(ess):
             tau = max(1.0, series.size / max(ess, 1.0))
+    elif fam_use is not None:
+        # cluster-robust variance of the mean over families, against the
+        # independent-draws one: the design effect of shared ancestry
+        f = np.exp(lf2 - lf2.max())
+        dev = f - f.mean()
+        _, inv = np.unique(fam_use, return_inverse=True)
+        clustered = float((np.bincount(inv, weights=dev) ** 2).sum())
+        iid = float((dev * dev).sum())
+        if iid > 0:
+            tau = max(1.0, clustered / iid)
     re2 = rel_var(lf1) / n2 + tau * rel_var(lf2) / n1
     w = np.exp(l2 - l2.max())
     prop_ess = float(w.sum() ** 2 / (w * w).sum())

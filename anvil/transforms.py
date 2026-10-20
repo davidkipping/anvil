@@ -263,8 +263,17 @@ class Transform:
                        - scale * np.exp(-u), out)
         return out
 
+    def jacobian_np(self, u: np.ndarray) -> np.ndarray:
+        """Host-side fp64 d(model)/du, column by column (the transform is
+        elementwise, so this is the Jacobian's diagonal), same shape as u."""
+        return np.exp(self._log_jac_np(u))
+
     def log_det_jac_np(self, u: np.ndarray) -> np.ndarray:
         """Host-side fp64 replica of ``log_det_jac`` (precision harness)."""
+        return self._log_jac_np(u).sum(axis=-1)
+
+    def _log_jac_np(self, u: np.ndarray) -> np.ndarray:
+        """log |d(model)/du| per column, fp64."""
         u = np.asarray(u, dtype=np.float64)
         lo = np.array([s.lo for s in self.specs])
         hi = np.array([s.hi for s in self.specs])
@@ -277,7 +286,7 @@ class Transform:
                       np.log(scale))
         lj = np.where(self._lower, np.log(scale) + u, lj)
         lj = np.where(self._upper, np.log(scale) - u, lj)
-        return lj.sum(axis=-1)
+        return lj
 
     def from_model_np(self, v: np.ndarray) -> np.ndarray:
         """Host-side inverse of ``to_model`` (for building initial states

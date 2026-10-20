@@ -72,9 +72,8 @@ particles at β = 1 had not finished warming up after 17 minutes, longer
 than a whole SMC run.
 
 `smc` counts such stages, in `SMCResult.stalled`, and warns when there are
-any. A stage is flagged when it uses all its moves, some coordinate is
-still correlated above 0.9 with the stage's start, and fewer than 5% of
-moves were accepted. The acceptance test is what spares multimodal
+any. A stage is flagged when it ends with some coordinate still correlated
+above 0.9 with the stage's start and fewer than 5% of its moves accepted. The acceptance test is what spares multimodal
 posteriors: a coordinate that tells modes apart stays correlated however
 well particles move within their modes. A thin parabolic ridge in the test
 suite reproduces the failure (0.16 nats low, flagged); a ridge four times

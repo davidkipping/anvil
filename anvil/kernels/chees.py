@@ -353,7 +353,9 @@ class ChEESHMC(Kernel):
     def adapt(self, a: ChEESAdaptState, state, info: StepInfo, t: int):
         # A chain at a non-finite log-density or a failure sentinel accepts
         # nothing at any step size, so it must not steer the step size: it
-        # would drive it to zero for everyone (see harmonic_mean). Judged on
+        # would drive it to zero for everyone (see harmonic_mean). Nor the
+        # preconditioner or the trajectory length: far from the bulk, it
+        # would set the scale and the ChEES centre for every chain. Judged on
         # the kernel's own state, on device, with no tuning -- a finite
         # straggler, however far behind, is never excluded.
         lp = state["log_prob"]
@@ -364,20 +366,21 @@ class ChEESHMC(Kernel):
         )
         grad = chees_gradient(
             info["q_prev"], info["q_prop"], info["v_end"],
-            info["accept_prob"], self._last_h,
+            info["accept_prob"], self._last_h, include=live,
         )
         chees = update_chees(
             a.chees, grad, t, mx.exp(da.log_eps),
             max_leapfrog=self.max_leapfrog,
         )
-        moments = update_moments(a.moments, state["u"], t)
+        moments = update_moments(a.moments, state["u"], t, include=live)
         sigma = stddev(moments) if t >= self.precondition_after else a.frozen_sigma
 
         dm, corr, lrinv = a.dense_moments, a.corr, a.lrinv
         if self.dense:
             # one host copy per warmup iteration; microseconds at realistic
             # sizes, and it never touches the compiled step
-            dm = update_dense_moments(dm, np.array(state["u"]), t)
+            dm = update_dense_moments(dm, np.array(state["u"]), t,
+                                      include=np.array(live))
             if t >= self.precondition_after:
                 for ridge in (self.ridge, 100.0 * self.ridge, 1e4 * self.ridge):
                     try:

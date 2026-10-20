@@ -243,6 +243,34 @@ def test_one_chain_at_minus_inf_no_longer_collapses_the_step_size():
 
 
 
+
+@pytest.mark.parametrize("dense", [False, True], ids=["diag", "dense"])
+def test_a_dead_chain_far_away_does_not_set_the_mass_matrix(dense):
+    """A chain parked at a failure sentinel 1,000 sd out used to enter the
+    moment estimates, inflating one coordinate's variance ~250x for every
+    chain (and the ChEES centre with it); it is now left out like it is
+    from the step size."""
+    from anvil.kernels.chees import ChEESHMC
+    t = _target(sloped=False)
+    rng = np.random.default_rng(5)
+    u0 = rng.standard_normal((64, DIM)).astype(np.float32)
+    clean = anvil.run(ChEESHMC(t, dense=dense), t, mx.array(u0), n_warmup=150,
+                      n_samples=5, seed=3)
+    u0[0] = [1000.0, 0.0, 0.0, 0.0]               # dead for good: flat -1e30
+    one_bad = anvil.run(ChEESHMC(t, dense=dense), t, mx.array(u0), n_warmup=150,
+                        n_samples=5, seed=3)
+
+    def scale(r):
+        p = r.final_params
+        return np.array(p["sigma"] if dense else mx.sqrt(p["inv_mass"]))
+
+    ratio = scale(one_bad) / scale(clean)
+    assert np.all((ratio > 0.5) & (ratio < 2.0)), ratio
+    T_ratio = float(one_bad.final_params["traj_length"].item()) / \
+        float(clean.final_params["traj_length"].item())
+    assert 0.5 < T_ratio < 2.0, T_ratio
+
+
 # -- climbing vs stranded: the per-probe history decides --------------------
 #
 # anvil-gp measured chains flagged LOST that were simply still descending at

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -838,19 +839,6 @@ def _settle_bounds(ev, u, lo_side, hi_side):
     return None
 
 
-def _jacobian_diag(target, u):
-    """d(model)/du at u (float64, host), per column."""
-    t = target.transform
-    lo = np.array([s.lo for s in t.specs])
-    hi = np.array([s.hi for s in t.specs])
-    scale = np.array([s.scale for s in t.specs])
-    sig = 1.0 / (1.0 + np.exp(-u))
-    j = np.where(t._bounded, np.where(t._bounded, hi - lo, 1.0) * sig * (1 - sig), scale)
-    j = np.where(t._lower, scale * np.exp(u), j)
-    j = np.where(t._upper, scale * np.exp(-u), j)
-    return j
-
-
 def _laplace(ev, u, at_bound):
     """Hessian at u: one axis-aligned pass, then a second along its
     eigenvectors at 0.3 sd (capped at 0.5 in u), as SquishierPlanet and
@@ -999,8 +987,16 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
         top = np.argsort(-F)[:_RESCORE]
         top = top[np.isfinite(F[top])]
         v64 = np.array(f_hi(mx.array(X[top].astype(np.float32))), dtype=np.float64)
-        b = int(top[np.nanargmax(v64)])
-        value = float(np.nanmax(v64))
+        if np.isfinite(v64).any():
+            v64 = np.where(np.isfinite(v64), v64, -np.inf)
+            b = int(top[np.argmax(v64)])
+            value = float(v64.max())
+        else:
+            warnings.warn(
+                f"the float64 path is not finite at any of the {top.size} best "
+                f"starts; keeping the float32 ranking and value", RuntimeWarning,
+                stacklevel=2)
+            f_hi = None
     u = X[b].copy()
     if target.supports_grad:
         u_set = _settle_bounds(ev, u, lo_side, hi_side)
@@ -1021,7 +1017,7 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
         model = tr.model_np(u[None])[0]
         physical = tr.to_physical(model)
         if cov_u is not None:
-            J = _jacobian_diag(target, u)
+            J = target.transform.jacobian_np(u)
             cov_model = cov_u * np.outer(J, J)
             sd = np.sqrt(np.diag(cov_model)) * np.abs(tr._rep_scale)
         names = list(tr.names)

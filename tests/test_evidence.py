@@ -169,6 +169,33 @@ def test_smc_infeasible_half_of_the_box():
     assert abs(r.log_z - lz) < 0.05
 
 
+@pytest.mark.parametrize("failed", [-math.inf, -1e30], ids=["minus_inf", "sentinel"])
+def test_smc_where_most_of_the_prior_fails(failed):
+    # L fails on 70% of the box, as -inf or as a finite sentinel (anvil's
+    # failure floor is -1e29). The first step must drop those particles;
+    # beta used to stall at 1e-300 (0 in float32) for max_stages stages
+    t = TransformedLogDensity(
+        lambda v: mx.where(v[:, 0] > 0.7, -0.5 * ((v[:, 0] - 0.85) / 0.05) ** 2,
+                           mx.full(v[:, 0].shape, failed)),
+        Transform([ParamSpec("x", 0.0, 1.0)]),
+        model_log_norm=-math.log(0.05 * math.sqrt(2 * math.pi)))
+    lz = math.log(_Phi(0.15 / 0.05) - _Phi(-0.15 / 0.05))
+    r = smc(t, n_particles=2048, max_stages=50, seed=0)
+    assert abs(r.log_z - lz) < 0.05
+
+
+def test_smc_says_why_beta_cannot_advance():
+    # a failure reported as -1e28 sits above the failure floor, so it counts
+    # as a likelihood 1e28 below the rest; with 70% of particles there, no
+    # step keeps the ESS
+    t = TransformedLogDensity(
+        lambda v: mx.where(v[:, 0] > 0.7, -0.5 * mx.sum(v * v, axis=-1),
+                           mx.full(v[:, 0].shape, -1e28)),
+        Transform([ParamSpec("x", 0.0, 1.0)]))
+    with pytest.raises(RuntimeError, match="cannot raise beta"):
+        smc(t, n_particles=512, seed=0)
+
+
 def test_smc_warns_when_groups_disagree():
     t, _ = _mirror_ridge()
     # groups of 16 particles cannot hold three modes between them
@@ -199,6 +226,16 @@ def test_smc_warns_when_particles_stop_moving():
     with pytest.warns(RuntimeWarning, match="stopped exploring"):
         r = smc(t, 2048, seed=0)
     assert r.stalled > 0 and "decorrelating" in str(r)
+
+
+def test_smc_counts_a_stall_that_ends_before_max_moves():
+    # with the acceptance-count rule a stage stops after ~10/acceptance
+    # sweeps, short of a generous max_moves: still a stall when the
+    # particles barely moved, and still counted
+    t, _ = _banana(0.0005)
+    with pytest.warns(RuntimeWarning, match="stopped exploring"):
+        r = smc(t, 2048, decorrelation=None, max_moves=1000, seed=0)
+    assert r.stalled > 0 and max(r.moves) < 1000
 
 
 @pytest.mark.parametrize("make", [lambda: _banana(0.002), _mirror_ridge],
@@ -251,6 +288,17 @@ def test_bridge_from_smc_and_from_a_chees_run():
     b = bridge_evidence(t, res)
     assert abs(b.log_z - lz) < max(4 * b.log_z_se, 0.02)
     assert b.details["tau"] >= 1.0
+
+
+def test_bridge_counts_smc_copies_of_one_ancestor_as_one_cluster():
+    # with one sweep per stage the copies of each resampled ancestor stay
+    # close; the error bar used to treat them as independent draws
+    t, lz, _, _ = _conjugate()
+    r = smc(t, min_moves=1, max_moves=1, seed=41)
+    assert r.ancestors.shape == (8192,) and np.unique(r.ancestors).size < 8192
+    b = bridge_evidence(t, r)
+    assert b.details["tau"] > 1.05
+    assert abs(b.log_z - lz) < 4 * b.log_z_se + 0.02
 
 
 # -- Laplace -----------------------------------------------------------------------

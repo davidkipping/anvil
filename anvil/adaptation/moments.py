@@ -25,15 +25,29 @@ def init_moments(dim: int) -> MomentsState:
     return MomentsState(m1=mx.zeros((dim,)), m2=mx.zeros((dim,)))
 
 
-def update_moments(ms: MomentsState, u: mx.array, t: int) -> MomentsState:
+def update_moments(ms: MomentsState, u: mx.array, t: int,
+                   include: mx.array | None = None) -> MomentsState:
     """EMA update from the current (n_chains, dim) positions; ``t`` is the
-    1-based warmup iteration."""
+    1-based warmup iteration. ``include`` (n_chains,) bool leaves chains out
+    -- a dead chain far from the bulk would otherwise set the scale; with
+    none included the moments are left as they were."""
     beta = t / (t + 8.0)
-    mean = mx.mean(u, axis=0)
-    sq = mx.mean(u * u, axis=0)
+    if include is None:
+        mean = mx.mean(u, axis=0)
+        sq = mx.mean(u * u, axis=0)
+        return MomentsState(
+            m1=beta * ms.m1 + (1.0 - beta) * mean,
+            m2=beta * ms.m2 + (1.0 - beta) * sq,
+        )
+    w = include.astype(u.dtype)[:, None]
+    uz = mx.where(include[:, None], u, 0.0)
+    n = mx.sum(w)
+    mean = mx.sum(uz, axis=0) / mx.maximum(n, 1.0)
+    sq = mx.sum(uz * uz, axis=0) / mx.maximum(n, 1.0)
+    any_ = n > 0
     return MomentsState(
-        m1=beta * ms.m1 + (1.0 - beta) * mean,
-        m2=beta * ms.m2 + (1.0 - beta) * sq,
+        m1=mx.where(any_, beta * ms.m1 + (1.0 - beta) * mean, ms.m1),
+        m2=mx.where(any_, beta * ms.m2 + (1.0 - beta) * sq, ms.m2),
     )
 
 
@@ -64,12 +78,17 @@ def init_dense_moments(dim: int) -> DenseMomentsState:
 
 
 def update_dense_moments(
-    ms: DenseMomentsState, u: np.ndarray, t: int
+    ms: DenseMomentsState, u: np.ndarray, t: int, include: np.ndarray | None = None
 ) -> DenseMomentsState:
     """EMA update from the current (n_chains, dim) positions, same
-    ``beta = t/(t+8)`` schedule as the diagonal path. ``u`` is host numpy."""
+    ``beta = t/(t+8)`` schedule as the diagonal path. ``u`` is host numpy;
+    ``include`` leaves chains out as in :func:`update_moments`."""
     beta = t / (t + 8.0)
     u = np.asarray(u, dtype=np.float64)
+    if include is not None:
+        u = u[np.asarray(include, dtype=bool)]
+        if u.shape[0] == 0:
+            return ms
     return DenseMomentsState(
         m1=beta * ms.m1 + (1.0 - beta) * u.mean(axis=0),
         m2=beta * ms.m2 + (1.0 - beta) * (u.T @ u) / u.shape[0],

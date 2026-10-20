@@ -44,9 +44,19 @@ def chees_gradient(
     v_end: mx.array,    # (n, dim) end-of-trajectory velocities M^{-1} p'
     accept_prob: mx.array,  # (n,)
     jitter: float,      # this iteration's Halton value h (chain rule t = h*T)
+    include: mx.array | None = None,  # (n,) bool: chains that may steer T
 ) -> mx.array:
-    """Per-iteration stochastic gradient of the ChEES criterion w.r.t. T."""
-    mu_prev = mx.mean(q_prev, axis=0)
+    """Per-iteration stochastic gradient of the ChEES criterion w.r.t. T.
+    Chains left out by ``include`` count neither in the centre nor in the
+    sum: a dead chain far from the bulk would move the centre for all."""
+    if include is not None:
+        q_prev = mx.where(include[:, None], q_prev, 0.0)
+        q_prop = mx.where(include[:, None], q_prop, 0.0)
+        accept_prob = mx.where(include, accept_prob, 0.0)
+        n = mx.maximum(mx.sum(include.astype(q_prev.dtype)), 1.0)
+        mu_prev = mx.sum(q_prev, axis=0) / n
+    else:
+        mu_prev = mx.mean(q_prev, axis=0)
     a_sum = mx.sum(accept_prob) + 1e-20
     mu_prop = mx.sum(accept_prob[:, None] * q_prop, axis=0) / a_sum
     dc_prev = q_prev - mu_prev

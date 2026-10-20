@@ -441,3 +441,18 @@ def test_result_keeps_no_compiled_graph():
             or isinstance(v, _Evaluator)]
     assert held == []
     assert np.array(r.laplace_starts(16)).shape == (16, 3)
+
+
+def test_a_float64_path_that_fails_everywhere_falls_back_to_float32():
+    # the float64 rescoring used to call nanargmax on all-NaN values and
+    # raise after the whole search had finished
+    specs = [anvil.ParamSpec("a", -5.0, 5.0), anvil.ParamSpec("b", -5.0, 5.0)]
+
+    def lp(v):
+        return -0.5 * mx.sum((v - 1.0) ** 2, axis=-1)
+
+    t = anvil.TransformedLogDensity(lp, anvil.Transform(specs),
+                                    model_log_prob_hi=lambda v: mx.full(v.shape[:1], mx.nan))
+    with pytest.warns(RuntimeWarning, match="float64"):
+        r = anvil.optimize(t, n_starts=16, seed=0)
+    assert np.allclose(r.model, 1.0, atol=1e-2) and np.isfinite(r.value)
