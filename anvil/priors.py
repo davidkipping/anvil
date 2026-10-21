@@ -239,7 +239,7 @@ class LogUniform(Prior):
 @dataclass(frozen=True)
 class Gaussian(Prior):
     """Normal(mu, sigma) in model units. On an unbounded ParamSpec it is a
-    plain Gaussian; on a bounded or half-bounded one, :meth:`bind` returns the
+    plain Gaussian; on a bounded or half-bounded one, ``bind`` returns the
     :class:`TruncatedGaussian` that the box makes it, with the right
     normalising constant."""
 

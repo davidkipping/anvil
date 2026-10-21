@@ -456,3 +456,63 @@ def test_a_float64_path_that_fails_everywhere_falls_back_to_float32():
     with pytest.warns(RuntimeWarning, match="float64"):
         r = anvil.optimize(t, n_starts=16, seed=0)
     assert np.allclose(r.model, 1.0, atol=1e-2) and np.isfinite(r.value)
+
+
+# -- 0.10.2: fixes from a review of optimize, each failing on 0.10.1 ----------
+
+def _edge_target(offset, with_hi):
+    """Interior optimum 0.22 sd from the upper edge of a box (u ~ 5), under a
+    likelihood offset that sets float32's resolution."""
+    def ll(v):
+        return (-0.5 * ((v[:, 0] - 0.9933) / 0.03) ** 2
+                - 0.5 * ((v[:, 1] - 0.5) / 0.1) ** 2 - offset)
+    return TransformedLogDensity(ll, Transform([ParamSpec("a", 0.0, 1.0),
+                                                ParamSpec("b", 0.0, 1.0)]),
+                                 model_log_prob_hi=ll if with_hi else None)
+
+
+@pytest.mark.parametrize("with_hi", [True, False], ids=["float64", "float32"])
+def test_bound_settling_does_not_pin_an_interior_optimum(with_hi):
+    # the move onto the bound used to be accepted within 4 float32 ulps of
+    # |f| -- 0.04 nats at 1e5 -- which pinned this optimum to its edge
+    rng = np.random.default_rng(0)
+    for seed in range(4):
+        u0 = np.c_[5 + 0.5 * rng.standard_normal(32), 0.3 * rng.standard_normal(32)]
+        r = anvil.optimize(_edge_target(1e5, with_hi), u0, seed=seed)
+        assert not r.at_bound[0]
+        # finite, not NaN; the Laplace pass at 0.3 sd reads the curvature
+        # across the logistic bend near the edge, so ~12% narrow here
+        assert np.isfinite(r.sd[0]) and 0.02 < r.sd[0] < 0.035
+        assert abs(r.model[0] - 0.9933) < 0.003
+
+
+def test_two_close_peaks_are_two_optima():
+    # equal peaks 0.03 apart in u used to merge on distance alone
+    def lp(u):
+        x = u[:, 0]
+        return mx.logaddexp(-0.5 * (x - 0.015) ** 2 / 1e-6, -0.5 * (x + 0.015) ** 2 / 1e-6)
+    r = anvil.optimize(FunctionLogDensity(lp, 1), np.linspace(-0.05, 0.05, 64)[:, None],
+                       objective="density")
+    assert len(r.optima) == 2
+    assert sorted(round(float(o["u"][0]), 3) for o in r.optima) == [-0.015, 0.015]
+
+
+def test_starts_cut_off_on_a_slope_are_not_optima():
+    # starts stopped by max_iter on one peak's slopes used to be listed as
+    # separate optima, with a multimodality warning
+    t, mu, _ = correlated_gaussian(3, rho=0.95, seed=0)
+    r = anvil.optimize(t, mu + 3 * np.random.default_rng(0).standard_normal((32, 3)),
+                       objective="density", method="lbfgs", max_iter=4)
+    assert (r.status == "max_iter").any()
+    assert len(r.optima) == 1 and "multimodality" not in str(r)
+
+
+def test_lbfgs_starts_at_the_float32_floor_are_converged_not_stalled():
+    # with a -1e5 offset float32 cannot see the last 0.008 nats: L-BFGS
+    # starts sitting at the optimum used to end "stalled" with no decrement
+    t = TransformedLogDensity(lambda v: -0.5 * mx.sum(v * v, axis=-1) - 1e5,
+                              Transform([ParamSpec("a", prior=anvil.priors.Gaussian(0.0, 10.0)),
+                                         ParamSpec("b", prior=anvil.priors.Gaussian(0.0, 10.0))]))
+    r = anvil.optimize(t, np.random.default_rng(1).standard_normal((64, 2)), method="lbfgs")
+    assert (r.status == "stalled").sum() == 0
+    assert np.all(np.isfinite(r.decrement[r.status == "converged"]))

@@ -8,6 +8,7 @@ for size, and its stall count for firing when particles stop moving.
 """
 
 import math
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -220,8 +221,9 @@ def _banana(w):
 
 def test_smc_warns_when_particles_stop_moving():
     # a ridge 0.0005 wide: late in the run under 5% of moves are accepted and
-    # the particles stay where resampling left them -- the failure that
-    # biases ln Z low (here by about 0.16 nats) -- and smc says so
+    # the particles stay where resampling left them -- the symptom that came
+    # with a 0.2-0.3 nat bias on the oblate transit fit (on this ridge ln Z
+    # itself measured unbiased over 5 seeds) -- and smc says so
     t, _ = _banana(0.0005)
     with pytest.warns(RuntimeWarning, match="stopped exploring"):
         r = smc(t, 2048, seed=0)
@@ -233,9 +235,36 @@ def test_smc_counts_a_stall_that_ends_before_max_moves():
     # sweeps, short of a generous max_moves: still a stall when the
     # particles barely moved, and still counted
     t, _ = _banana(0.0005)
-    with pytest.warns(RuntimeWarning, match="stopped exploring"):
+    with pytest.warns(RuntimeWarning, match="stopped exploring") as w:
         r = smc(t, 2048, decorrelation=None, max_moves=1000, seed=0)
     assert r.stalled > 0 and max(r.moves) < 1000
+    # and the warning gives the moves those stages ran, not max_moves
+    msg = str(w[0].message)
+    assert "1000" not in msg and "up to" in msg
+
+
+def test_smc_reports_unsettled_stages_without_warning():
+    # eight sweeps per stage on the wider ridge: every stage ends correlated
+    # above 0.9 but with well over 5% of moves accepted -- unsettled, which
+    # is reported, not a stall, which is warned about
+    t, _ = _banana(0.002)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        r = smc(t, 2048, min_moves=8, max_moves=8, seed=0)
+    assert r.stalled == 0 and r.unsettled > 0
+    assert "used every move" in str(r)
+
+
+def test_smc_block_size_grows_only_when_asked():
+    from anvil.evidence import _Sweep
+    t, _ = _separable()
+    u = t.transform.sample_prior(8192, np.random.default_rng(0))
+    auto = _Sweep(t, 1, 1024, t.dim, 2.0, None, True)
+    fixed = _Sweep(t, 1, 1024, t.dim, 2.0, 512, True)
+    for _ in range(4):
+        auto.values(u)
+        fixed.values(u)
+    assert auto.block > 1024 and fixed.block == 512
 
 
 @pytest.mark.parametrize("make", [lambda: _banana(0.002), _mirror_ridge],
@@ -275,6 +304,20 @@ def test_bridge_exact_on_exact_draws():
     assert abs(b.log_z - lz) < max(3 * b.log_z_se, 1e-3)
     assert abs(b.log_z - lz) < 0.01
     assert b.details["proposal_ess"] > 0.5 * b.details["n_proposal"]
+
+
+def test_bridge_averages_both_folds_with_a_calibrated_error_bar():
+    # fit on one half and bridge on the other, then swap: the mean of the
+    # two is more accurate than either, and its error bar must still cover
+    t, lz, mu, sd = _conjugate()
+    z = []
+    for s in range(20):
+        draws = mu + sd * np.random.default_rng(700 + s).standard_normal((2000, 3))
+        b = bridge_evidence(t, draws, seed=s)
+        assert b.log_z == pytest.approx(np.mean(b.details["log_z_folds"]))
+        z.append((b.log_z - lz) / b.log_z_se)
+    assert 0.5 < np.sqrt(np.mean(np.square(z))) < 1.5
+    assert np.mean(np.abs(z) < 2) >= 0.8
 
 
 def test_bridge_from_smc_and_from_a_chees_run():

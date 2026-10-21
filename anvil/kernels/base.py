@@ -6,10 +6,12 @@ them without retracing, and the return value is a pair of plain dicts
 (``mx.compile`` handles dict pytrees but not custom classes). The engine owns
 the iteration loop; kernels never loop over iterations themselves.
 
-Step info convention — dict with per-chain arrays of shape (n_chains,):
-    "accept_prob"  Metropolis acceptance probability of the proposal
-    "accepted"     whether the proposal was taken (bool)
-plus kernel-specific extras (e.g. "diverged" for HMC).
+Step info convention — a dict with per-chain arrays of shape (n_chains,):
+
+- ``"accept_prob"``: Metropolis acceptance probability of the proposal;
+- ``"accepted"``: whether the proposal was taken (bool);
+
+plus kernel-specific extras (e.g. ``"diverged"`` for HMC).
 """
 
 from __future__ import annotations
@@ -26,6 +28,13 @@ StepInfo = dict[str, mx.array]
 
 
 class Kernel:
+    """Base class of every sampler: ``init`` builds the batched chain
+    state, ``step`` advances every chain once (pure, so it compiles),
+    ``init_adapt``/``adapt``/``make_params`` tune it during warmup, and
+    ``retrace``/``refresh`` keep compiled graphs and cached quantities
+    consistent with the current target. Subclass it to add a kernel; the
+    samplers guide describes the contract."""
+
     #: kernels that require log_prob gradients set this
     needs_grad: bool = False
     #: kernels that manage their own mx.compile (e.g. host-side move
@@ -36,7 +45,7 @@ class Kernel:
     #: for every kernel
     compile_step: bool = True
     #: set once MLX has refused to compile this kernel's graphs (see
-    #: :mod:`anvil.compile`); later retraces then skip the attempt
+    #: ``anvil.compile``); later retraces then skip the attempt
     compile_refused: bool = False
 
     def init(self, key: mx.array, u0: mx.array, target: LogDensity) -> ChainState:

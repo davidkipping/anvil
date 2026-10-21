@@ -42,8 +42,12 @@ def update_moments(ms: MomentsState, u: mx.array, t: int,
     w = include.astype(u.dtype)[:, None]
     uz = mx.where(include[:, None], u, 0.0)
     n = mx.sum(w)
-    mean = mx.sum(uz, axis=0) / mx.maximum(n, 1.0)
-    sq = mx.sum(uz * uz, axis=0) / mx.maximum(n, 1.0)
+    # every chain included: the unmasked mean exactly, so a healthy run is
+    # bit-identical to one without the mask (sum/n is not, unless n is a
+    # power of two)
+    full = n == u.shape[0]
+    mean = mx.where(full, mx.mean(u, axis=0), mx.sum(uz, axis=0) / mx.maximum(n, 1.0))
+    sq = mx.where(full, mx.mean(u * u, axis=0), mx.sum(uz * uz, axis=0) / mx.maximum(n, 1.0))
     any_ = n > 0
     return MomentsState(
         m1=mx.where(any_, beta * ms.m1 + (1.0 - beta) * mean, ms.m1),
@@ -99,8 +103,11 @@ def dense_factors(ms: DenseMomentsState, ridge: float = 1e-6):
     """Factor the EMA covariance into the arrays the kernel consumes.
 
     Returns ``(sd, R, B)`` as float32 mx arrays, where Sigma = S R S and
-    B = inv(chol(R)). The momentum draw uses B via ``(z @ B) / sd``, which
-    has covariance ``B^T B / (sd sd^T) = Sigma^-1`` as required.
+    B = inv(chol(R)), with R already carrying the ridge: the momentum draw
+    ``(z @ B) / sd`` has covariance (S R S)^-1 and the kinetic energy uses
+    S R S, so both sides must see the same R. (Before 0.10.2 the energy used
+    R without the ridge: posterior variances ~ridge/lambda_min(R) low,
+    9% at the first escalation on a rho = 0.999 pair.)
 
     Raises ``numpy.linalg.LinAlgError`` if R is not positive definite at
     this ridge, so the caller can escalate or fall back.
@@ -110,7 +117,8 @@ def dense_factors(ms: DenseMomentsState, ridge: float = 1e-6):
     R = cov / np.outer(sd, sd)
     R = 0.5 * (R + R.T)                       # kill asymmetry from rounding
     np.fill_diagonal(R, 1.0)
-    Lr = np.linalg.cholesky(R + ridge * np.eye(len(sd)))
+    R = R + ridge * np.eye(len(sd))
+    Lr = np.linalg.cholesky(R)
     B = np.linalg.inv(Lr)
     return (
         mx.array(sd.astype(np.float32)),

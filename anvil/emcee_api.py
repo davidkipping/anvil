@@ -14,6 +14,8 @@ move frozen (this keeps the recorded chain a valid MCMC sample).
 
 from __future__ import annotations
 
+import warnings
+
 import mlx.core as mx
 import numpy as np
 
@@ -25,6 +27,15 @@ from .logdensity import FunctionLogDensity, LogDensity, validate_batched_signatu
 
 
 class EnsembleSampler:
+    """emcee-style front door to the ensemble kernel: ``nwalkers`` walkers
+    in ``ndim`` dimensions, ``log_prob_fn`` a batched MLX function
+    ``(nwalkers, ndim) -> (nwalkers,)`` (checked at construction).
+    ``moves``: a list of ``(move, weight)``, default the stretch move alone;
+    ``kernel`` replaces the ensemble kernel outright. ``run_mcmc`` returns
+    a :class:`~anvil.Results`; ``get_chain``, ``get_log_prob`` and
+    ``acceptance_fraction`` read it as emcee's do. Stretch and DE moves have
+    nothing to tune, so ``warmup`` only discards burn-in here."""
+
     def __init__(
         self,
         nwalkers: int,
@@ -74,6 +85,13 @@ class EnsembleSampler:
             )
         if warmup is None:
             warmup = nsteps if tune else 0
+        if warmup == 0 and isinstance(self, HMCSampler):
+            warnings.warn(
+                "HMCSampler.run_mcmc with no warmup: ChEES adapts its step "
+                "size, trajectory length and preconditioner only during "
+                "warmup, so this run uses the starting values (step 0.1, "
+                "length 1.0) unadapted; pass warmup= or tune=True",
+                RuntimeWarning, stacklevel=2)
         self._results = engine.run(
             self._make_kernel(),
             self.target,

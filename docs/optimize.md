@@ -9,7 +9,7 @@ over all the starts still moving.
 res = anvil.optimize(target)            # MLE from 128 prior draws
 print(res)                              # best fit, +/- Laplace sd, flags
 u0 = res.ball(512)                      # start ChEES around it
-run(ChEESHMC(target), target, u0)
+anvil.run(anvil.ChEESHMC(target), target, u0)
 ```
 
 ## What is maximised
@@ -124,11 +124,14 @@ Per start, the result records:
   - `"failed"`: the objective was non-finite at the start.
 - `decrement`: the gain a Newton step still predicted, in nats.
 
-`optima` lists the distinct optima the starts found. Starts count as one
-optimum when the objective does not dip between them, so starts held at
-different depths on one bound, or spread across one broad peak, are not
-reported as rivals. The printed summary warns when a second optimum lies
-within 10 nats of the best.
+`optima` lists the distinct optima the starts found. Only starts that
+stopped at a stationary point count; one cut off by `max_iter` is on a
+slope, not at an optimum. Two starts are one optimum when the objective
+does not dip anywhere on the segment between them (checked at a quarter,
+half and three quarters of the way), so starts held at different depths on
+one bound, or spread across one broad peak, are not reported as rivals,
+while two peaks are kept apart however close they sit. The printed summary
+warns when a second optimum lies within 10 nats of the best.
 
 The best point is the highest start. `converged` says whether it is
 certified: it converged itself, or a converged start within `tol` below it

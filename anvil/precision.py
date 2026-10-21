@@ -145,11 +145,21 @@ def chunked_sum(
         if probe.dtype == mx.float32:
             # accumulate int64 across chunks too, so the whole reduction is
             # exact and only the final float32 cast rounds
-            acc = _fixed_point_partial(probe)
+            # a term the fixed-point grid cannot hold -- non-finite, or past
+            # its clamp -- would be clamped to a finite flat penalty, hiding
+            # a failed model from every -inf check; those chains take the
+            # plain float32 sum instead, which keeps the NaN/inf/large value
+            lim = _FIXED_CLAMP / _FIXED_SCALE
+
+            def flag(t):
+                return mx.any(~mx.isfinite(t) | (mx.abs(t) > lim), axis=-1)
+            acc, bad, plain = _fixed_point_partial(probe), flag(probe), mx.sum(probe, axis=-1)
             for s in range(c, n_data, c):
-                acc = acc + _fixed_point_partial(
-                    term_fn(s, min(s + c, n_data)))
-            return _fixed_to_float32(acc)
+                t = term_fn(s, min(s + c, n_data))
+                acc = acc + _fixed_point_partial(t)
+                bad = bad | flag(t)
+                plain = plain + mx.sum(t, axis=-1)
+            return mx.where(bad, plain, _fixed_to_float32(acc))
     partials = [
         mx.sum(term_fn(s, min(s + c, n_data)), axis=-1)
         for s in range(0, n_data, c)
@@ -191,7 +201,7 @@ class ChunkedGaussianLogLike:
       model, summing ``0.5*(1 - r^2)`` instead of ``-0.5*r^2`` leaves an
       O(sqrt(N/2)) quantity rather than an O(N/2) one -- at N = 1e5 that
       is ~200 instead of ~5e4, so the float32 ulp of the stored value
-      falls by ~500x and every difference taken downstream (Metropolis
+      falls by ~128x (measured) and every difference taken downstream (Metropolis
       ratios, and HMC's energy difference) gets correspondingly sharper.
       The per-term form ``0.5*(1-r)*(1+r)`` is used because ``1-r`` is
       exact for 0.5 <= r <= 2 (Sterbenz), avoiding cancellation near

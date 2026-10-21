@@ -67,10 +67,11 @@ posterior.
    policy additionally performs the cross-chunk sum in float64 on the CPU
    stream *inside the same lazy graph*, for a measured 0–20% cost — but
    read the fine print: **it only does anything when there are many
-   chunks.** At the default `chunk_size=65536` over 10⁵ points there are
-   two chunks, and the exact sum of two float32 values rounds identically
-   whether added in float32 or in float64 — the two policies are then
-   *bit-identical* (verified). Shrinking to `chunk_size=1024` makes it
+   chunks.** At `chunk_size=65536` (the default before 0.10) over 10⁵
+   points there are two chunks, and the exact sum of two float32 values
+   rounds identically whether added in float32 or in float64 — the two
+   policies are then *bit-identical* (verified). At today's default of
+   16384 there are seven, and the anchor can differ in the last bits. Shrinking to `chunk_size=1024` makes it
    real but buys only ~6% of the error dispersion. Measured error
    contributions on the transit targets: the summation accounts for only
    2–40% of the total, the rest being per-datum model arithmetic and
@@ -186,14 +187,24 @@ your target ESS, which is the only comparison that means anything —
 "small" is meaningless without asking *small compared to what*:
 
 ```
-  float32 error dispersion (sd) : 0.00543   [mean +0.00022, irrelevant: it cancels]
-  exact-reweighting ESS retained: 0.999971
+Certificate from 256 probe evaluations of 128000 draws
+  float32 error dispersion (sd) : 8.699e-05   [mean +3.511e-05, irrelevant: it cancels]
+  exact-reweighting ESS retained: 1.000000
+  worst-case certified ESS      : 132,144,123
   probes used / needed          : 256 / 16
   bias at ESS = 100,000 (units of MC standard error):
-              q1   +0.195   (+0.000618 posterior sd)
-               r   -0.188   (-0.000595 posterior sd)
-  ACCEPTABLE: bias is 0.20x the Monte Carlo standard error at ESS=100,000
+           depth   -0.011   (-3.46e-05 posterior sd)
+             dur   +0.011   (+3.45e-05 posterior sd)
+             tau   -0.005   (-1.55e-05 posterior sd)
+           p_off   +0.003   (+1.01e-05 posterior sd)
+          t0_off   -0.003   (-8.37e-06 posterior sd)
+             df0   -0.000   (-1.47e-06 posterior sd)
+  OK: bias is 0.011x the Monte Carlo standard error at ESS=100,000 — negligible
 ```
+
+(The built-in 6-parameter transit target over 2×10⁴ points, 128,000
+ensemble draws; on a worse-conditioned model the verdict reads
+`ACCEPTABLE` or `WARNING` and the bias column is where to look.)
 
 Only the error's *dispersion* matters; a constant offset is absorbed
 entirely by the normalization, which is why the mean is reported but

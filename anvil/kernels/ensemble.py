@@ -120,6 +120,10 @@ class EnsembleKernel(Kernel):
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
+        # a fresh run draws its moves afresh, so reusing a kernel object
+        # reproduces a run (resume restores the stream from the checkpoint)
+        self._chooser = _pyrandom.Random(self._seed ^ 0x5EED)
+        self._moves_drawn = 0
         n, d = u0.shape
         if n % 2:
             raise ValueError("ensemble moves require an even number of walkers")

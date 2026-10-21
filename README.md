@@ -22,7 +22,8 @@ operations live inside the same lazy graph as float32 GPU work.
   flow anywhere:
   the trajectory jitter is a shared per-iteration Halton scalar, so
   thousands of chains advance in lockstep. Requires an MLX-differentiable
-  log density. On smooth targets it reaches ~60% ESS per draw.
+  log density. On a smooth target it reaches 0.60 ESS per draw (10-D
+  correlated Gaussian, 1024 chains).
 - **Ensemble moves** (robust fallback) — vectorized Goodman-Weare stretch
   and differential-evolution moves with detailed-balance-correct red-black
   half-ensemble updates. Gradient-free, affine-invariant, near-drop-in for
@@ -72,9 +73,10 @@ Metal GPUs have no float64. Sampling correctness in float32 is a
 2. **Sample offsets, not absolutes.** Parameters like `t0` and `P` enter
    the model as `t0 - t0_ref`, `P - P_ref`; `ParamSpec.report_offset`
    (float64, host-side) reinstates absolute units on output. See
-   `anvil/targets/builtin.py` for a worked transit example — the
-   naive absolute-parameter model loses ~10 units of log-likelihood to
-   float32 rounding; the offset model loses ~0.2.
+   `anvil/targets/builtin.py` for a worked transit example — measured
+   at the posterior typical set of the 100k-point transit target, the
+   median float32 error falls from 2.3 log-likelihood units (absolute
+   parameters) to 0.0015 (offsets); see the precision guide.
 3. **Recentre, then reduce with structure.** A chi-squared over N points
    sums to ≈ −N/2, so anvil sums `0.5·(1 − r²)` and keeps the exact −N/2
    as a float64 host constant: the float32 quantity is then O(√(N/2))
@@ -126,8 +128,9 @@ of CPU and would only widen the gap.
 Honest caveats: sustained GPU throughput swings ~2× with thermal state,
 and emcee's own ESS/s varies several-fold across repeats on the same
 machine, so treat the ratios as order-of-magnitude. The trapezoid model's
-kinks and plateaus are near ChEES's worst case; on smooth targets it
-reaches ~60% ESS per draw (see `tests/test_chees.py`).
+kinks and plateaus are near ChEES's worst case; on a smooth 10-D
+correlated Gaussian it reaches 0.60 ESS per draw (1024 chains; see the
+samplers guide).
 
 For a science-grade worked example on a real transit model, including a
 converged head-to-head and a curvature read-out explaining the result,
@@ -218,7 +221,7 @@ from the weights, not from chains crossing between modes, so it holds
 where MCMC cannot certify them. On a spherical transit fit it matched the
 reference to 0.02 nats in 77 s. On a narrow, curved posterior its moves
 stop being accepted late in the run and ln Z comes out a few tenths of a
-nat low (0.2-0.3 on an oblate-planet fit), whatever the population size;
+nat low (0.17-0.30 on an oblate-planet fit), whatever the population size;
 `smc` flags those stages and warns. `anvil.bridge_evidence` (seconds, from
 draws you already have) and `anvil.laplace_evidence` (a floor) are the
 cheap checks. See the evidence guide for the measurements.

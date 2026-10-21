@@ -255,9 +255,11 @@ class OptimizeResult:
     ``hessian_u``/``cov_u``: curvature of the objective at the best point in
     u, and its inverse; ``cov_model`` maps it to model units through the
     transform's Jacobian, and ``sd`` gives physical-unit standard
-    deviations. Rows and columns of parameters on a bound are NaN. These
-    are None when ``hessian=False``, without gradients, or when the
-    curvature is not negative definite.
+    deviations. Rows and columns of parameters on a bound are NaN. All four
+    are None when ``hessian=False`` or without gradients; when the
+    curvature is not negative definite ``hessian_u`` is still returned
+    (it shows which direction is flat or rising) and the other three are
+    None.
 
     ``optima``: distinct optima among the starts, best first, as dicts with
     ``value``, ``u`` and ``n_starts``. More than one within a few nats of
@@ -506,13 +508,12 @@ class _LBFGS:
         sy = np.einsum("nd,nd->n", s, y_phi)
         keep = (sy > 1e-10 * np.linalg.norm(s, axis=1) * np.linalg.norm(y_phi, axis=1)) \
             & np.isfinite(sy) & (sy > 0)
-        for i, ok, si, yi, syi in zip(idx, keep, s, y_phi, sy):
-            if ok:
-                h = self.head[i]
-                self.S[h, i], self.Y[h, i] = si, yi
-                self.rho[h, i] = 1.0 / syi
-                self.valid[h, i] = True
-                self.head[i] = (h + 1) % self.m
+        i = np.asarray(idx)[keep]
+        h = self.head[i]
+        self.S[h, i], self.Y[h, i] = s[keep], y_phi[keep]
+        self.rho[h, i] = 1.0 / sy[keep]
+        self.valid[h, i] = True
+        self.head[i] = (h + 1) % self.m
 
 
 def _clamp(X, lo_side, hi_side):
@@ -552,7 +553,6 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
     hist = [F.copy()]
     newton_since = np.zeros(n, int)
     newton_F0 = F.copy()
-    last_negdef = np.ones(n, bool)
     step_scale = np.ones(n)
     mem = _LBFGS(n, d)
     tol_f32 = 4.0 * np.finfo(np.float32).eps
@@ -573,7 +573,9 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
             gl = np.where(frz[lb], 0.0, Ga[lb])
             p, gain = mem.direction(idx[lb], gl)
             P[lb] = np.where(frz[lb], 0.0, p)
-            past = hist[-_PATIENCE_LBFGS] if len(hist) >= _PATIENCE_LBFGS else None
+            # hist[-1] is the current F, so the window is the last
+            # _PATIENCE_LBFGS iterations back from it
+            past = hist[-_PATIENCE_LBFGS - 1] if len(hist) > _PATIENCE_LBFGS else None
             stalled = (np.zeros(lb.sum(), bool) if past is None
                        else (Fa[lb] - past[idx[lb]] < tol))
             if method == "lbfgs":
@@ -601,7 +603,6 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
             H, hok = _fd_hessian(ev, Xa[j], G=Ga[j])
             p, dec, negdef, w, V = _newton_direction(H, Ga[j], frz[j])
             decrement[idx[j]] = np.where(hok, dec, np.nan)
-            last_negdef[idx[j]] = negdef
             conv = hok & (dec < tol) & negdef
             # Little predicted gain but curvature that is not negative
             # definite: a saddle, or a non-concave stretch (Rosenbrock off its
@@ -646,7 +647,10 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
         cand = _f32(_clamp((Xg[:, None, :] + alphas[:, :, None] * Pg[:, None, :])
                            .reshape(-1, d), lo_side, hi_side))
         Fc = ev.value(cand).reshape(-1, K)
-        k = np.argmax(Fc, axis=1)
+        # on a float32-flat stretch several scales read the same value: take
+        # the one nearest the full step, not the longest (a 4x overshoot)
+        tie = Fc == Fc.max(axis=1, keepdims=True)
+        k = np.argmax(np.where(tie, -np.abs(np.log(_ALPHAS))[None, :], -np.inf), axis=1)
         Fbest = Fc[np.arange(gi.size), k]
         slack = np.where(final[go], 0.0, tol_f32 * np.maximum(1.0, np.abs(Fg)))
         accept = Fbest >= Fg - slack
@@ -680,14 +684,18 @@ def _gradient_search(ev, X, method, *, max_iter, tol, lo_side, hi_side,
     if method == "lbfgs":
         # L-BFGS's own predicted gain is unreliable when the problem is
         # ill-conditioned (it read < tol on Elome 0.1 nats from the optimum),
-        # so a start it calls converged must pass one Newton decrement
-        c = np.flatnonzero(status == "converged")
+        # so a start it calls converged must pass one Newton decrement; a
+        # start it calls stalled may only have hit float32's value floor at
+        # the optimum, and passes the same test
+        c = np.flatnonzero((status == "converged") | (status == "stalled"))
         if c.size:
             H, hok = _fd_hessian(ev, X[c], G=G[c])
             _, dec, negdef, _, _ = _newton_direction(
                 H, G[c], _frozen(X[c], G[c], lo_side, hi_side))
             decrement[c] = np.where(hok, dec, np.nan)
-            status[c[~(hok & (dec < tol) & negdef)]] = "stalled"
+            good = hok & (dec < tol) & negdef
+            status[c[good]] = "converged"
+            status[c[~good]] = "stalled"
 
     return X, F, status, n_iter, decrement
 
@@ -745,32 +753,38 @@ def _de_search(ev, X, rng, *, max_iter, tol, lo_side, hi_side, report):
 _MAX_CANDIDATES = 64
 
 
-def _distinct_optima(ev, U, F, lo_side, hi_side, max_optima=10):
+def _distinct_optima(ev, U, F, lo_side, hi_side, status=None, max_optima=10):
     """Distinct optima among the starts, best first.
 
-    Starts within 0.05 in u and 0.1 nats are one optimum. That alone splits
-    one optimum whose starts stop far apart in u -- on a bound, where any
-    |u| from 15 to the clamp is the bound, or on a broad peak -- so
-    candidates of nearly equal value are then merged when the objective does
-    not dip between them: a single peak has no valley at the midpoint, and
-    two separate ones do."""
-    order = np.argsort(-F)
+    Only starts that stopped at a stationary point count: one that ran out
+    of iterations or failed is somewhere on a slope, not at an optimum
+    (unless no start stopped, when the best start stands in). Starts within
+    1e-3 in u and 0.1 nats are one optimum outright. Any two other
+    candidates are one optimum when the objective does not dip on the
+    segment between them -- checked at 1/4, 1/2 and 3/4 of the way: a single
+    peak (or a bound, where any |u| from 15 to the clamp is the same point)
+    has no valley there, and two separate peaks do, however close in u or
+    different in height."""
+    keep = np.isfinite(F)
+    if status is not None:
+        stopped = keep & ~np.isin(np.asarray(status, dtype=object), ["max_iter", "failed"])
+        keep = stopped if stopped.any() else (keep & (F == np.max(F[keep])))
+    order = [i for i in np.argsort(-F) if keep[i]]
     reps: list[dict] = []
     for i in order:
-        if not np.isfinite(F[i]):
-            break
         for r in reps:
-            if abs(r["value"] - F[i]) < 0.1 and np.max(np.abs(r["u"] - U[i])) < 0.05:
+            if abs(r["value"] - F[i]) < 0.1 and np.max(np.abs(r["u"] - U[i])) < 1e-3:
                 r["n_starts"] += 1
                 break
         else:
             reps.append({"value": float(F[i]), "u": U[i].copy(), "n_starts": 1})
     reps = reps[:_MAX_CANDIDATES]
-    pairs = [(a, b) for a in range(len(reps)) for b in range(a + 1, len(reps))
-             if abs(reps[a]["value"] - reps[b]["value"]) < 0.1]
+    pairs = [(a, b) for a in range(len(reps)) for b in range(a + 1, len(reps))]
     if pairs:
-        mid = np.array([0.5 * (reps[a]["u"] + reps[b]["u"]) for a, b in pairs])
-        fm = ev.value(_f32(_clamp(mid, lo_side, hi_side)))
+        fr = (0.25, 0.5, 0.75)
+        pts = np.array([(1 - t) * reps[a]["u"] + t * reps[b]["u"]
+                        for a, b in pairs for t in fr])
+        fm = ev.value(_f32(_clamp(pts, lo_side, hi_side))).reshape(len(pairs), len(fr)).min(axis=1)
         parent = list(range(len(reps)))
 
         def root(a):
@@ -813,7 +827,7 @@ def _certified(ev, X, F, status, b, tol, lo_side, hi_side):
     return bool(np.any(fm >= np.minimum(F[c], F[b]) - tol))
 
 
-def _settle_bounds(ev, u, lo_side, hi_side):
+def _settle_bounds(ev, u, lo_side, hi_side, f_hi=None, tol=1e-2):
     """Move columns whose optimum is on a bound onto it.
 
     The stopping rule ends a start once under ``tol`` nats remain, and for a
@@ -821,8 +835,11 @@ def _settle_bounds(ev, u, lo_side, hi_side):
     units of u short (u ~ 6 for a likelihood rising 5 nats across the box),
     where ``at_bound`` cannot see it. A column past ``|u| = 4`` whose gradient
     still points out is set to the bound; the move is kept if the objective
-    does not fall by more than float32 resolution. Returns the moved point,
-    or None if nothing moved."""
+    does not fall: on the float64 path when there is one (by at most
+    ``1e-3 tol``), else on float32 with no slack. A slack of float32
+    resolution is 0.04 nats at |f| = 1e5, and let float32 noise pin an
+    interior optimum 0.2 sd from its edge. Returns the moved point, or None
+    if nothing moved."""
     f0, g, ok = ev.value_and_grad(u[None])
     if not ok[0]:
         return None
@@ -833,8 +850,12 @@ def _settle_bounds(ev, u, lo_side, hi_side):
         return None
     moved = u.copy()
     moved[cols] = np.sign(u[cols]) * _U_BOUND
-    slack = 4.0 * np.finfo(np.float32).eps * max(1.0, abs(f0[0]))
-    if ev.value(moved[None])[0] >= f0[0] - slack:
+    if f_hi is not None:
+        v = np.array(f_hi(mx.array(np.stack([u, moved]).astype(np.float32))),
+                     dtype=np.float64)
+        if np.all(np.isfinite(v)):
+            return moved if v[1] >= v[0] - 1e-3 * tol else None
+    if ev.value(moved[None])[0] >= f0[0]:
         return moved
     return None
 
@@ -978,7 +999,10 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
         raise RuntimeError("every start failed: the objective is not finite "
                            "at any of them, or at any point they reached")
     status = np.asarray(status, dtype=object)
-    b = int(np.argmax(F))
+    # float32 ties among starts at the optimum: prefer the smallest Newton
+    # decrement (the float64 rescoring below replaces this when it exists)
+    tie = np.flatnonzero(F == np.max(F))
+    b = int(tie[np.argmin(np.nan_to_num(decrement[tie], nan=np.inf))])
     value = float(F[b])
     if f_hi is not None:
         # float32 cannot rank starts that all sit at the optimum (on Elome
@@ -999,7 +1023,7 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
             f_hi = None
     u = X[b].copy()
     if target.supports_grad:
-        u_set = _settle_bounds(ev, u, lo_side, hi_side)
+        u_set = _settle_bounds(ev, u, lo_side, hi_side, f_hi=f_hi, tol=tol)
         if u_set is not None:
             u = X[b] = u_set
             F[b] = ev.value(u[None])[0]
@@ -1034,6 +1058,6 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
         converged=converged, status=status, u_all=X,
         values=F, n_iter=n_iter, decrement=decrement, at_bound=at_bound,
         hessian_u=H, cov_u=cov_u, cov_model=cov_model, sd=sd,
-        optima=_distinct_optima(ev, X, F, lo_side, hi_side), n_value_rows=ev.n_value_rows,
+        optima=_distinct_optima(ev, X, F, lo_side, hi_side, status), n_value_rows=ev.n_value_rows,
         n_grad_rows=ev.n_grad_rows, wall_time=time.perf_counter() - t0,
         _value_fn=_EagerValue(f, max_rows), _lo_side=lo_side, _hi_side=hi_side)

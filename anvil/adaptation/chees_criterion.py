@@ -53,8 +53,9 @@ def chees_gradient(
         q_prev = mx.where(include[:, None], q_prev, 0.0)
         q_prop = mx.where(include[:, None], q_prop, 0.0)
         accept_prob = mx.where(include, accept_prob, 0.0)
-        n = mx.maximum(mx.sum(include.astype(q_prev.dtype)), 1.0)
-        mu_prev = mx.sum(q_prev, axis=0) / n
+        n = mx.sum(include.astype(q_prev.dtype))
+        mu_prev = mx.where(n == q_prev.shape[0], mx.mean(q_prev, axis=0),
+                           mx.sum(q_prev, axis=0) / mx.maximum(n, 1.0))
     else:
         mu_prev = mx.mean(q_prev, axis=0)
     a_sum = mx.sum(accept_prob) + 1e-20

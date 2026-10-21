@@ -488,8 +488,11 @@ def nested_rhat(chain: np.ndarray, n_superchains: int) -> np.ndarray:
     super_mean = chain_mean.mean(axis=1)             # (K, dim)
     grand_mean = super_mean.mean(axis=0)             # (dim,)
 
-    b_hat = ((super_mean - grand_mean) ** 2).mean(axis=0)          # (dim,)
-    b_within = ((chain_mean - super_mean[:, None, :]) ** 2).mean(axis=1)
+    # Margossian et al. (2022), Definition 2.2: 1/(K-1) between superchains
+    # and 1/(M-1) between a superchain's chains (zero with one chain each)
+    b_hat = ((super_mean - grand_mean) ** 2).sum(axis=0) / max(k - 1, 1)   # (dim,)
+    b_within = (((chain_mean - super_mean[:, None, :]) ** 2).sum(axis=1) / (j - 1)
+                if j > 1 else np.zeros_like(super_mean))
     w_within = chain_var.mean(axis=1)
     w_hat = (b_within + w_within).mean(axis=0)                     # (dim,)
 

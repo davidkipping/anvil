@@ -73,11 +73,18 @@ than a whole SMC run.
 
 `smc` counts such stages, in `SMCResult.stalled`, and warns when there are
 any. A stage is flagged when it ends with some coordinate still correlated
-above 0.9 with the stage's start and fewer than 5% of its moves accepted. The acceptance test is what spares multimodal
+above 0.9 with the stage's start and fewer than 5% of its moves accepted.
+The acceptance test is what spares multimodal
 posteriors: a coordinate that tells modes apart stays correlated however
-well particles move within their modes. A thin parabolic ridge in the test
-suite reproduces the failure (0.16 nats low, flagged); a ridge four times
-wider does not (0.02, not flagged).
+well particles move within their modes. The flag detects the symptom, not
+the bias itself: on a thin parabolic ridge in the test suite (6 dimensions,
+2,048 particles) it fired in 6 or 7 of 13 stages on every one of 5 seeds,
+yet ln Z came out unbiased there (−0.01 ± 0.04 nats over the 5 seeds); a
+ridge four times wider was never flagged (−0.02 ± 0.03). On the oblate fit
+above, the same symptom came with a bias of 0.17–0.30. Both thresholds cut
+a continuous failure, so a run just on the other side of them is not much
+safer; `SMCResult.unsettled` counts the stages that used all their moves
+still correlated, whatever their acceptance.
 
 What to do with a warning:
 
@@ -105,7 +112,11 @@ by more than 0.5 nats, but groups that agree can all be too small.
 
 {func}`~anvil.bridge_evidence` takes posterior draws and returns ln Z by
 Meng and Wong's optimal bridge between them and a Student-t fitted to half
-the draws. The draws can be:
+the draws, then again with the halves swapped, and averages the two. The
+average was 15–25% more accurate than one fold on a Gaussian posterior,
+and its error bar adds the spread between the folds to the formula's
+(calibrated: rms of error / error bar 0.8–1.0 over 80 seeds, 500 to
+20,000 draws). The draws can be:
 
 - a {class}`~anvil.Results`, whose autocorrelation the error bar accounts
   for;

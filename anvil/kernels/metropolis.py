@@ -32,6 +32,12 @@ class RWMAdaptState:
 
 
 class RandomWalkMetropolis(Kernel):
+    """Adaptive random-walk Metropolis, ``u' = u + s * sigma * xi``: the
+    global scale ``s`` (starting at ``initial_scale``, 0.5) is tuned during
+    warmup toward 23.4% acceptance and the per-dimension ``sigma`` taken
+    from cross-chain moments; both freeze after warmup. The baseline the
+    other kernels are measured against; gradient-free."""
+
     needs_grad = False
 
     def __init__(self, target: LogDensity, initial_scale: float = 0.5):

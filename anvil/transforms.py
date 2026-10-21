@@ -205,8 +205,12 @@ class Transform:
     def to_model(self, u: mx.array) -> mx.array:
         """(n, dim) unbounded -> (n, dim) model space."""
         bounded = self._mid32 + self._half32 * mx.tanh(0.5 * u)
-        lower = self._lo32 + self._scale32 * mx.exp(u)
-        upper = self._hi32 - self._scale32 * mx.exp(-u)
+        # each exp sees u only in its own columns: exp(u) of a column it is
+        # not selected for overflows past |u| = 88.7, and the discarded inf
+        # still back-propagates as inf * 0 = NaN through mx.where, freezing
+        # every chain's step-size adaptation (bit-identical where selected)
+        lower = self._lo32 + self._scale32 * mx.exp(mx.where(self._m_lower, u, 0.0))
+        upper = self._hi32 - self._scale32 * mx.exp(-mx.where(self._m_upper, u, 0.0))
         free = self._loc32 + self._scale32 * u
         out = mx.where(self._m_bounded, bounded, free)
         out = mx.where(self._m_lower, lower, out)
@@ -362,7 +366,7 @@ class TransformedLogDensity(LogDensity):
         """Float64 constant that turns a stored log_prob into the absolute
         log posterior density: ``res.get_log_prob() + target.log_norm_const``
         = log L(v) + log p(v) + log|dv/du|. The priors' normalisers plus
-        ``model_log_norm``; meaningful only when :attr:`is_proper`."""
+        ``model_log_norm``; meaningful only when ``is_proper``."""
         return self.transform.log_prior_norm + self.model_log_norm
 
     @property

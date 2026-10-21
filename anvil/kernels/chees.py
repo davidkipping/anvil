@@ -16,7 +16,8 @@ scalars (eps, T) that determine L.
 Warmup adapts three things simultaneously from cross-chain statistics —
 step size (dual averaging on the harmonic-mean acceptance), trajectory
 length (ChEES criterion), and a diagonal preconditioner (EMA moments) —
-then all three freeze at their averaged iterates.
+then they freeze: step size and trajectory length at their averaged
+iterates, the preconditioner at its final estimate.
 """
 
 from __future__ import annotations
@@ -76,6 +77,32 @@ class ChEESAdaptState:
 
 
 class ChEESHMC(Kernel):
+    """ChEES-HMC (Hoffman & Sountsov 2021): every chain runs the same number
+    of leapfrog steps per iteration, so the whole ensemble is one batched
+    gradient call per step. Needs a gradient-capable target.
+
+    Adapted during warmup from cross-chain statistics, then frozen:
+
+    * ``step_size`` (default 0.1, the starting value) by dual averaging
+      toward ``target_accept`` (0.651) of harmonic-mean acceptance;
+    * ``traj_length`` (default 1.0, the starting value) by the ChEES
+      criterion, the leapfrog count per iteration being
+      ``ceil(h * T / eps)`` for a Halton jitter h, capped at
+      ``max_leapfrog`` (default 1000; lower it, to ~128, if a few
+      iterations take far longer than the rest);
+    * a diagonal preconditioner from EMA moments, used from iteration
+      ``precondition_after`` (50) on; ``dense=True`` adapts a full one
+      (factored as S R S, with ``ridge`` (1e-6) added to R, escalated 100x
+      up to twice if R is not positive definite) and falls back to the
+      diagonal with fewer than ``4 * dim`` chains or above 512 dimensions.
+
+    A proposal whose energy error exceeds ``divergence_threshold`` (1000)
+    is a divergence: rejected and counted in ``Results.extras``. Chains at
+    a non-finite log-density, at or below the failure floor of -1e29, or
+    with a non-finite gradient are left out of every adapted statistic, so
+    one failed chain cannot steer the rest.
+    """
+
     needs_grad = True
     self_compiled = True
 
@@ -168,6 +195,7 @@ class ChEESHMC(Kernel):
             "accepted": accept,
             "diverged": diverged,
             "q_prev": q0,
+            "lp_prev": lp0,
             "q_prop": q1,
             "v_end": inv_mass * p1,
         }
@@ -223,6 +251,7 @@ class ChEESHMC(Kernel):
             "accepted": accept,
             "diverged": diverged,
             "q_prev": q0,
+            "lp_prev": lp0,
             "q_prop": q1,
             "v_end": self._sigma_p(p1, s, R),
         }
@@ -232,6 +261,9 @@ class ChEESHMC(Kernel):
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
+        # a fresh run starts the Halton sequence afresh, so reusing a kernel
+        # object reproduces a run (resume restores it from the checkpoint)
+        self._iter = 0
         n_chains, dim = u0.shape
         if self.dense:
             # a cross-chain covariance needs comfortably more chains than
@@ -359,14 +391,22 @@ class ChEESHMC(Kernel):
         # the kernel's own state, on device, with no tuning -- a finite
         # straggler, however far behind, is never excluded.
         lp = state["log_prob"]
-        live = mx.isfinite(lp) & (lp > _FAILURE_FLOOR)
+        # a finite log-density with a non-finite gradient accepts nothing
+        # either (its dH is NaN), so it is dead for adaptation too
+        live = (mx.isfinite(lp) & (lp > _FAILURE_FLOOR)
+                & mx.all(mx.isfinite(state["grad"]), axis=-1))
+        # the trajectory gradient reads the PRE-step position as well: a
+        # chain rescued this iteration must not bring its old, far-away
+        # point into the centre
+        lp0 = info["lp_prev"]
+        live_traj = live & mx.isfinite(lp0) & (lp0 > _FAILURE_FLOOR)
         da = update_dual_averaging(
             a.da, harmonic_mean(info["accept_prob"], include=live), t,
             target=self.target_accept,
         )
         grad = chees_gradient(
             info["q_prev"], info["q_prop"], info["v_end"],
-            info["accept_prob"], self._last_h, include=live,
+            info["accept_prob"], self._last_h, include=live_traj,
         )
         chees = update_chees(
             a.chees, grad, t, mx.exp(da.log_eps),

@@ -12,8 +12,10 @@ mean of per-chain acceptance, target 0.651), a shared trajectory length
 The design keeps every chain's control flow identical: the
 trajectory-length jitter is a single per-iteration scalar from a Halton
 sequence, so all chains run the same number of leapfrog steps each
-iteration. On smooth targets this reaches ~60% ESS per draw with zero
-divergences.
+iteration. On a smooth target it reaches 0.60 bulk ESS per draw with zero
+divergences (measured: 10-D correlated Gaussian, ρ = 0.5, 1024 chains ×
+300 draws after 500 of warmup, two seeds; `tests/test_chees.py` asserts
+the weaker > 0.2).
 
 **Practical guidance:**
 
@@ -289,21 +291,22 @@ one thing everywhere.
 
 ## Measured performance
 
-Benchmark (M2 Max, 6-parameter transit over 10⁵ points, all runs
-converged; `benchmarks/bench_transit.py`):
+Benchmark (M2 Max, 6-parameter trapezoid transit over 10⁵ points; minimum
+bulk ESS per second of total wall time, warmup included;
+`benchmarks/bench_transit.py`):
 
-| sampler | min ESS | max R-hat | ESS/s |
-|---|---:|---:|---:|
-| stretch, 2048 walkers (GPU) | 48,952 | 1.033 | 612 |
-| ChEES-HMC, 1024 chains (GPU) | 80,313 | 1.009 | 100–330 |
-| emcee, 64 walkers (CPU, fp64 numpy) | 1,207 | 1.041 | 2–10 |
+| sampler | wall [s] | min ESS | max R-hat | ESS/s | vs emcee |
+|---|---:|---:|---:|---:|---:|
+| ensemble, stretch+DE (GPU, 128 walkers) | 36 | 123,917 | 1.001 | 3,469 | 215× |
+| ChEES-HMC, dense mass (GPU, 512 chains) | 75 | 90,156 | 1.003 | 1,203 | 75× |
+| emcee (CPU fp64 numpy, 64 walkers) | 336 | 5,427 | 1.014 | 16 | — |
 
-Sustained-GPU thermal throttling swings wall-clock ~2× on laptop-class
-hardware; the conservative cross-run claims are ≥60× (stretch) and ≥10×
-(ChEES-HMC) over emcee's best measurement. The trapezoid's kinks are
-near ChEES-HMC's worst case; on smooth models the ranking flips — and
-see the correlation/curvature discussion above for *why* the
-gradient-free move competes at all here.
+Sustained-GPU throughput swings ~2× with thermal state, and emcee's own
+ESS/s varies several-fold across repeats, so treat the ratios as
+order-of-magnitude. The trapezoid's kinks are near ChEES-HMC's worst
+case; on smooth models the ranking flips — and see the
+correlation/curvature discussion above for *why* the gradient-free move
+competes at all here.
 
 ## How much warmup do you need?
 
@@ -344,8 +347,8 @@ at this:
   this: spread frozen at the initialization ball, acceptance 0.98, step
   size 7×10⁻⁶.
 
-Verdicts are `OK`, `LONGER THAN NEEDED`, `TOO SHORT`, `INCONCLUSIVE` and
-`FAILED`. Pass `warmup_probes=0` to skip the recording entirely.
+Verdicts are `OK`, `LONGER THAN NEEDED`, `TOO SHORT`, `INCONCLUSIVE`,
+`LOST CHAINS` and `FAILED`. Pass `warmup_probes=0` to skip the recording entirely.
 
 Note what this deliberately is *not*: automatic warmup termination. Given
 that a stalled run is indistinguishable from a converged one on spread
@@ -395,7 +398,7 @@ with the same frozen adaptation:
 
 ```python
 res1 = anvil.run(kernel, target, u0, n_warmup=400, n_samples=200, seed=1)
-if anvil.diagnose(res1.get_chain()).min_ess < 400:
+if anvil.diagnose(res1.get_chain()).ess_bulk.min() < 400:
     res2 = anvil.run(kernel, target, resume=res1, n_samples=400)
     draws = np.concatenate([res1.get_chain(), res2.get_chain()])
 ```

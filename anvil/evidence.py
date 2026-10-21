@@ -65,6 +65,11 @@ _GROUP_SPREAD_WARN = 0.5
 #: their modes, which the acceptance rate tells apart
 _STALL_RHO = 0.9
 _STALL_ACCEPT = 0.05
+#: max_rows=None: first block size, and the per-block time under which it
+#: doubles (a block of seconds is what macOS kills as "Impacting
+#: Interactivity"; doubling from under 0.1 s stays far from that)
+_BLOCK0 = 1024
+_BLOCK_FAST = 0.1
 #: log L at or below this is a failed evaluation, as for the samplers
 #: (``kernels.chees``, ``diagnostics.lost_chains``): weight 0 at any beta
 _FAILURE_FLOOR = -1e29
@@ -153,7 +158,12 @@ class SMCResult:
     ``stalled`` counts the stages that ended with some coordinate still
     correlated above 0.9 with the stage's start and fewer than 5% of moves
     accepted: particles that stopped exploring, which
-    biases ln Z low.
+    biases ln Z low. Both thresholds cut a continuous failure, so a run just
+    on the other side of them is not much safer. ``unsettled`` counts the
+    stages that used all of ``max_moves`` with a coordinate still correlated
+    above 0.9, whatever their acceptance: the same symptom without the low
+    acceptance, which is also what a coordinate that tells modes apart
+    shows, so it is reported but not warned about.
 
     ``u`` holds the final particles in sampling space, equal-weight
     posterior draws, ``(n_particles, dim)``; ``model`` and ``physical`` the
@@ -182,6 +192,7 @@ class SMCResult:
     precision: dict | None = None
     stalled: int = 0
     ancestors: np.ndarray | None = None
+    unsettled: int = 0
 
     @property
     def n_stages(self) -> int:
@@ -198,6 +209,10 @@ class SMCResult:
         if self.stalled:
             lines.append(f"  {self.stalled} of {self.n_stages} stages ended without "
                          f"the particles decorrelating: ln Z is likely low")
+        elif self.unsettled:
+            lines.append(f"  {self.unsettled} of {self.n_stages} stages used every move "
+                         f"with a coordinate still correlated above 0.9, though with "
+                         f"moves still being accepted (mode labels do this)")
         lines.append(f"  {self.u.shape[0]} particles, {self.n_stages} stages, "
                      f"{sum(self.moves)} moves, {self.n_evals:,} likelihood "
                      f"evaluations, {self.wall_time:.1f} s")
@@ -215,8 +230,10 @@ class _Sweep:
     group, never another group's, so the groups stay independent. Proposals
     are evaluated in blocks of at most ``max_rows`` rows, each its own GPU
     command: one command over thousands of expensive light curves ran long
-    enough for macOS to kill it ("Impacting Interactivity"). ``beta`` is an
-    argument throughout, so nothing is retraced as it changes."""
+    enough for macOS to kill it ("Impacting Interactivity"); with
+    ``max_rows=None`` the block grows from 1024 while blocks stay fast.
+    ``beta`` is an argument throughout, so nothing is retraced as it
+    changes."""
 
     def __init__(self, target, G, K, d, a, max_rows, compile_step):
         self.G, self.K, self.d = G, K, d
@@ -225,38 +242,56 @@ class _Sweep:
         self.evaluate = CompiledOrEager(lambda u: _split(target, u),
                                         name="the SMC likelihood",
                                         enabled=compile_step)
-        self.block = int(max_rows)
+        # max_rows=None: start at _BLOCK0 and double while every block of a
+        # call finishes inside _BLOCK_FAST seconds, so a cheap likelihood is
+        # not split into many small commands; a given max_rows is fixed
+        self.auto = max_rows is None
+        self.block = _BLOCK0 if self.auto else int(max_rows)
+
+        def propose(move):
+            def f(keys, S, C):
+                out = [move.propose(keys[g], S[g], C[g]) for g in range(G)]
+                return mx.stack([o[0] for o in out]), mx.stack([o[1] for o in out])
+            return CompiledOrEager(f, name="the SMC proposal", enabled=compile_step)
+        self.propose = {False: propose(self.stretch), True: propose(self.de)}
+
+        def accept(key, log_q, beta, ll_y, r_y, LLs, Rs, Y, S):
+            log_ratio = log_q + beta * ll_y + r_y - (beta * LLs + Rs)
+            ok = ((mx.log(mx.random.uniform(shape=LLs.shape, key=key)) < log_ratio)
+                  & mx.all(mx.isfinite(Y), axis=-1) & mx.isfinite(ll_y))
+            return (mx.where(ok[..., None], Y, S), mx.where(ok, ll_y, LLs),
+                    mx.where(ok, r_y, Rs), ok)
+        self.accept = CompiledOrEager(accept, name="the SMC acceptance",
+                                      enabled=compile_step)
 
     def values(self, u: mx.array):
         """(log L, rest) at every row of u, block by block."""
         n = u.shape[0]
         b = min(self.block, n)
         lls, rs = [], []
+        slowest = 0.0
         for s in range(0, n, b):
             ub = u[s:s + b]
             m = ub.shape[0]
             if m < b:       # one block shape, so one compiled trace
                 ub = mx.concatenate([ub, mx.repeat(ub[:1], b - m, axis=0)], axis=0)
+            t0 = time.perf_counter()
             ll, r = self.evaluate(ub)
             mx.eval(ll, r)
+            slowest = max(slowest, time.perf_counter() - t0)
             lls.append(ll[:m])
             rs.append(r[:m])
+        if self.auto and b == self.block and self.block < n and slowest < _BLOCK_FAST:
+            self.block *= 2
         return mx.concatenate(lls), mx.concatenate(rs)
 
     def _half(self, key, S, LLs, Rs, C, beta, de):
         G, K, d = self.G, self.K, self.d
-        move = self.de if de else self.stretch
         ks = mx.random.split(key, G + 1)
-        props = [move.propose(ks[g], S[g], C[g]) for g in range(G)]
-        Y = mx.stack([p[0] for p in props])
-        log_q = mx.stack([p[1] for p in props])
+        Y, log_q = self.propose[de](ks[:G], S, C)
         ll_y, r_y = self.values(Y.reshape(G * K, d))
-        ll_y, r_y = ll_y.reshape(G, K), r_y.reshape(G, K)
-        log_ratio = log_q + beta * ll_y + r_y - (beta * LLs + Rs)
-        ok = ((mx.log(mx.random.uniform(shape=(G, K), key=ks[G])) < log_ratio)
-              & mx.all(mx.isfinite(Y), axis=-1) & mx.isfinite(ll_y))
-        out = (mx.where(ok[..., None], Y, S), mx.where(ok, ll_y, LLs),
-               mx.where(ok, r_y, Rs), ok)
+        out = self.accept(ks[G], log_q, beta, ll_y.reshape(G, K), r_y.reshape(G, K),
+                          LLs, Rs, Y, S)
         mx.eval(*out)
         return out
 
@@ -329,7 +364,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         n_groups: int = 1, ess: float = 0.5, decorrelation: float | None = 0.1,
         de_fraction: float = 0.5, accepts_per_stage: float = 10.0,
         min_moves: int = 8, max_moves: int = 200, max_stages: int = 1000,
-        n_probe: int = 32, max_rows: int = 1024,
+        n_probe: int = 32, max_rows: int | None = None,
         seed: int = 0, compile_step: bool = True, progress: bool = False,
         callback=None) -> SMCResult:
     """Evidence and posterior draws by tempered sequential Monte Carlo.
@@ -367,7 +402,10 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     than 0.5 nats, but agreement does not prove they are large enough.
 
     Needs a proper prior. Uses only log-likelihood values, no gradients.
-    Proposals are evaluated in blocks of ``max_rows`` rows.
+    Proposals are evaluated in blocks of ``max_rows`` rows; the default,
+    None, starts at 1024 and doubles while each block takes under 0.1 s,
+    which only changes how the work is batched. Give a number to fix it --
+    for a likelihood so expensive that one block of 1024 runs for seconds.
     ``n_probe`` posterior draws are re-evaluated on the float64 path, when
     the target has one, to report float32's error in log L.
     ``progress``/``callback`` as in :func:`anvil.run`; the callback gets
@@ -401,7 +439,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     log_z = np.zeros(G)
     anc = np.arange(n_particles).reshape(G, n_g)
     betas, moves, accepts, decorr = [], [], [], []
-    stalled = 0
+    stalled, unsettled, stalled_moves = 0, 0, []
     n_evals = n_particles
     acc_prev = 0.25
     it = 0
@@ -456,6 +494,9 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         acc_prev = float(np.array(acc_sum).mean()) / M
         if decorr[-1] > _STALL_RHO and acc_prev < _STALL_ACCEPT:
             stalled += 1
+            stalled_moves.append(M)
+        if M >= max_moves and decorr[-1] > _STALL_RHO:
+            unsettled += 1
         moves.append(M)
         accepts.append(acc_prev)
         n_evals += n_particles * M
@@ -475,8 +516,9 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     if stalled:
         warnings.warn(
             f"in {stalled} of {len(moves)} SMC stages the particles were still "
-            f"correlated with the stage's start after {max_moves} moves: they "
-            f"stopped exploring, and ln Z is likely biased low",
+            f"correlated with the stage's start after up to {max(stalled_moves)} "
+            f"moves, with under {_STALL_ACCEPT:.0%} accepted: they stopped "
+            f"exploring, and ln Z is likely biased low",
             RuntimeWarning, stacklevel=2)
     z = np.exp(log_z - log_z.max())
     se = float(z.std(ddof=1) / z.mean() / math.sqrt(G)) if G > 1 else math.nan
@@ -507,7 +549,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         physical=tr.to_physical(model), log_likelihood=LL, betas=betas,
         moves=moves, accept=accepts, decorrelation=decorr, n_evals=n_evals,
         wall_time=time.perf_counter() - t0, precision=precision,
-        stalled=stalled, ancestors=anc.reshape(-1))
+        stalled=stalled, unsettled=unsettled, ancestors=anc.reshape(-1))
 
 
 # -- the cheap tier ------------------------------------------------------------
@@ -576,10 +618,11 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     :class:`~anvil.Results`, whose autocorrelation the standard error then
     accounts for. SMC particles that share an ancestor are kept together
     (all in the fitted half or all in the bridged half) and counted as one
-    cluster in the standard error. A Student-t proposal (``nu`` degrees of freedom) is
-    fitted to a random half; the bridge uses the other half and
-    ``n_proposal`` proposal draws (default: as many). One batched
-    evaluation of the target; the iteration runs on the host.
+    cluster in the standard error. A Student-t proposal (``nu`` degrees of
+    freedom) is fitted to a random half and the bridge uses the other half
+    and ``n_proposal`` proposal draws (default: as many); then the halves
+    swap, and ln Z is the mean of the two (``details["log_z_folds"]``).
+    Batched evaluations of the target; the iteration runs on the host.
 
     The answer is only as good as the draws' mode weights: on a multimodal
     posterior, draws from MCMC chains that did not mix between modes give a
@@ -595,84 +638,98 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     t0 = time.perf_counter()
     a, families = _draws_of(draws)
     rng = np.random.default_rng(seed)
-    fam_use = None
+    d = a.shape[-1]
     if a.ndim == 3:
         # chains: fit on every other chain, bridge on the rest, so each
         # bridged chain keeps the time order its autocorrelation needs
         if a.shape[1] < 2:
             raise ValueError("bridge_evidence needs at least two chains")
-        fit = a[:, 0::2].reshape(-1, a.shape[-1])
-        use_chains = a[:, 1::2]
-        layout = use_chains.shape[:2]
-        use = use_chains.reshape(-1, a.shape[-1])
+        halves = [(a[:, 0::2], None), (a[:, 1::2], None)]
     elif families is not None:
         # whole families to one side, so the proposal is not fitted to the
         # ancestors it is then tested against
         ids = np.unique(families)
-        to_fit = np.isin(families, rng.permutation(ids)[: ids.size // 2])
-        fit, use = a[to_fit], a[~to_fit]
-        fam_use = families[~to_fit]
-        layout = None
+        side = np.isin(families, rng.permutation(ids)[: ids.size // 2])
+        halves = [(a[side], families[side]), (a[~side], families[~side])]
     else:
         perm = rng.permutation(a.shape[0])
-        fit, use = a[perm[: a.shape[0] // 2]], a[perm[a.shape[0] // 2:]]
-        layout = None
-    d = a.shape[-1]
-    cov = np.cov(fit.T).reshape(d, d)
-    L = np.linalg.cholesky(cov + 1e-12 * np.trace(cov) / d * np.eye(d))
-    logq, sample = _mvt(fit.mean(axis=0), L, float(nu))
-    n2 = int(n_proposal or use.shape[0])
-    prop = sample(n2, rng)
+        k = a.shape[0] // 2
+        halves = [(a[perm[:k]], None), (a[perm[k:]], None)]
 
     ev = _Evaluator(target.log_prob, compile_step=True, max_rows=max_rows)
     c = target.log_norm_const
-    l1 = ev.value(use) + c - logq(use)          # log p/q at posterior draws
-    l2 = ev.value(prop) + c - logq(prop)        # log p/q at proposal draws
-    n1 = use.shape[0]
-    s1, s2 = n1 / (n1 + n2), n2 / (n1 + n2)
-    ls1, ls2 = math.log(s1), math.log(s2)
 
-    lr = float(np.median(l1[np.isfinite(l1)]))
-    for _ in range(10_000):
-        num = _logsumexp(l2 - np.logaddexp(ls1 + l2, ls2 + lr)) - math.log(n2)
-        den = _logsumexp(-np.logaddexp(ls1 + l1, ls2 + lr)) - math.log(n1)
-        new = num - den
-        done = abs(new - lr) < 1e-12
-        lr = new
-        if done:
-            break
+    def fold(fit, use, fam_use):
+        """One bridge: Student-t fitted to ``fit``, bridged with ``use``."""
+        layout = use.shape[:2] if use.ndim == 3 else None
+        fit = fit.reshape(-1, d)
+        use = use.reshape(-1, d)
+        cov = np.cov(fit.T).reshape(d, d)
+        L = np.linalg.cholesky(cov + 1e-12 * np.trace(cov) / d * np.eye(d))
+        logq, sample = _mvt(fit.mean(axis=0), L, float(nu))
+        n2 = int(n_proposal or use.shape[0])
+        prop = sample(n2, rng)
+        l1 = ev.value(use) + c - logq(use)          # log p/q at posterior draws
+        l2 = ev.value(prop) + c - logq(prop)        # log p/q at proposal draws
+        n1 = use.shape[0]
+        s1, s2 = n1 / (n1 + n2), n2 / (n1 + n2)
+        ls1, ls2 = math.log(s1), math.log(s2)
 
-    # relative-MSE estimate (Fruhwirth-Schnatter 2004), with the posterior
-    # side's variance inflated by its integrated autocorrelation
-    # in logs: with poor overlap most terms underflow, and var/mean^2 then
-    # reads 0/0 in linear space
-    lf1 = l2 - np.logaddexp(ls1 + l2, ls2 + lr)                 # at proposal draws
-    lf2 = -np.logaddexp(ls1 + l1, ls2 + lr)                     # at posterior draws
+        lr = float(np.median(l1[np.isfinite(l1)]))
+        for _ in range(10_000):
+            num = _logsumexp(l2 - np.logaddexp(ls1 + l2, ls2 + lr)) - math.log(n2)
+            den = _logsumexp(-np.logaddexp(ls1 + l1, ls2 + lr)) - math.log(n1)
+            new = num - den
+            done = abs(new - lr) < 1e-12
+            lr = new
+            if done:
+                break
 
-    def rel_var(lf):
-        # var(f) / mean(f)^2 = mean(f^2) / mean(f)^2 - 1
-        k = lf.size
-        return max(math.exp(_logsumexp(2 * lf) - math.log(k) - 2 * (_logsumexp(lf) - math.log(k))) - 1.0, 0.0)
+        # relative-MSE estimate (Fruhwirth-Schnatter 2004), with the
+        # posterior side's variance inflated by its integrated
+        # autocorrelation; in logs: with poor overlap most terms underflow,
+        # and var/mean^2 then reads 0/0 in linear space
+        lf1 = l2 - np.logaddexp(ls1 + l2, ls2 + lr)                 # at proposal draws
+        lf2 = -np.logaddexp(ls1 + l1, ls2 + lr)                     # at posterior draws
 
-    tau = 1.0
-    if layout is not None:
-        series = np.exp(lf2 - lf2.max()).reshape(layout)
-        ess = float(_ess_batched(series[..., None])[0])
-        if np.isfinite(ess):
-            tau = max(1.0, series.size / max(ess, 1.0))
-    elif fam_use is not None:
-        # cluster-robust variance of the mean over families, against the
-        # independent-draws one: the design effect of shared ancestry
-        f = np.exp(lf2 - lf2.max())
-        dev = f - f.mean()
-        _, inv = np.unique(fam_use, return_inverse=True)
-        clustered = float((np.bincount(inv, weights=dev) ** 2).sum())
-        iid = float((dev * dev).sum())
-        if iid > 0:
-            tau = max(1.0, clustered / iid)
-    re2 = rel_var(lf1) / n2 + tau * rel_var(lf2) / n1
-    w = np.exp(l2 - l2.max())
-    prop_ess = float(w.sum() ** 2 / (w * w).sum())
+        def rel_var(lf):
+            # var(f) / mean(f)^2 = mean(f^2) / mean(f)^2 - 1
+            k = lf.size
+            return max(math.exp(_logsumexp(2 * lf) - math.log(k)
+                                - 2 * (_logsumexp(lf) - math.log(k))) - 1.0, 0.0)
+
+        tau = 1.0
+        if layout is not None:
+            series = np.exp(lf2 - lf2.max()).reshape(layout)
+            ess = float(_ess_batched(series[..., None])[0])
+            if np.isfinite(ess):
+                tau = max(1.0, series.size / max(ess, 1.0))
+        elif fam_use is not None:
+            # cluster-robust variance of the mean over families, against the
+            # independent-draws one: the design effect of shared ancestry
+            f = np.exp(lf2 - lf2.max())
+            dev = f - f.mean()
+            _, inv = np.unique(fam_use, return_inverse=True)
+            clustered = float((np.bincount(inv, weights=dev) ** 2).sum())
+            iid = float((dev * dev).sum())
+            if iid > 0:
+                tau = max(1.0, clustered / iid)
+        re2 = rel_var(lf1) / n2 + tau * rel_var(lf2) / n1
+        w = np.exp(l2 - l2.max())
+        return lr, re2, float(w.sum() ** 2 / (w * w).sum()), tau, n1, n2
+
+    # both ways round, averaged: every draw is used on each side once,
+    # which cut the error 15-25% on a Gaussian posterior (80 seeds, 500 to
+    # 20,000 draws). The two halves share their draws, so the folds are not
+    # independent: the error bar adds their spread to the independent one,
+    # which measured rms z 0.8-1.0 where the independent one alone read 1.24
+    (A, fa), (B, fb) = halves
+    r1 = fold(A, B, fb)
+    r2 = fold(B, A, fa)
+    lr = 0.5 * (r1[0] + r2[0])
+    re2 = 0.25 * (r1[1] + r2[1]) + (0.5 * (r1[0] - r2[0])) ** 2
+    prop_ess, n2 = min(r1[2], r2[2]), r1[5]
+    tau, n1 = max(r1[3], r2[3]), r1[4] + r2[4]
     if prop_ess < _BRIDGE_MIN_ESS * n2:
         warnings.warn(
             f"bridge sampling: the Student-t proposal overlaps the posterior "
@@ -683,7 +740,8 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
         log_z=float(lr), log_z_se=float(math.sqrt(re2)), method="bridge",
         details={"proposal_ess": prop_ess,
                  "n_posterior": int(n1), "n_proposal": n2, "nu": float(nu),
-                 "tau": float(tau)},
+                 "tau": float(tau), "log_z_folds": (float(r1[0]), float(r2[0])),
+                 "se_folds": (math.sqrt(r1[1]), math.sqrt(r2[1]))},
         wall_time=time.perf_counter() - t0)
 
 

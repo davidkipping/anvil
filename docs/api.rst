@@ -38,6 +38,9 @@ Kernels
 .. automodule:: anvil.kernels.metropolis
    :members: RandomWalkMetropolis
 
+.. automodule:: anvil.kernels.base
+   :members: Kernel
+
 Log densities and transforms
 ----------------------------
 
