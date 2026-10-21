@@ -23,7 +23,7 @@ from .precision import (Certificate, PrecisionPolicy, certify,
                         validate_precision)
 from .transforms import ParamSpec, Transform, TransformedLogDensity
 
-__version__ = "0.10.2"
+__version__ = "0.11.0"
 
 __all__ = [
     "ChEESHMC",

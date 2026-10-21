@@ -18,7 +18,8 @@ import numpy as np
 @dataclass
 class MomentsState:
     m1: mx.array  # (dim,) EMA of cross-chain mean
-    m2: mx.array  # (dim,) EMA of cross-chain second moment
+    m2: mx.array  # (dim,) EMA of the cross-chain variance about each
+    #                iteration's own mean (centred: see update_moments)
 
 
 def init_moments(dim: int) -> MomentsState:
@@ -30,35 +31,46 @@ def update_moments(ms: MomentsState, u: mx.array, t: int,
     """EMA update from the current (n_chains, dim) positions; ``t`` is the
     1-based warmup iteration. ``include`` (n_chains,) bool leaves chains out
     -- a dead chain far from the bulk would otherwise set the scale; with
-    none included the moments are left as they were."""
+    none included the moments are left as they were.
+
+    The variance is accumulated about each iteration's own cross-chain
+    mean, not as E[u^2] - E[u]^2: in float32 that difference cancels for a
+    narrow posterior away from u = 0 (before 0.11.0 the scale came out 10x
+    small at u = 3 with sd 1e-3, and 3x large at u = 1 with sd 3e-4)."""
     beta = t / (t + 8.0)
     if include is None:
         mean = mx.mean(u, axis=0)
-        sq = mx.mean(u * u, axis=0)
+        d = u - mean
+        var = mx.mean(d * d, axis=0)
         return MomentsState(
             m1=beta * ms.m1 + (1.0 - beta) * mean,
-            m2=beta * ms.m2 + (1.0 - beta) * sq,
+            m2=beta * ms.m2 + (1.0 - beta) * var,
         )
     w = include.astype(u.dtype)[:, None]
-    uz = mx.where(include[:, None], u, 0.0)
     n = mx.sum(w)
+    nz = mx.maximum(n, 1.0)
     # every chain included: the unmasked mean exactly, so a healthy run is
     # bit-identical to one without the mask (sum/n is not, unless n is a
     # power of two)
     full = n == u.shape[0]
-    mean = mx.where(full, mx.mean(u, axis=0), mx.sum(uz, axis=0) / mx.maximum(n, 1.0))
-    sq = mx.where(full, mx.mean(u * u, axis=0), mx.sum(uz * uz, axis=0) / mx.maximum(n, 1.0))
+    mean = mx.where(full, mx.mean(u, axis=0),
+                    mx.sum(mx.where(include[:, None], u, 0.0), axis=0) / nz)
+    d = u - mean
+    dz = mx.where(include[:, None], d, 0.0)
+    var = mx.where(full, mx.mean(d * d, axis=0), mx.sum(dz * dz, axis=0) / nz)
     any_ = n > 0
     return MomentsState(
         m1=mx.where(any_, beta * ms.m1 + (1.0 - beta) * mean, ms.m1),
-        m2=mx.where(any_, beta * ms.m2 + (1.0 - beta) * sq, ms.m2),
+        m2=mx.where(any_, beta * ms.m2 + (1.0 - beta) * var, ms.m2),
     )
 
 
-def stddev(ms: MomentsState, reg: float = 1e-8) -> mx.array:
-    """Per-dimension posterior scale estimate."""
-    var = mx.maximum(ms.m2 - ms.m1 * ms.m1, reg)
-    return mx.sqrt(var)
+def stddev(ms: MomentsState, reg: float = 1e-30) -> mx.array:
+    """Per-dimension posterior scale estimate. ``reg`` only keeps a
+    coordinate with no spread at all from a zero scale; before 0.11.0 it
+    was 1e-8 (a floor of 1e-4 in u), which made every parameter narrower
+    than that in u read as 1e-4 and shrank the shared step size for all."""
+    return mx.sqrt(mx.maximum(ms.m2, reg))
 
 
 # --- dense (full-covariance) preconditioning --------------------------------

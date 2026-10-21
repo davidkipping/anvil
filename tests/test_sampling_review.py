@@ -118,3 +118,30 @@ def test_fixed_point_reduction_keeps_failures_and_large_terms():
     assert out[0] == pytest.approx(-50.0)
     assert np.isnan(out[1]) and out[2] == -np.inf
     assert out[3] == pytest.approx(-1e5 - 49.5, rel=1e-6)
+
+
+# -- 0.11.0: the diagonal preconditioner's moments -------------------------------
+
+@pytest.mark.parametrize("mu,sd", [(3.0, 1e-3), (1.0, 3e-4), (10.0, 1e-3), (0.0, 3e-5)])
+def test_preconditioner_scale_survives_float32_cancellation_and_has_no_floor(mu, sd):
+    # E[u^2] - E[u]^2 in float32 read 10x small at u = 3 (sd 1e-3), 3x large
+    # at u = 1 (sd 3e-4); and a floor of 1e-4 in u made sd 3e-5 read 1e-4
+    from anvil.adaptation.moments import stddev
+    rng = np.random.default_rng(0)
+    ms = init_moments(1)
+    for t in range(1, 301):
+        u = mx.array((mu + sd * rng.standard_normal((1024, 1))).astype(np.float32))
+        ms = update_moments(ms, u, t)
+    assert float(stddev(ms).item()) == pytest.approx(sd, rel=0.05)
+
+
+def test_a_tight_parameter_no_longer_shrinks_everyone_s_step():
+    # sd 3e-5 in one coordinate used to be floored at 1e-4, and the step size
+    # then fell from ~1.0 to ~0.4 for every coordinate
+    sd = mx.array(np.array([3e-5, 1, 1, 1], np.float32))
+    t = anvil.FunctionLogDensity(lambda u: -0.5 * mx.sum((u / sd) ** 2, axis=-1), 4)
+    u0 = mx.array((np.random.default_rng(0).standard_normal((128, 4)) * np.array([3e-5, 1, 1, 1])).astype(np.float32))
+    r = anvil.run(C.ChEESHMC(t), t, u0, n_warmup=400, n_samples=100, seed=0)
+    sigma = np.sqrt(np.array(r.final_params["inv_mass"]))
+    assert sigma[0] == pytest.approx(3e-5, rel=0.1)
+    assert float(r.final_params["step_size"].item()) > 0.7

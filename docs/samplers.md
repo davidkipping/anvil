@@ -7,7 +7,10 @@ GPU-native HMC. Three quantities adapt simultaneously during warmup from
 *cross-chain* statistics — a step size (dual averaging on the harmonic
 mean of per-chain acceptance, target 0.651), a shared trajectory length
 (stochastic ascent on the ChEES criterion), and a diagonal preconditioner
-(EMA of cross-chain moments) — then all freeze for the recorded phase.
+(an EMA of the cross-chain mean and of the variance about each iteration's
+own mean; the variance is accumulated centred because `E[u²] − E[u]²` in
+float32 loses a narrow posterior that sits away from u = 0) — then all
+freeze for the recorded phase.
 
 The design keeps every chain's control flow identical: the
 trajectory-length jitter is a single per-iteration scalar from a Halton
