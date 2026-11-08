@@ -22,7 +22,8 @@ the user's log_prob (model space) as MLX ops.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Callable
 
 import mlx.core as mx
 import numpy as np
@@ -82,6 +83,9 @@ class Transform:
         self.specs = specs
         self.dim = len(specs)
         self.names = [s.name for s in specs]
+        dup = sorted({n for n in self.names if self.names.count(n) > 1})
+        if dup:
+            raise ValueError(f"duplicate parameter names: {dup}")
 
         lo = np.array([s.lo for s in specs])
         hi = np.array([s.hi for s in specs])
@@ -332,6 +336,23 @@ class TransformedLogDensity(LogDensity):
         #: a ChunkedGaussianLogLike's log_offset_const + log_norm_const)
         self.model_log_norm = float(model_log_norm)
 
+    @property
+    def names(self) -> list[str]:
+        """The parameter names, ``transform.names``."""
+        return self.transform.names
+
+    @property
+    def model_log_prob(self) -> Callable[[mx.array], mx.array]:
+        """The model-space function this target wraps -- the likelihood plus
+        any prior written into it, ``(n, dim) -> (n,)``, without the
+        Jacobian or the declared priors. What :func:`joint` sums."""
+        return self._fn
+
+    @property
+    def model_log_prob_hi(self) -> Callable[[mx.array], mx.array] | None:
+        """Its float64 twin, or None."""
+        return self._fn_hi
+
     def log_prob(self, u: mx.array) -> mx.array:
         v = self.transform.to_model(u)
         lp = self._fn(v) + self.transform.log_det_jac(u)
@@ -401,3 +422,115 @@ class TransformedLogDensity(LogDensity):
                 out = out + mx.array(self.transform.log_prior_np(v_np),
                                      dtype=mx.float64)
             return out
+
+
+# -- several targets, one parameter vector --------------------------------------
+
+class JointLogDensity(TransformedLogDensity):
+    """A :class:`TransformedLogDensity` over several members' model-space
+    functions, built by :func:`joint`. ``members`` maps a member's name to
+    its target; ``member_columns(name)`` gives the joint columns that
+    member reads, in its own parameter order, so a joint start can be
+    assembled and a joint draw split by indexing."""
+
+    def __init__(self, members, columns, shared, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.members = dict(members)
+        self._columns = {k: np.asarray(c, dtype=np.int64) for k, c in columns.items()}
+        #: for every shared parameter, joint name to ``{member: its name there}``
+        self.shared: dict[str, dict[str, str]] = shared
+
+    def member_columns(self, name: str) -> np.ndarray:
+        return self._columns[name].copy()
+
+
+def joint(members: dict[str, TransformedLogDensity],
+          shared: dict | None = None) -> JointLogDensity:
+    """One target over several :class:`TransformedLogDensity` members that
+    share some parameters: a joint fit of several datasets, instruments or
+    epochs with common physics, whatever each member's likelihood is.
+
+    ``members`` maps a name to a member. ``shared`` maps each shared
+    parameter's joint name to the members that carry it: a sequence of
+    member names when they all call it by the joint name, or a dict
+    ``{member: its_name}`` when they do not. Every other parameter is
+    unshared and appears in the joint vector as ``"<member>.<name>"``.
+    The joint columns are the shared parameters in ``shared``'s order,
+    then each member's unshared ones in member order.
+
+    The members' *model-space* functions are summed, each reading its own
+    columns, and the joint :class:`Transform` applies one Jacobian and one
+    set of declared priors; summing the members' ``log_prob`` would count a
+    shared parameter's Jacobian and prior once per member. The members'
+    ``ParamSpec``s for a shared parameter must agree in everything but the
+    name: two models disagreeing about one quantity's bounds or prior is a
+    modelling decision to settle at the source. ``model_log_norm`` is the
+    members' sum; the float64 path exists when every member has one;
+    gradients are supported when every member supports them. A member's
+    failed evaluation (at or below -1e29) keeps that meaning in the sum.
+
+    The result is an ordinary :class:`TransformedLogDensity`, so
+    :func:`anvil.run`, :func:`anvil.optimize`, :func:`anvil.smc` and the
+    precision tools take it unchanged.
+    """
+    if not members:
+        raise ValueError("joint() needs at least one member")
+    for k, m in members.items():
+        if not isinstance(m, TransformedLogDensity):
+            raise TypeError(f"member {k!r} is not a TransformedLogDensity")
+    shared = dict(shared or {})
+    norm_shared: dict[str, dict[str, str]] = {}
+    for jname, who in shared.items():
+        norm_shared[jname] = dict(who) if isinstance(who, dict) else {m: jname for m in who}
+        for m, pname in norm_shared[jname].items():
+            if m not in members:
+                raise ValueError(f"shared {jname!r}: no member named {m!r}")
+            if pname not in members[m].transform.names:
+                raise ValueError(f"shared {jname!r}: member {m!r} has no parameter {pname!r}")
+
+    def spec_of(m, pname):
+        tr = members[m].transform
+        return tr.specs[tr.names.index(pname)]
+
+    specs: list[ParamSpec] = []
+    col: dict[tuple[str, str], int] = {}          # (member, its name) -> joint column
+    for jname, who in norm_shared.items():
+        ref_m, ref_p = next(iter(who.items()))
+        ref = replace(spec_of(ref_m, ref_p), name=jname)
+        for m, pname in who.items():
+            cand = replace(spec_of(m, pname), name=jname)
+            if cand != ref:
+                raise ValueError(
+                    f"shared {jname!r}: member {m!r} declares {pname!r} as {cand}, "
+                    f"member {ref_m!r} declares {ref_p!r} as {ref}; they must agree")
+            col[(m, pname)] = len(specs)
+        specs.append(ref)
+    for m, t in members.items():
+        for s in t.transform.specs:
+            if (m, s.name) not in col:
+                col[(m, s.name)] = len(specs)
+                specs.append(replace(s, name=f"{m}.{s.name}"))
+    columns = {m: [col[(m, s.name)] for s in t.transform.specs] for m, t in members.items()}
+    idx = {m: mx.array(np.asarray(c, dtype=np.int32)) for m, c in columns.items()}
+
+    def fn(v):
+        out = None
+        for m, t in members.items():
+            part = t.model_log_prob(mx.take(v, idx[m], axis=1))
+            out = part if out is None else out + part
+        return out
+
+    fn_hi = None
+    if all(t.has_hi for t in members.values()):
+        def fn_hi(v):
+            out = None
+            for m, t in members.items():
+                part = t.model_log_prob_hi(mx.take(v, idx[m], axis=1))
+                out = part if out is None else out + part
+            return out
+
+    return JointLogDensity(
+        members, columns, norm_shared, fn, Transform(specs),
+        supports_grad=all(t.supports_grad for t in members.values()),
+        model_log_prob_hi=fn_hi,
+        model_log_norm=sum(t.model_log_norm for t in members.values()))

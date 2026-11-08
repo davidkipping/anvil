@@ -361,14 +361,14 @@ def _as_resume_state(obj) -> ResumeState:
 def run(
     kernel: Kernel,
     target: LogDensity,
-    u0: mx.array | None = None,
+    u0=None,
     *,
     n_warmup: int | None = None,
     n_samples: int = 1000,
     thin: int = 1,
     seed: int | None = None,
     storage: MemoryBackend | None = None,
-    compile_step: bool = True,
+    compile_step: bool | None = None,
     progress: bool | int = False,
     reanchor_every: int = 0,
     archive=None,
@@ -423,9 +423,20 @@ def run(
     (pass one explicitly to override). ``accept_fraction`` and the
     divergence counts describe the resumed segment alone.
 
-    ``compile_step``: whether step graphs are ``mx.compile``d (default
-    True). It reaches every kernel, including those that compile their own
-    graphs. If MLX refuses a graph -- its compiler fuses a long elementwise
+    ``u0``: the initial positions, ``(n_chains, dim)``, as an ``mx.array``
+    or anything NumPy can turn into one (converted to float32).
+
+    ``compile_step``: whether step graphs are ``mx.compile``d. True or
+    False is written to ``kernel.compile_step`` and reaches every kernel,
+    including those that compile their own graphs; the default None keeps
+    whatever the kernel's attribute already says (True unless set). A
+    target that leaves MLX inside ``log_prob`` -- NumPy, ``.item()``, host
+    control flow -- cannot be compiled, and MLX says so at the first step
+    (``[eval] Attempting to eval an array during function
+    transformations``); the engine re-raises that with the remedy, which is
+    ``compile_step=False``.
+
+    If MLX refuses a graph -- its compiler fuses a long elementwise
     chain into one Metal kernel and raises ``[compile] Too many
     inputs/outputs fused ...`` rather than splitting it -- the run warns once
     and continues uncompiled: the sampled distribution is the same (draws
@@ -474,7 +485,12 @@ def run(
     barrier because adaptation reads freshly-computed parameters on the
     host, and pipelining it would mean adapting from stale ones."""
     if u0 is not None:
-        u0 = u0.astype(mx.float32) if u0.dtype != mx.float32 else u0
+        if not isinstance(u0, mx.array):
+            u0 = mx.array(np.asarray(u0, dtype=np.float32))
+        elif u0.dtype != mx.float32:
+            u0 = u0.astype(mx.float32)
+    if compile_step is None:
+        compile_step = bool(getattr(kernel, "compile_step", True))
 
     if resume is None:
         if u0 is None:

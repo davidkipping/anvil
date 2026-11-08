@@ -43,6 +43,7 @@ this project out at least once:
 |---|---|
 | {func}`~anvil.optimize` | what is the best fit, and is there more than one? |
 | {func}`~anvil.smc` (optional) | which model does the data prefer? |
+| {func}`~anvil.joint` | several datasets or instruments, one shared physics: how do I fit them together? |
 | {func}`~anvil.diagnostics.diagnose` | did it converge, and how many effective samples? |
 | {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed — or are some chains lost? |
 | {func}`~anvil.diagnostics.whitened_shape` | correlated, or curved? (predicts whether `dense=True` pays) |
@@ -65,5 +66,6 @@ priors
 samplers
 optimize
 evidence
+joint
 api
 ```

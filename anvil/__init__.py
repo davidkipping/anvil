@@ -21,9 +21,10 @@ from .priors import (Gaussian, ImproperFlat, LogUniform, Prior,
                      TruncatedGaussian, Uniform)
 from .precision import (Certificate, PrecisionPolicy, certify,
                         validate_precision)
-from .transforms import ParamSpec, Transform, TransformedLogDensity
+from .transforms import (JointLogDensity, ParamSpec, Transform,
+                         TransformedLogDensity, joint)
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 __all__ = [
     "ChEESHMC",
@@ -32,6 +33,7 @@ __all__ = [
     "EnsembleSampler",
     "EvidenceResult",
     "HMCSampler",
+    "JointLogDensity",
     "FunctionLogDensity",
     "LogDensity",
     "OptimizeResult",
@@ -58,6 +60,7 @@ __all__ = [
     "diagnose",
     "diagnostics",
     "evidence",
+    "joint",
     "laplace_evidence",
     "load_state",
     "optimize",

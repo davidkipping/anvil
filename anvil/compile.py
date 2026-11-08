@@ -44,6 +44,18 @@ def is_compile_refusal(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and str(exc).startswith(_REFUSAL_PREFIX)
 
 
+_EVAL_PREFIX = "[eval]"
+
+
+def is_eval_under_compile(exc: BaseException) -> bool:
+    """True for the ``ValueError`` MLX raises when a traced function
+    forces evaluation (``[eval] Attempting to eval an array during function
+    transformations ...``): the function leaves MLX, so it cannot be
+    compiled at all. Not a refusal to fall back from -- the user has to
+    choose ``compile_step=False`` -- but worth naming."""
+    return isinstance(exc, ValueError) and str(exc).startswith(_EVAL_PREFIX)
+
+
 # indirection so tests can inject a refusal without needing a target large
 # enough to provoke MLX for real
 _compile = mx.compile
@@ -82,7 +94,19 @@ class CompiledOrEager:
     def __call__(self, *args, **kwargs):
         if not self.compiled:
             return self._eager(*args, **kwargs)
-        out = self._compiled_fn(*args, **kwargs)
+        try:
+            out = self._compiled_fn(*args, **kwargs)
+        except ValueError as exc:
+            if not is_eval_under_compile(exc):
+                raise
+            raise ValueError(
+                f"{self.name} evaluated an array while MLX was compiling it, "
+                f"which usually means the log density leaves MLX inside "
+                f"log_prob (NumPy, .item(), float(), host control flow on "
+                f"array values). Such a target cannot be compiled: pass "
+                f"compile_step=False to run it uncompiled, or write it from "
+                f"mlx.core ops. (MLX: {str(exc).splitlines()[0][:120]})"
+            ) from exc
         if self._verified:
             return out
         try:

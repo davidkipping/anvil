@@ -290,7 +290,18 @@ silent no-op for exactly the kernels most likely to hit this. Measured on
 the target that provoked it (a six-generator collapsed limb-darkening model
 at 128 chains): ChEES failed identically with and without the flag; only
 the global `mx.disable_compile()` worked. That is fixed, and the flag means
-one thing everywhere.
+one thing everywhere. Since 0.12.0 `run`'s default is `compile_step=None`,
+which keeps whatever `kernel.compile_step` already says, so setting the
+attribute on the kernel is honoured too; an explicit True or False to
+`run` still wins.
+
+A refusal is not the only way compilation can fail. A `log_prob` that
+leaves MLX part-way (NumPy, `.item()`, `float()`, host control flow on
+array values) forces an evaluation inside the trace, which MLX reports as
+`[eval] Attempting to eval an array during function transformations`.
+There is nothing to fall back to in that case, since the graph was never
+built; since 0.12.0 the first compiled step re-raises it as a
+`ValueError` that names the cause and `compile_step=False`.
 
 ## Measured performance
 

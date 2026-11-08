@@ -147,7 +147,11 @@ Rules of thumb from profiling:
   limit, which MLX reports as `[compile] Too many inputs/outputs fused`.
   `run` falls back to the uncompiled step with a warning — same
   distribution, draws differ at float32 round-off, slower — and
-  `compile_step=False` skips the attempt for every kernel.
+  `compile_step=False` skips the attempt for every kernel (the default,
+  `None`, keeps whatever `kernel.compile_step` says).
+- A `log_prob` that leaves MLX part-way (NumPy, `.item()`, host control
+  flow on array values) cannot be compiled at all; the first step raises
+  a `ValueError` that says so and names `compile_step=False`.
 - ChEES-HMC costs L gradient evaluations per step but repays with an
   order-of-magnitude better per-draw efficiency on smooth targets; the
   stretch move is the safer pick for kinky or plateau-ridden posteriors
@@ -205,6 +209,19 @@ stops short of the optimum; the default `"mixed"` method reaches it from
 98% of 128 starts in 0.6 s. Convergence is judged by the Newton decrement,
 which float32 resolves where differences of the log-likelihood cannot. See
 the optimization guide.
+
+## Joint fits
+
+```python
+jt = anvil.joint({"v1": t1, "v2": t2}, shared={"ror": ["v1", "v2"], "b": ["v1", "v2"]})
+```
+
+Several targets, one parameter vector, some columns shared: a joint fit of
+several visits, instruments or epochs with common physics. The members'
+model-space functions are summed and one Jacobian and one set of priors
+applied, so a shared parameter is counted once; the result is an ordinary
+`TransformedLogDensity` that every tool takes unchanged. See the joint-fits
+guide.
 
 ## Evidence (optional)
 

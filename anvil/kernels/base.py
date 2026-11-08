@@ -40,9 +40,11 @@ class Kernel:
     #: kernels that manage their own mx.compile (e.g. host-side move
     #: mixing) set this so the engine does not wrap step() again
     self_compiled: bool = False
-    #: set by the engine from ``run(compile_step=...)`` before ``retrace``;
-    #: a self-compiling kernel consults it so the flag means the same thing
-    #: for every kernel
+    #: whether this kernel's step graphs are ``mx.compile``d. The engine
+    #: writes ``run(compile_step=True|False)`` here before ``retrace`` and
+    #: leaves it alone for the default ``None``, so setting the attribute
+    #: directly is honoured; a self-compiling kernel consults it so the flag
+    #: means the same thing for every kernel
     compile_step: bool = True
     #: set once MLX has refused to compile this kernel's graphs (see
     #: ``anvil.compile``); later retraces then skip the attempt

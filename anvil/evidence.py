@@ -132,7 +132,7 @@ def _split(target: TransformedLogDensity, u: mx.array):
     would otherwise weigh as much as a real likelihood."""
     tr = target.transform
     v = tr.to_model(u)
-    ll = target._fn(v)
+    ll = target.model_log_prob(v)
     rest = tr.log_det_jac(u)
     if tr.has_prior_terms:
         rest = rest + tr.log_prior(v)

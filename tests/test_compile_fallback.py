@@ -180,3 +180,67 @@ def test_a_refusal_is_remembered_across_runs(monkeypatch):
         fresh = anvil.run(k, target, u0, n_warmup=10, n_samples=5, seed=6)
     assert again.extras["compile_refused"] and fresh.extras["compile_refused"]
     assert k._leapfrog_c.compiled is False
+
+
+# -- run() inputs: NumPy u0, the kernel's own compile_step, targets that
+# -- leave MLX (anvil-gp's note of 2026-11-06) -----------------------------
+
+def test_run_accepts_a_numpy_u0():
+    """run() used to call u0.astype(mx.float32) on whatever it was given, so a
+    NumPy start died with "Cannot interpret 'mlx.core.float32' as a data
+    type" -- while EnsembleSampler.run_mcmc took NumPy happily."""
+    target, u0 = _setup()
+    u0_np = np.array(u0, dtype=np.float64)
+    kw = dict(n_warmup=5, n_samples=3, seed=1)
+    a = anvil.run(RandomWalkMetropolis(target), target, u0, **kw).get_chain()
+    b = anvil.run(RandomWalkMetropolis(target), target, u0_np, **kw).get_chain()
+    c = anvil.run(RandomWalkMetropolis(target), target, u0_np.tolist(), **kw).get_chain()
+    np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(a, c)
+
+
+def test_run_honours_the_kernels_own_compile_step():
+    """run() wrote its own default of True over the attribute, so a user who
+    set kernel.compile_step = False was silently compiled anyway."""
+    target, u0 = _setup()
+    kw = dict(n_warmup=5, n_samples=3, seed=1)
+    e = EnsembleKernel(target, seed=3)
+    e.compile_step = False
+    anvil.run(e, target, u0, **kw)
+    assert e.compile_step is False and all(not c.compiled for c in e._compiled)
+    # an explicit argument still wins, either way
+    anvil.run(e, target, u0, compile_step=True, **kw)
+    assert e.compile_step is True and all(c.compiled for c in e._compiled)
+    e2 = EnsembleKernel(target, seed=3)
+    anvil.run(e2, target, u0, compile_step=False, **kw)
+    assert e2.compile_step is False
+    # the untouched default is still compiled
+    e3 = EnsembleKernel(target, seed=3)
+    anvil.run(e3, target, u0, **kw)
+    assert e3.compile_step is True and all(c.compiled for c in e3._compiled)
+
+
+def _leaves_mlx():
+    from anvil import ParamSpec, Transform, TransformedLogDensity
+
+    def fn(v):          # a log density computed on the host
+        return mx.array(-0.5 * np.sum(np.array(v) ** 2, axis=-1))
+    tr = Transform([ParamSpec(f"p{i}", -5.0, 5.0) for i in range(3)])
+    return TransformedLogDensity(fn, tr)
+
+
+def test_a_target_that_leaves_mlx_gets_the_compile_step_hint():
+    """MLX's own error ("[eval] Attempting to eval an array during function
+    transformations") names neither anvil nor the remedy."""
+    target = _leaves_mlx()
+    u0 = mx.array(np.random.default_rng(1).standard_normal((16, 3)).astype(np.float32))
+    kw = dict(n_warmup=3, n_samples=2, seed=1)
+    for make in (lambda: RandomWalkMetropolis(target),
+                 lambda: EnsembleKernel(target, seed=3)):
+        with pytest.raises(ValueError, match="compile_step=False") as info:
+            anvil.run(make(), target, u0, **kw)
+        assert C.is_eval_under_compile(info.value.__cause__)
+        # ... and the remedy works
+        anvil.run(make(), target, u0, compile_step=False, **kw)
+    # a fusion refusal is still a refusal, not this
+    assert not C.is_eval_under_compile(REFUSAL)

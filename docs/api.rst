@@ -48,7 +48,7 @@ Log densities and transforms
    :members: LogDensity, FunctionLogDensity, CountingLogDensity
 
 .. automodule:: anvil.transforms
-   :members: ParamSpec, Transform, TransformedLogDensity
+   :members: ParamSpec, Transform, TransformedLogDensity, joint, JointLogDensity
 
 .. automodule:: anvil.priors
    :members: Prior, Uniform, LogUniform, Gaussian, TruncatedGaussian,
