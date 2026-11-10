@@ -937,6 +937,12 @@ def optimize(target: LogDensity, u0=None, *, objective: str = "mle",
     ``max_rows``: largest batch sent to the target in one call; lower it if
     the target's memory per row is large.
 
+    ``compile_step=False`` evaluates the target and its gradient
+    uncompiled. A target that leaves MLX inside ``log_prob`` then runs, but
+    no gradient flows through the part computed outside MLX, so the search
+    gets no gradient from it; such a target has to be written in
+    ``mlx.core`` ops to be optimised.
+
     ``progress``/``callback``: as in :func:`anvil.run`; the callback gets
     ``("optimize", iteration, info)``.
     """

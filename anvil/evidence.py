@@ -408,6 +408,8 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     for a likelihood so expensive that one block of 1024 runs for seconds.
     ``n_probe`` posterior draws are re-evaluated on the float64 path, when
     the target has one, to report float32's error in log L.
+    ``compile_step=False`` evaluates the target uncompiled, for one that
+    leaves MLX inside ``log_prob``.
     ``progress``/``callback`` as in :func:`anvil.run`; the callback gets
     ``("smc", stage, info)``.
     """
