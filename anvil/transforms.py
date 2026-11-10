@@ -22,7 +22,9 @@ the user's log_prob (model space) as MLX ops.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, replace
 from typing import Callable
 
 import mlx.core as mx
@@ -67,6 +69,8 @@ class ParamSpec:
             raise ValueError(f"{self.name}: hi must exceed lo")
         if not self.scale > 0:
             raise ValueError(f"{self.name}: scale must be positive")
+        if not math.isfinite(self.loc):
+            raise ValueError(f"{self.name}: loc must be finite")
         if self.prior is not None:
             if isinstance(self.prior, LogUniform) and self.report_offset != 0.0:
                 raise ValueError(
@@ -83,7 +87,7 @@ class Transform:
         self.specs = specs
         self.dim = len(specs)
         self.names = [s.name for s in specs]
-        dup = sorted({n for n in self.names if self.names.count(n) > 1})
+        dup = sorted((n for n, k in Counter(self.names).items() if k > 1), key=str)
         if dup:
             raise ValueError(f"duplicate parameter names: {dup}")
 
@@ -426,6 +430,31 @@ class TransformedLogDensity(LogDensity):
 
 # -- several targets, one parameter vector --------------------------------------
 
+def _same(a, b) -> bool:
+    """``a == b``, with NaN equal to NaN and dataclasses compared field by
+    field: unbound priors carry NaN placeholders, and whether a dataclass
+    ``==`` sees through those depends on the Python version."""
+    if type(a) is not type(b):
+        # 1 and 1.0 are the same bound; a Uniform and a Gaussian are not
+        num = (int, float, np.integer, np.floating)
+        if not (isinstance(a, num) and isinstance(b, num)):
+            return False
+    if hasattr(a, "__dataclass_fields__"):
+        return all(_same(getattr(a, f.name), getattr(b, f.name)) for f in fields(a))
+    if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+        return True
+    return bool(a == b)
+
+
+def _specs_agree(a: ParamSpec, b: ParamSpec) -> bool:
+    """Two specs describe one parameter: every field equal, and the priors
+    equal *as resolved*, so ``prior=None`` on a finite box agrees with an
+    explicit ``Uniform()`` there."""
+    return (all(_same(getattr(a, f.name), getattr(b, f.name))
+                for f in fields(a) if f.name != "prior")
+            and _same(Transform._resolve_prior(a), Transform._resolve_prior(b)))
+
+
 class JointLogDensity(TransformedLogDensity):
     """A :class:`TransformedLogDensity` over several members' model-space
     functions, built by :func:`joint`. ``members`` maps a member's name to
@@ -472,62 +501,129 @@ def joint(members: dict[str, TransformedLogDensity],
     The result is an ordinary :class:`TransformedLogDensity`, so
     :func:`anvil.run`, :func:`anvil.optimize`, :func:`anvil.smc` and the
     precision tools take it unchanged.
+
+    A member's parameter can be shared under one joint name only, and a
+    member must not override ``log_prob`` (the sum is over
+    ``model_log_prob``). Parameters that merely have the same name in two
+    members stay separate unless ``shared`` lists them. The joint graph
+    holds every member's intermediates at once: its peak memory is the
+    members' sum, not the largest member's.
     """
+    if not isinstance(members, Mapping):
+        raise TypeError(
+            f"joint() takes members as a dict {{name: target}}, got "
+            f"{type(members).__name__}")
+    # our own copy: the closures below must not follow later changes to the
+    # caller's dict (a compiled step would keep the old one, an eager call
+    # the new)
+    members = dict(members)
     if not members:
         raise ValueError("joint() needs at least one member")
     for k, m in members.items():
+        if not isinstance(k, str):
+            raise TypeError(f"member names must be strings, got {k!r}")
         if not isinstance(m, TransformedLogDensity):
             raise TypeError(f"member {k!r} is not a TransformedLogDensity")
-    shared = dict(shared or {})
+        # joint() sums model_log_prob and applies its own Jacobian and
+        # priors, so anything a subclass does in log_prob itself (tempering,
+        # an added term) would be dropped without a word
+        for meth in ("log_prob", "log_prob_hi"):
+            if getattr(type(m), meth) is not getattr(TransformedLogDensity, meth):
+                raise TypeError(
+                    f"member {k!r} ({type(m).__name__}) overrides {meth}(); "
+                    f"joint() sums the members' model_log_prob and would "
+                    f"discard that override. Put the change in the model "
+                    f"function instead.")
+    if shared is not None and not isinstance(shared, Mapping):
+        raise TypeError(
+            "shared must be a dict {joint name: [members]} or "
+            "{joint name: {member: its name}}, got "
+            f"{type(shared).__name__}")
     norm_shared: dict[str, dict[str, str]] = {}
-    for jname, who in shared.items():
-        norm_shared[jname] = dict(who) if isinstance(who, dict) else {m: jname for m in who}
+    claimed: dict[tuple[str, str], str] = {}      # (member, its name) -> joint name
+    for jname, who in dict(shared or {}).items():
+        if not isinstance(jname, str):
+            raise TypeError(f"shared parameter names must be strings, got {jname!r}")
+        if isinstance(who, str) or not isinstance(who, (Mapping, list, tuple, set, frozenset)):
+            raise TypeError(
+                f"shared {jname!r}: give a list of member names or a dict "
+                f"{{member: its name}}, got {who!r}")
+        norm_shared[jname] = (dict(who) if isinstance(who, Mapping)
+                              else {m: jname for m in who})
+        if not norm_shared[jname]:
+            raise ValueError(f"shared {jname!r}: no members listed")
         for m, pname in norm_shared[jname].items():
             if m not in members:
                 raise ValueError(f"shared {jname!r}: no member named {m!r}")
             if pname not in members[m].transform.names:
                 raise ValueError(f"shared {jname!r}: member {m!r} has no parameter {pname!r}")
+            if (m, pname) in claimed:
+                raise ValueError(
+                    f"shared {jname!r}: member {m!r} parameter {pname!r} is "
+                    f"already shared as {claimed[(m, pname)]!r}")
+            claimed[(m, pname)] = jname
 
     def spec_of(m, pname):
         tr = members[m].transform
         return tr.specs[tr.names.index(pname)]
 
     specs: list[ParamSpec] = []
+    source: list[str] = []                        # where each joint name came from
     col: dict[tuple[str, str], int] = {}          # (member, its name) -> joint column
     for jname, who in norm_shared.items():
         ref_m, ref_p = next(iter(who.items()))
         ref = replace(spec_of(ref_m, ref_p), name=jname)
         for m, pname in who.items():
             cand = replace(spec_of(m, pname), name=jname)
-            if cand != ref:
+            if not _specs_agree(cand, ref):
                 raise ValueError(
                     f"shared {jname!r}: member {m!r} declares {pname!r} as {cand}, "
                     f"member {ref_m!r} declares {ref_p!r} as {ref}; they must agree")
             col[(m, pname)] = len(specs)
         specs.append(ref)
+        source.append(f"shared parameter {jname!r}")
     for m, t in members.items():
-        for s in t.transform.specs:
-            if (m, s.name) not in col:
-                col[(m, s.name)] = len(specs)
-                specs.append(replace(s, name=f"{m}.{s.name}"))
-    columns = {m: [col[(m, s.name)] for s in t.transform.specs] for m, t in members.items()}
+        for sp in t.transform.specs:
+            if (m, sp.name) not in col:
+                col[(m, sp.name)] = len(specs)
+                specs.append(replace(sp, name=f"{m}.{sp.name}"))
+                source.append(f"member {m!r} parameter {sp.name!r}")
+    seen: dict[str, str] = {}
+    for sp, src in zip(specs, source):
+        if sp.name in seen:
+            raise ValueError(
+                f"joint parameter name {sp.name!r} is produced twice: by "
+                f"{seen[sp.name]} and by {src}. Rename a member or a shared "
+                f"parameter.")
+        seen[sp.name] = src
+    columns = {m: [col[(m, sp.name)] for sp in t.transform.specs] for m, t in members.items()}
     idx = {m: mx.array(np.asarray(c, dtype=np.int32)) for m, c in columns.items()}
+    order = list(members.items())
+
+    def _total(parts):
+        # Not a chained ``a + b + ...``: that is elementwise, so MLX fuses
+        # every member's tail into one Metal kernel and refuses the joint
+        # graph ("[compile] Too many inputs/outputs fused") from about 8
+        # members whose own graphs compile alone -- measured on
+        # ChunkedGaussianLogLike members with the fixed_point reduction.
+        # A stack is a fusion barrier and costs nothing where the chain
+        # compiled.
+        if len(parts) == 1:
+            return parts[0]
+        return mx.sum(mx.stack(parts, axis=0), axis=0)
 
     def fn(v):
-        out = None
-        for m, t in members.items():
-            part = t.model_log_prob(mx.take(v, idx[m], axis=1))
-            out = part if out is None else out + part
-        return out
+        return _total([t.model_log_prob(mx.take(v, idx[m], axis=1))
+                       for m, t in order])
 
     fn_hi = None
     if all(t.has_hi for t in members.values()):
         def fn_hi(v):
-            out = None
-            for m, t in members.items():
-                part = t.model_log_prob_hi(mx.take(v, idx[m], axis=1))
-                out = part if out is None else out + part
-            return out
+            # float64 lives on the CPU; log_prob_hi already sets the stream,
+            # but model_log_prob_hi is public and may be called directly
+            with mx.stream(mx.cpu):
+                return _total([t.model_log_prob_hi(mx.take(v, idx[m], axis=1))
+                               for m, t in order])
 
     return JointLogDensity(
         members, columns, norm_shared, fn, Transform(specs),

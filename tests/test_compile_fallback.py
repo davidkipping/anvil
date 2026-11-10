@@ -244,3 +244,67 @@ def test_a_target_that_leaves_mlx_gets_the_compile_step_hint():
         anvil.run(make(), target, u0, compile_step=False, **kw)
     # a fusion refusal is still a refusal, not this
     assert not C.is_eval_under_compile(REFUSAL)
+
+
+# -- from the three-part review of 0.12.0 (shipped as 0.12.1) ---------------
+
+def test_u0_errors_name_u0():
+    target, u0 = _setup()
+    k = lambda: RandomWalkMetropolis(target)
+    with pytest.raises(ValueError, match=r"u0 must have shape \(n_chains, dim\)"):
+        anvil.run(k(), target, np.zeros(3), n_samples=2)
+    with pytest.raises(ValueError, match="u0 has 4 columns but the target has 3"):
+        anvil.run(k(), target, np.zeros((8, 4)), n_samples=2)
+    with pytest.raises(TypeError, match="u0 must be"):
+        anvil.run(k(), target, [[1.0, 2.0, 3.0], [1.0, 2.0]], n_samples=2)
+    with pytest.raises(TypeError, match="u0 must be"):
+        anvil.run(k(), target, "hello", n_samples=2)
+    # a float64 mx.array (CPU-only dtype) is converted like NumPy float64
+    with mx.stream(mx.cpu):
+        u64 = mx.array(np.array(u0, dtype=np.float64), dtype=mx.float64)
+    kw = dict(n_warmup=5, n_samples=3, seed=1)
+    np.testing.assert_array_equal(anvil.run(k(), target, u64, **kw).get_chain(),
+                                  anvil.run(k(), target, u0, **kw).get_chain())
+
+
+def test_compile_step_must_be_a_bool_or_none():
+    target, u0 = _setup()
+    with pytest.raises(TypeError, match="compile_step must be True, False or None"):
+        anvil.run(RandomWalkMetropolis(target), target, u0, n_samples=2, compile_step="no")
+    k = RandomWalkMetropolis(target)
+    k.compile_step = None
+    with pytest.raises(TypeError, match="kernel.compile_step must be True or False"):
+        anvil.run(k, target, u0, n_samples=2)
+
+
+def test_the_emcee_wrappers_and_bridge_evidence_take_compile_step():
+    """The hint names compile_step=False; these entry points had no such
+    argument, and bridge_evidence called itself the optimizer."""
+    from anvil.emcee_api import EnsembleSampler
+    target = _leaves_mlx()
+    p0 = np.random.default_rng(1).standard_normal((16, 3))
+
+    def fn(u):          # leaves MLX
+        return mx.array(-0.5 * np.sum(np.array(u) ** 2, axis=-1))
+    s = EnsembleSampler(16, 3, fn)
+    with pytest.raises(ValueError, match="compile_step=False"):
+        s.run_mcmc(p0, 3)
+    assert s.run_mcmc(p0, 3, compile_step=False).get_chain().shape == (3, 16, 3)
+    r = anvil.run(EnsembleKernel(target, seed=3), target, p0, n_warmup=0,
+                  n_samples=60, compile_step=False)
+    draws = r.get_chain(flat=True)
+    with pytest.raises(ValueError, match="the bridge-sampling target"):
+        anvil.bridge_evidence(target, draws)
+    ev = anvil.bridge_evidence(target, draws, compile_step=False)
+    assert np.isfinite(ev.log_z)
+
+
+def test_the_hint_does_not_send_gradient_users_to_compile_step_false():
+    target = _leaves_mlx()
+    u0 = mx.array(np.random.default_rng(1).standard_normal((16, 3)).astype(np.float32))
+    with pytest.raises(ValueError) as info:
+        anvil.run(ChEESHMC(target), target, u0, n_warmup=3, n_samples=2, seed=1)
+    msg = str(info.value)
+    assert "ChEES" in msg and "no gradient flows" in msg
+    # a user's own ValueError that merely starts "[eval]" is not relabelled
+    assert not C.is_eval_under_compile(ValueError("[eval] my own message"))

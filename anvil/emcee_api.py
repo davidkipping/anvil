@@ -70,12 +70,15 @@ class EnsembleSampler:
         tune: bool = False,
         thin_by: int = 1,
         progress: bool = False,
+        compile_step: bool | None = None,
     ) -> engine.Results:
         """Run the chain. ``initial_state``: (nwalkers, ndim) array-like.
 
         ``warmup`` iterations adapt and are discarded; if None, defaults to
         ``nsteps`` when ``tune=True`` else 0. ``nsteps`` states per walker
         are then recorded, one every ``thin_by`` frozen iterations.
+        ``compile_step`` is passed to :func:`anvil.run` (False runs the
+        step uncompiled, for a ``log_prob`` that leaves MLX).
         """
         p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
         if p0.shape != (self.nwalkers, self.ndim):
@@ -101,6 +104,7 @@ class EnsembleSampler:
             thin=thin_by,
             seed=self.seed,
             progress=progress,
+            compile_step=compile_step,
         )
         return self._results
 

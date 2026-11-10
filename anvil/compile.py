@@ -44,7 +44,7 @@ def is_compile_refusal(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and str(exc).startswith(_REFUSAL_PREFIX)
 
 
-_EVAL_PREFIX = "[eval]"
+_EVAL_PREFIX = "[eval] Attempting to eval an array during function transformations"
 
 
 def is_eval_under_compile(exc: BaseException) -> bool:
@@ -103,9 +103,14 @@ class CompiledOrEager:
                 f"{self.name} evaluated an array while MLX was compiling it, "
                 f"which usually means the log density leaves MLX inside "
                 f"log_prob (NumPy, .item(), float(), host control flow on "
-                f"array values). Such a target cannot be compiled: pass "
-                f"compile_step=False to run it uncompiled, or write it from "
-                f"mlx.core ops. (MLX: {str(exc).splitlines()[0][:120]})"
+                f"array values). Such a target cannot be compiled. With a "
+                f"gradient-free method (the ensemble kernel, random-walk "
+                f"Metropolis, smc, bridge_evidence) pass compile_step=False "
+                f"to run it uncompiled. A gradient-based one (ChEES-HMC, "
+                f"optimize) needs the target written in mlx.core ops: "
+                f"uncompiled it would run, but no gradient flows through "
+                f"the part computed outside MLX. "
+                f"(MLX: {str(exc).splitlines()[0][:120]})"
             ) from exc
         if self._verified:
             return out

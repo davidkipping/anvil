@@ -105,7 +105,8 @@ class _Evaluator:
     with non-finite values mapped to ``-inf``.
     """
 
-    def __init__(self, f, *, compile_step: bool, max_rows: int):
+    def __init__(self, f, *, compile_step: bool, max_rows: int,
+                 name: str = "the optimizer objective"):
         self.f = f
         self.max_rows = int(max_rows)
 
@@ -113,9 +114,8 @@ class _Evaluator:
             out, vjps = mx.vjp(f, [u], [mx.ones(u.shape[:1], dtype=u.dtype)])
             return out[0], vjps[0]
 
-        self._f = CompiledOrEager(f, name="the optimizer objective",
-                                  enabled=compile_step)
-        self._vg = CompiledOrEager(vg, name="the optimizer gradient",
+        self._f = CompiledOrEager(f, name=name, enabled=compile_step)
+        self._vg = CompiledOrEager(vg, name=f"{name}'s gradient",
                                    enabled=compile_step)
         self.n_value_rows = 0
         self.n_grad_rows = 0

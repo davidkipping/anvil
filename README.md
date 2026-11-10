@@ -151,7 +151,9 @@ Rules of thumb from profiling:
   `None`, keeps whatever `kernel.compile_step` says).
 - A `log_prob` that leaves MLX part-way (NumPy, `.item()`, host control
   flow on array values) cannot be compiled at all; the first step raises
-  a `ValueError` that says so and names `compile_step=False`.
+  a `ValueError` that says so. `compile_step=False` runs it with a
+  gradient-free kernel; ChEES and `optimize` need it in `mlx.core` ops,
+  since no gradient flows through the part computed outside MLX.
 - ChEES-HMC costs L gradient evaluations per step but repays with an
   order-of-magnitude better per-draw efficiency on smooth targets; the
   stretch move is the safer pick for kinky or plateau-ridden posteriors

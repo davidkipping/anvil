@@ -610,7 +610,8 @@ def _mvt(mu, L, nu):
 
 def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
                     n_proposal: int | None = None, seed: int = 0,
-                    max_rows: int = 1 << 15) -> EvidenceResult:
+                    max_rows: int = 1 << 15,
+                    compile_step: bool = True) -> EvidenceResult:
     """ln Z by Meng and Wong's optimal bridge sampling.
 
     ``draws`` are posterior draws in u: an array ``(n, dim)`` of independent
@@ -630,6 +631,9 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     effective sample size of the proposal-side ratios) falls when the
     proposal and posterior overlap poorly, and the standard error grows
     with it.
+
+    ``compile_step=False`` evaluates the target uncompiled, for one that
+    leaves MLX inside ``log_prob``.
     """
     from .diagnostics import _ess_batched
     from .optimize import _Evaluator
@@ -656,7 +660,8 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
         k = a.shape[0] // 2
         halves = [(a[perm[:k]], None), (a[perm[k:]], None)]
 
-    ev = _Evaluator(target.log_prob, compile_step=True, max_rows=max_rows)
+    ev = _Evaluator(target.log_prob, compile_step=bool(compile_step),
+                    max_rows=max_rows, name="the bridge-sampling target")
     c = target.log_norm_const
 
     def fold(fit, use, fam_use):

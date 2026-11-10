@@ -429,12 +429,19 @@ def run(
     ``compile_step``: whether step graphs are ``mx.compile``d. True or
     False is written to ``kernel.compile_step`` and reaches every kernel,
     including those that compile their own graphs; the default None keeps
-    whatever the kernel's attribute already says (True unless set). A
-    target that leaves MLX inside ``log_prob`` -- NumPy, ``.item()``, host
-    control flow -- cannot be compiled, and MLX says so at the first step
-    (``[eval] Attempting to eval an array during function
-    transformations``); the engine re-raises that with the remedy, which is
-    ``compile_step=False``.
+    whatever the kernel's attribute already says (True unless set). The
+    attribute persists: after ``run(kernel, ..., compile_step=False)`` a
+    later ``run(kernel, ...)`` on the same kernel object is uncompiled too,
+    until True is passed. A target that leaves MLX inside ``log_prob`` --
+    NumPy, ``.item()``, host control flow -- cannot be compiled, and MLX
+    says so at the first step (``[eval] Attempting to eval an array during
+    function transformations``); the engine re-raises that with the
+    remedy. For a gradient-free kernel that is ``compile_step=False``. For
+    ChEES it is not: uncompiled, the gradient does not flow through the
+    part computed outside MLX, so the sampler runs without the
+    likelihood's gradient (valid draws, random-walk efficiency); such a
+    target has to be written in ``mlx.core`` ops or sampled with the
+    ensemble kernel.
 
     If MLX refuses a graph -- its compiler fuses a long elementwise
     chain into one Metal kernel and raises ``[compile] Too many
@@ -485,12 +492,32 @@ def run(
     barrier because adaptation reads freshly-computed parameters on the
     host, and pipelining it would mean adapting from stale ones."""
     if u0 is not None:
-        if not isinstance(u0, mx.array):
-            u0 = mx.array(np.asarray(u0, dtype=np.float32))
-        elif u0.dtype != mx.float32:
-            u0 = u0.astype(mx.float32)
+        if not isinstance(u0, mx.array) or u0.dtype != mx.float32:
+            # through NumPy for every other input, MLX arrays included: a
+            # float64 mx.array cannot be cast on the GPU
+            try:
+                u0 = mx.array(np.asarray(u0, dtype=np.float32))
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"u0 must be an (n_chains, dim) array of numbers (an "
+                    f"mx.array or anything NumPy can convert); got "
+                    f"{type(u0).__name__}: {exc}") from exc
+        if u0.ndim != 2:
+            raise ValueError(
+                f"u0 must have shape (n_chains, dim), got {tuple(u0.shape)}")
+        dim_t = getattr(target, "dim", None)
+        if isinstance(dim_t, int) and u0.shape[1] != dim_t:
+            raise ValueError(
+                f"u0 has {u0.shape[1]} columns but the target has "
+                f"{dim_t} parameters (u0 shape {tuple(u0.shape)})")
     if compile_step is None:
-        compile_step = bool(getattr(kernel, "compile_step", True))
+        compile_step = getattr(kernel, "compile_step", True)
+        if not isinstance(compile_step, bool):
+            raise TypeError(
+                f"kernel.compile_step must be True or False, got {compile_step!r}")
+    elif not isinstance(compile_step, bool):
+        raise TypeError(
+            f"compile_step must be True, False or None, got {compile_step!r}")
 
     if resume is None:
         if u0 is None:

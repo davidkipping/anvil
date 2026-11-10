@@ -2,6 +2,7 @@
 some columns shared. Checked against the same model written by hand."""
 
 import math
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -159,3 +160,159 @@ def test_tools_take_a_joint_target(two):
     # precision tools
     rep = anvil.validate_precision(jt, mx.array(r.ball(16)))
     assert rep is not None
+
+
+# -- from the three-part review of 0.12.0 (shipped as 0.12.1) ---------------
+
+def _quad(names, centres, widths, lo=-10.0, hi=10.0):
+    """Independent Gaussians in each parameter, with a float64 twin."""
+    c32, w32 = mx.array(np.float32(centres)), mx.array(np.float32(widths))
+    c64 = mx.array(np.float64(centres), dtype=mx.float64)
+    w64 = mx.array(np.float64(widths), dtype=mx.float64)
+    return TransformedLogDensity(
+        lambda v: -0.5 * mx.sum(((v - c32) / w32) ** 2, axis=-1),
+        Transform([ParamSpec(n, lo, hi) for n in names]),
+        model_log_prob_hi=lambda v: -0.5 * mx.sum(((v - c64) / w64) ** 2, axis=-1))
+
+
+def test_permuted_members_against_float64_by_hand():
+    """Members in different parameter orders, shared in an order that is
+    neither's, one under a different name: a layout that mixed up joint
+    order and member order would show against the hand calculation."""
+    m1 = _quad(["c", "a", "b"], [0.5, -1.0, 2.0], [0.3, 0.7, 1.1])
+    m2 = _quad(["beta", "k", "a"], [1.5, 0.2, -0.4], [0.9, 0.4, 0.6])
+    jt = joint({"m1": m1, "m2": m2},
+               shared={"b": {"m1": "b", "m2": "beta"}, "a": ["m1", "m2"]})
+    assert jt.names == ["b", "a", "m1.c", "m2.k"]
+    assert jt.member_columns("m1").tolist() == [2, 1, 0]
+    assert jt.member_columns("m2").tolist() == [0, 3, 1]
+    u = mx.array(np.random.default_rng(7).standard_normal((16, 4)).astype(np.float32))
+    hi = jt.log_prob_hi(u)
+    assert hi.dtype == mx.float64
+    u32 = np.array(u, dtype=np.float64)
+    v = jt.transform.model_np(u32)
+    b, a, c, k = v.T
+    want = (-0.5 * (((c - 0.5) / 0.3) ** 2 + ((a + 1.0) / 0.7) ** 2 + ((b - 2.0) / 1.1) ** 2)
+            - 0.5 * (((b - 1.5) / 0.9) ** 2 + ((k - 0.2) / 0.4) ** 2 + ((a + 0.4) / 0.6) ** 2))
+    want = want + jt.transform.log_det_jac_np(u32) + jt.transform.log_prior_np(v)
+    np.testing.assert_allclose(np.array(hi), want, rtol=1e-12, atol=1e-10)
+    np.testing.assert_allclose(np.array(jt.log_prob(u)),
+                               want, rtol=1e-4, atol=1e-2)
+    # the public float64 function works outside a CPU stream too
+    v64 = mx.array(v, dtype=mx.float64)
+    assert jt.model_log_prob_hi(v64).dtype == mx.float64
+
+
+def test_smc_log_z_of_a_joint_target_is_the_analytic_one():
+    """Two Gaussian likelihoods sharing x, one with its own y, uniform on
+    a box of side 20: ln Z is known. A prior counted twice would be
+    ln(20) = 3.0 low."""
+    s1, s2, sy, d = 0.5, 0.8, 0.3, 0.6
+    m1 = _quad(["x", "y"], [0.0, 1.0], [s1, sy])
+    m2 = _quad(["x"], [d], [s2])
+    jt = joint({"m1": m1, "m2": m2}, shared={"x": ["m1", "m2"]})
+    want = (math.log(math.sqrt(2 * math.pi) * s1 * s2 / math.hypot(s1, s2))
+            - 0.5 * d * d / (s1 * s1 + s2 * s2)
+            + math.log(math.sqrt(2 * math.pi) * sy) - 2 * math.log(20.0))
+    s = anvil.smc(jt, n_particles=4096, seed=0)
+    assert abs(s.log_z - want) < 0.1
+
+
+def test_a_member_parameter_cannot_be_shared_twice():
+    """The later entry used to overwrite the column: the first sharing was
+    dropped while jt.shared still reported it."""
+    a, b = _quad(["x", "y"], [0, 0], [1, 1]), _quad(["x", "z"], [0, 0], [1, 1])
+    with pytest.raises(ValueError, match="already shared as 'x'"):
+        joint({"a": a, "b": b}, shared={"x": ["a", "b"], "x2": {"a": "x", "b": "z"}})
+
+
+def test_the_joint_does_not_follow_the_callers_dict():
+    a, b = _quad(["x", "y"], [0, 0], [1, 1]), _quad(["x", "z"], [0, 0], [1, 1])
+    md = {"a": a, "b": b}
+    jt = joint(md, shared={"x": ["a", "b"]})
+    u = mx.array(np.random.default_rng(2).standard_normal((4, 3)).astype(np.float32))
+    before = np.array(jt.log_prob(u))
+    md["b"] = _quad(["x", "z"], [5, 5], [0.1, 0.1])
+    md["c"] = _quad(["q"], [0], [1])
+    np.testing.assert_array_equal(np.array(jt.log_prob(u)), before)
+    assert list(jt.members) == ["a", "b"] and jt.members["b"] is b
+
+
+def test_a_member_overriding_log_prob_is_refused():
+    class Tempered(TransformedLogDensity):
+        def log_prob(self, u):
+            return 0.5 * super().log_prob(u)
+    t = Tempered(lambda v: -0.5 * mx.sum(v * v, axis=-1),
+                 Transform([ParamSpec("x", 0.0, 1.0)]))
+    with pytest.raises(TypeError, match="overrides log_prob"):
+        joint({"t": t})
+    # a joint is itself a legitimate member
+    a = _quad(["x", "y"], [0, 0], [1, 1])
+    inner = joint({"a": a})
+    assert joint({"j": inner, "b": _quad(["w"], [0], [1])}).names == ["j.a.x", "j.a.y", "b.w"]
+
+
+def test_bad_arguments_get_messages_that_name_the_problem():
+    a, b = _quad(["x", "y"], [0, 0], [1, 1]), _quad(["x", "z"], [0, 0], [1, 1])
+    with pytest.raises(TypeError, match="members as a dict"):
+        joint([a, b])
+    with pytest.raises(TypeError, match="list of member names"):
+        joint({"a": a, "b": b}, shared={"x": "ab"})
+    with pytest.raises(TypeError, match="list of member names"):
+        joint({"a": a, "b": b}, shared={"x": None})
+    with pytest.raises(ValueError, match="no members listed"):
+        joint({"a": a, "b": b}, shared={"x": []})
+    with pytest.raises(TypeError, match="shared must be a dict"):
+        joint({"a": a, "b": b}, shared=["x"])
+    with pytest.raises(TypeError, match="member names must be strings"):
+        joint({1: a, "b": b})
+    # a generated name colliding with a shared one says where both came from
+    with pytest.raises(ValueError, match=r"produced twice.*shared parameter 'a.y'.*member 'a' parameter 'y'"):
+        joint({"a": a, "b": b}, shared={"a.y": {"b": "z"}})
+    with pytest.raises(ValueError, match="loc must be finite"):
+        ParamSpec("x", loc=float("nan"))
+
+
+def test_shared_specs_agree_as_resolved():
+    """None on a finite box is Uniform there; separately built priors with
+    NaN placeholders are the same prior (dataclass == sees through those
+    on some Python versions only)."""
+    from anvil.priors import LogUniform, Uniform
+
+    def one(prior, lo=0.1, hi=2.0):
+        return TransformedLogDensity(lambda v: -0.5 * mx.sum(v * v, axis=-1),
+                                     Transform([ParamSpec("x", lo, hi, prior=prior)]))
+    assert joint({"a": one(None), "b": one(Uniform())}, shared={"x": ["a", "b"]}).dim == 1
+    assert joint({"a": one(LogUniform()), "b": one(LogUniform())}, shared={"x": ["a", "b"]}).dim == 1
+    assert joint({"a": one(None, 0, 2), "b": one(None, 0.0, 2.0)}, shared={"x": ["a", "b"]}).dim == 1
+    with pytest.raises(ValueError, match="must agree"):
+        joint({"a": one(Uniform()), "b": one(LogUniform())}, shared={"x": ["a", "b"]})
+    with pytest.raises(ValueError, match="must agree"):
+        joint({"a": one(Gaussian(1.0, 0.5)), "b": one(Gaussian(1.0, 0.6))}, shared={"x": ["a", "b"]})
+
+
+def test_twelve_chunked_members_compile_as_one_graph():
+    """A chained a + b + ... over the members let MLX fuse every member's
+    tail into one Metal kernel, which it then refused from about 8
+    fixed_point members of several chunks each -- members that compile
+    alone. The run fell back to eager, 4x slower."""
+    from anvil.precision import ChunkedGaussianLogLike, PrecisionPolicy
+
+    def member(seed):
+        rng = np.random.default_rng(seed)
+        x = np.linspace(-1, 1, 7000)
+        y = 0.3 + 1.2 * x + rng.normal(0, 1, x.size)
+
+        def model(v, xx):
+            return v[:, 0:1] + v[:, 1:2] * xx + v[:, 2:3] * mx.sin(v[:, 3:4] * xx)
+        lik = ChunkedGaussianLogLike(model, x, y, np.ones_like(x),
+                                     PrecisionPolicy(reduction="fixed_point", chunk_size=1000))
+        return TransformedLogDensity(lik, Transform([ParamSpec(n, -5.0, 5.0) for n in "abcd"]))
+    mem = {f"m{k}": member(k) for k in range(12)}
+    jt = joint(mem, shared={"a": list(mem), "b": list(mem)})
+    u0 = np.random.default_rng(1).normal(0, 0.1, (128, jt.dim))
+    k = anvil.EnsembleKernel(jt, seed=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        anvil.run(k, jt, u0, n_warmup=0, n_samples=3, seed=1)
+    assert not k.compile_refused

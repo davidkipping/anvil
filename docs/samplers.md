@@ -293,7 +293,9 @@ the global `mx.disable_compile()` worked. That is fixed, and the flag means
 one thing everywhere. Since 0.12.0 `run`'s default is `compile_step=None`,
 which keeps whatever `kernel.compile_step` already says, so setting the
 attribute on the kernel is honoured too; an explicit True or False to
-`run` still wins.
+`run` still wins. It is written to the kernel and stays there: after
+`run(kernel, ..., compile_step=False)`, a later `run(kernel, ...)` on the
+same object is uncompiled as well, until True is passed.
 
 A refusal is not the only way compilation can fail. A `log_prob` that
 leaves MLX part-way (NumPy, `.item()`, `float()`, host control flow on
@@ -301,7 +303,16 @@ array values) forces an evaluation inside the trace, which MLX reports as
 `[eval] Attempting to eval an array during function transformations`.
 There is nothing to fall back to in that case, since the graph was never
 built; since 0.12.0 the first compiled step re-raises it as a
-`ValueError` that names the cause and `compile_step=False`.
+`ValueError` that names the cause and the remedy. For a gradient-free
+method (the ensemble kernel, random-walk Metropolis, {func}`anvil.smc`,
+{func}`anvil.bridge_evidence`, `run_mcmc`) the remedy is
+`compile_step=False`. For ChEES and {func}`anvil.optimize` it is not:
+uncompiled they run, but no gradient flows through the part computed
+outside MLX, so they see only the Jacobian's and the priors' gradient.
+Measured on a three-parameter Gaussian written in NumPy, ChEES still drew
+from the right distribution but adapted its step to 0.004 where the MLX
+version of the same target gets 1.07. A gradient method needs the target
+in `mlx.core` ops.
 
 ## Measured performance
 
