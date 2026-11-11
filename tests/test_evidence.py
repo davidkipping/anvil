@@ -135,12 +135,17 @@ def test_smc_weights_modes_it_cannot_cross():
 def test_smc_group_error_bar_is_calibrated():
     t, lz = _separable()
     z = np.array([(r.log_z - lz) / r.log_z_se
-                  for r in (smc(t, 16384, n_groups=4, seed=100 + s) for s in range(20))])
+                  for r in (smc(t, 16384, n_groups=4, seed=100 + s) for s in range(30))])
     # err/se is t-distributed with n_groups - 1 = 3 dof: P(|t| < 2) = 0.86,
     # median |t| = 0.77. Its mean square has no finite variance, so it is
-    # not tested.
-    assert np.mean(np.abs(z) < 2) >= 0.7
-    assert 0.3 < np.median(np.abs(z)) < 1.6
+    # not tested. The seeds are fixed but the draws differ by platform, so
+    # the bounds are set to fail a calibrated error bar 0.3% of the time
+    # (20 runs with a 0.7 floor failed it 1.7% of the time, and CI's CPU
+    # runner landed there on every push from 0.10.2 on, at 0.65); they
+    # still catch an error bar half its true size 72% of the time.
+    # 200 seeds on the CPU backend gave 0.855 and 0.72.
+    assert np.mean(np.abs(z) < 2) >= 0.65
+    assert 0.35 < np.median(np.abs(z)) < 1.5
 
 
 def test_smc_adds_only_the_likelihood_constant():
