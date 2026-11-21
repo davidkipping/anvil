@@ -11,7 +11,8 @@ from .diagnostics import (Diagnostics, WarmupReport, diagnose,
 from .emcee_api import EnsembleSampler, HMCSampler
 from . import evidence
 from .evidence import (EvidenceResult, SMCResult, TemperedLogDensity,
-                       bridge_evidence, laplace_evidence, smc)
+                       bridge_evidence, flow_evidence, laplace_evidence, smc)
+from . import flow
 from .engine import Results, ResumeState, load_state, run
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
 from .logdensity import FunctionLogDensity, LogDensity
@@ -24,7 +25,7 @@ from .precision import (Certificate, PrecisionPolicy, certify,
 from .transforms import (JointLogDensity, ParamSpec, Transform,
                          TransformedLogDensity, joint)
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 
 __all__ = [
     "ChEESHMC",
@@ -60,6 +61,8 @@ __all__ = [
     "diagnose",
     "diagnostics",
     "evidence",
+    "flow",
+    "flow_evidence",
     "joint",
     "laplace_evidence",
     "load_state",

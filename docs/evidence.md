@@ -12,13 +12,14 @@ print(res)                         # anvil.smc: ln Z = ... (one population)
 lnB = anvil.smc(round_planet).log_z - anvil.smc(oblate_planet).log_z
 ```
 
-## Three tools
+## Four tools
 
 | call | what it does | cost | trust it when |
 |---|---|---|---|
 | {func}`~anvil.smc` | tempered sequential Monte Carlo from the prior | a fraction of a sampling run | it reports no stalled stages |
 | {func}`~anvil.bridge_evidence` | bridge sampling on posterior draws you already have | seconds | the posterior is close to unimodal, and the draws weight its modes correctly |
 | {func}`~anvil.laplace_evidence` | Gaussian at the mode | an optimisation | as a floor only |
+| {func}`~anvil.flow_evidence` | importance sampling with a trained flow ({doc}`flow`) | seconds, once a flow exists | the flow's importance efficiency is not tiny |
 
 ### Tempered SMC
 

@@ -78,7 +78,8 @@ skew, exkurt = anvil.whitened_shape(pilot.get_chain(flat=True))
 * both near zero → correlated but Gaussian-ish; turn on `dense=True`;
 * large → the posterior is curved, no global preconditioner will save
   you, and an affine-invariant ensemble move is likely the better buy
-  (better still, reparameterize the curvature away). Measured: ~0.01 on a
+  (better still, reparameterize the curvature away: {doc}`flow` does that
+  with a trained normalizing flow). Measured: ~0.01 on a
   correlated Gaussian, 1.9 on the transit posterior.
 
 ### Using a dense mass matrix

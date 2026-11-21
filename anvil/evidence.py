@@ -1,7 +1,7 @@
 """Bayesian evidence (marginal likelihood), as an optional calculation.
 
 Nothing here runs unless called: :func:`anvil.run` and the samplers never
-compute an evidence. Three tools, in decreasing order of what they assume:
+compute an evidence. Four tools:
 
 * :func:`smc` -- tempered sequential Monte Carlo. Particles drawn from the
   prior are carried to the posterior through L^beta, reweighted, resampled
@@ -15,6 +15,9 @@ compute an evidence. Three tools, in decreasing order of what they assume:
   draws have.
 * :func:`laplace_evidence` -- the Gaussian approximation at the mode. A
   floor, not an answer.
+* :func:`flow_evidence` -- importance sampling with a trained normalizing
+  flow (:mod:`anvil.flow`) as the proposal. The most accurate of these on
+  curved posteriors, when the flow is good.
 
 Measured on Elome transit fits (10,000 points, hybrid4 limb darkening;
 docs/evidence.md has the tables):
@@ -749,6 +752,65 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
                  "n_posterior": int(n1), "n_proposal": n2, "nu": float(nu),
                  "tau": float(tau), "log_z_folds": (float(r1[0]), float(r2[0])),
                  "se_folds": (math.sqrt(r1[1]), math.sqrt(r2[1]))},
+        wall_time=time.perf_counter() - t0)
+
+
+def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed: int = 0,
+                  max_rows: int = 1 << 10, compile_step: bool = True) -> EvidenceResult:
+    """ln Z by importance sampling, with a trained :class:`~anvil.flow.Flow`
+    as the proposal: ``n`` draws from the flow, weighted by target over
+    flow. The standard error is the delta-method one, ``sqrt(1/ESS - 1/n)``.
+
+    ``details["efficiency"]`` is the effective sample size as a fraction of
+    ``n``. A warning fires below 0.01, where the error bar is no longer
+    trustworthy. Importance sampling cannot see posterior mass the flow puts
+    almost nothing on, so the flow should come from :func:`anvil.flow.train`
+    (training that starts from the prior).
+
+    Measured on transit fits (10,000 points; references from an
+    independent calculation): oblate, 3 seeds 84871.773-84871.788 (se
+    0.007-0.012, efficiency 0.03-0.08) against 84871.8 +/- 0.1; spherical
+    hybrid4, 84874.385-84874.388 against 84874.36. Default SMC was 0.1-0.45
+    nats low on the oblate fit and Laplace 3-6 nats low on both. 262,144
+    draws took 14 s at 66 ms per batched evaluation of 512.
+
+    The target is evaluated ``max_rows`` draws at a time, and peak memory
+    grows with ``max_rows`` times the data size: on a transit likelihood,
+    about 8 bytes per row per data point (79 MB at 10,000 points, 392 MB at
+    50,000, against 629 MB and 3.1 GB at 8,192 rows), for 10-15% more time.
+
+    ``compile_step=False`` evaluates the target uncompiled, for one that
+    leaves MLX inside ``log_prob``."""
+    from .optimize import _Evaluator
+
+    _require_proper(target)
+    if int(flow.dim) != int(target.dim):
+        raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
+    t0 = time.perf_counter()
+    ev = _Evaluator(target.log_prob, compile_step=bool(compile_step),
+                    max_rows=max_rows, name="the flow-evidence target")
+    keys = mx.random.split(mx.random.key(seed), -(-n // max_rows))
+    lw = []
+    for i, s in enumerate(range(0, n, max_rows)):
+        u, logq = flow.sample(min(max_rows, n - s), key=keys[i])
+        lw.append(ev.value(np.array(u)) - np.array(logq, dtype=np.float64))
+    lw = np.concatenate(lw)
+    lw = np.where(np.isfinite(lw), lw, -np.inf)
+    lz = _logmeanexp(lw)
+    if not np.isfinite(lz):
+        raise ValueError("flow_evidence: the target is -inf at every flow draw")
+    w = np.exp(lw - lw.max())
+    ess = float(w.sum() ** 2 / (w * w).sum())
+    if ess < 0.01 * n:
+        warnings.warn(
+            f"flow_evidence: importance efficiency {ess / n:.4f} (ESS {ess:.0f} of "
+            f"{n}); the flow fits the posterior poorly and the error bar is not "
+            f"trustworthy", RuntimeWarning, stacklevel=2)
+    return EvidenceResult(
+        log_z=float(lz + target.log_norm_const),
+        log_z_se=float(math.sqrt(max(1.0 / ess - 1.0 / n, 0.0))),
+        method="flow importance sampling",
+        details={"efficiency": ess / n, "n": int(n)},
         wall_time=time.perf_counter() - t0)
 
 

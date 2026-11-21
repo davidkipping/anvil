@@ -22,6 +22,12 @@ class LogDensity:
     #: whether gradients may be requested (smooth, MLX-differentiable model)
     supports_grad: bool = True
 
+    # Optional, for a target sampled in other coordinates than the ones its
+    # draws should be recorded in (anvil.flow.FlowTarget is the built-in one):
+    # ``to_base(u, log_prob) -> (u_base, log_prob_base)`` maps stored frames,
+    # and ``resume_tag`` (a string) names the coordinates, so that run()
+    # refuses to resume a state written in different ones.
+
     def log_prob(self, u: mx.array) -> mx.array:
         """Batched log density: (n_chains, dim) -> (n_chains,).
 

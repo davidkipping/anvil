@@ -22,7 +22,7 @@ import numpy as np
 from . import engine
 from .kernels.base import Kernel
 from .kernels.chees import ChEESHMC
-from .kernels.ensemble import EnsembleKernel, StretchMove
+from .kernels.ensemble import DEMove, EnsembleKernel, StretchMove
 from .logdensity import FunctionLogDensity, LogDensity, validate_batched_signature
 
 
@@ -34,32 +34,94 @@ class EnsembleSampler:
     ``kernel`` replaces the ensemble kernel outright. ``run_mcmc`` returns
     a :class:`~anvil.Results`; ``get_chain``, ``get_log_prob`` and
     ``acceptance_fraction`` read it as emcee's do. Stretch and DE moves have
-    nothing to tune, so ``warmup`` only discards burn-in here."""
+    nothing to tune, so ``warmup`` only discards burn-in here.
+
+    ``target``: a :class:`~anvil.LogDensity` (for instance a
+    :class:`~anvil.TransformedLogDensity`) in place of ``log_prob_fn``.
+
+    **Flow mode** (``flow=``, off by default), for posteriors with curved
+    degeneracies: the walkers move in the coordinates of a normalizing flow
+    (:mod:`anvil.flow`), and ``get_chain`` reads in the target's own.
+    ``flow=True`` trains one at the first ``run_mcmc`` with
+    :func:`anvil.flow.train` -- SMC from the prior, then refinement rounds,
+    minutes to an hour on an expensive likelihood -- which needs ``target=`` a
+    :class:`~anvil.TransformedLogDensity` with proper priors; the trained
+    flow is kept as the ``flow`` attribute, its report printed, and later runs reuse
+    it. ``flow=`` a trained :class:`~anvil.flow.Flow` uses that one. The
+    default moves become stretch and differential evolution, half each
+    (the mix measured), and ``initial_state`` may be None to start from
+    the flow's training draws. ``kernel=`` cannot be combined with a flow:
+    a kernel is built on the target it samples."""
 
     def __init__(
         self,
         nwalkers: int,
         ndim: int,
-        log_prob_fn,
+        log_prob_fn=None,
         *,
+        target: LogDensity | None = None,
         moves=None,
         kernel: Kernel | None = None,
         seed: int = 0,
+        flow=False,
     ):
-        validate_batched_signature(log_prob_fn, ndim)
+        if (log_prob_fn is None) == (target is None):
+            raise TypeError("give log_prob_fn or target=, not both or neither")
         self.nwalkers = int(nwalkers)
         self.ndim = int(ndim)
-        self.target = FunctionLogDensity(log_prob_fn, ndim)
+        if target is None:
+            validate_batched_signature(log_prob_fn, ndim)
+            target = FunctionLogDensity(log_prob_fn, ndim)
+        elif int(target.dim) != self.ndim:
+            raise ValueError(f"target has dim {target.dim}, but ndim={self.ndim}")
+        self.target = target
         self.seed = seed
-        self._moves = moves  # consumed once ensemble moves land (M3)
+        self._moves = moves
         self._kernel = kernel
         self._results: engine.Results | None = None
+        self._init_flow(flow)
 
-    def _make_kernel(self) -> Kernel:
+    def _init_flow(self, flow) -> None:
+        from .flow import Flow
+        from .transforms import TransformedLogDensity
+
+        if flow is False or flow is None:
+            self.flow = None
+            self._train_flow = False
+            return
+        if self._kernel is not None:
+            raise ValueError("kernel= cannot be combined with flow=: a kernel is "
+                             "built on the target it samples, and in flow mode that "
+                             "is the target in the flow's coordinates")
+        if isinstance(flow, Flow):
+            if flow.dim != self.ndim:
+                raise ValueError(f"the flow has dim {flow.dim}, but ndim={self.ndim}")
+            self.flow, self._train_flow = flow, False
+        elif flow is True:
+            if not (isinstance(self.target, TransformedLogDensity)
+                    and self.target.is_proper):
+                raise ValueError(
+                    "flow=True trains the flow from the prior (anvil.smc), so it needs "
+                    "target= a TransformedLogDensity with proper priors; or pass flow= a "
+                    "Flow trained with anvil.flow.train(..., draws=...)")
+            if self.nwalkers % 2:
+                raise ValueError("ensemble moves require an even number of walkers")
+            #: the flow in use (trained at the first run_mcmc for flow=True)
+            self.flow, self._train_flow = None, True
+        else:
+            raise TypeError(f"flow= takes True, False or an anvil.flow.Flow, "
+                            f"not {type(flow).__name__}")
+
+    def _sampled_target(self) -> LogDensity:
+        return self.target if self.flow is None else self.flow.wrap(self.target)
+
+    def _make_kernel(self, target: LogDensity | None = None) -> Kernel:
         if self._kernel is not None:
             return self._kernel
-        moves = self._moves or [(StretchMove(), 1.0)]
-        return EnsembleKernel(self.target, moves=moves, seed=self.seed)
+        target = self.target if target is None else target
+        default = ([(StretchMove(), 0.5), (DEMove(), 0.5)] if self.flow is not None
+                   else [(StretchMove(), 1.0)])
+        return EnsembleKernel(target, moves=self._moves or default, seed=self.seed)
 
     def run_mcmc(
         self,
@@ -79,8 +141,26 @@ class EnsembleSampler:
         are then recorded, one every ``thin_by`` frozen iterations.
         ``compile_step`` is passed to :func:`anvil.run` (False runs the
         step uncompiled, for a ``log_prob`` that leaves MLX).
+
+        In flow mode ``initial_state`` is in the target's own coordinates
+        (it is mapped into the flow's), and may be None to start from the
+        flow's training draws: ``run_mcmc(None, nsteps, warmup=...)``; ``flow=True`` trains the flow here first.
         """
-        p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
+        if self._train_flow and self.flow is None:
+            from .flow import train
+            self.flow = train(self.target, n_chains=self.nwalkers, seed=self.seed,
+                              progress=progress)
+            print(self.flow.report, flush=True)
+        sampled = self._sampled_target()
+        if initial_state is None:
+            if self.flow is None:
+                raise TypeError("run_mcmc() needs initial_state (it may be None "
+                                "only in flow mode)")
+            p0 = self.flow.start(self.nwalkers, seed=self.seed)
+        else:
+            p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
+            if self.flow is not None and p0.shape == (self.nwalkers, self.ndim):
+                p0 = self.flow.to_latent(p0)
         if p0.shape != (self.nwalkers, self.ndim):
             raise ValueError(
                 f"initial_state must have shape ({self.nwalkers}, {self.ndim}), "
@@ -96,8 +176,8 @@ class EnsembleSampler:
                 "length 1.0) unadapted; pass warmup= or tune=True",
                 RuntimeWarning, stacklevel=2)
         self._results = engine.run(
-            self._make_kernel(),
-            self.target,
+            self._make_kernel(sampled),
+            sampled,
             p0,
             n_warmup=warmup,
             n_samples=nsteps,
@@ -145,6 +225,9 @@ class HMCSampler(EnsembleSampler):
         seed: int = 0,
         **kernel_kwargs,
     ):
+        if "flow" in kernel_kwargs:
+            raise TypeError("HMCSampler has no flow mode; use EnsembleSampler(flow=...), "
+                            "or wrap the target yourself (anvil.flow)")
         if target is not None:
             self.target = target
             self.nwalkers, self.ndim, self.seed = int(nwalkers), int(ndim), seed
@@ -153,9 +236,12 @@ class HMCSampler(EnsembleSampler):
             super().__init__(nwalkers, ndim, log_prob_fn, seed=seed)
         self._kernel_kwargs = kernel_kwargs
         self._kernel = None
+        # flow mode is the ensemble sampler's: ChEES trailed it 20-40x in
+        # flow coordinates on the oblate fit (anvil.flow docstring)
+        self.flow, self._train_flow = None, False
 
-    def _make_kernel(self) -> Kernel:
-        return ChEESHMC(self.target, **self._kernel_kwargs)
+    def _make_kernel(self, target: LogDensity | None = None) -> Kernel:
+        return ChEESHMC(self.target if target is None else target, **self._kernel_kwargs)
 
     @property
     def n_divergent(self) -> int:

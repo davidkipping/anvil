@@ -245,6 +245,30 @@ nat low (0.17-0.30 on an oblate-planet fit), whatever the population size;
 draws you already have) and `anvil.laplace_evidence` (a floor) are the
 cheap checks. See the evidence guide for the measurements.
 
+## Flow mode (optional)
+
+```python
+flow = anvil.flow.train(target)                # SMC from the prior, refinement, a frozen flow
+print(flow.report)                             # says "no flow needed" when it isn't
+ft = flow.wrap(target)
+res = anvil.run(anvil.EnsembleKernel(ft), ft, flow.start(512), n_warmup=500, n_samples=2000)
+res.get_chain()                                # in the target's own coordinates
+# or: anvil.EnsembleSampler(512, ndim, target=target, flow=True)
+```
+
+For posteriors with curved degeneracies, where both ChEES and the ensemble
+crawl. A normalizing flow trained from the prior maps the posterior close
+to a standard normal, and the walkers move there. It is exact for any
+frozen flow, and the priors are unchanged. On oblate-planet transit fits
+no plain sampler converged (R-hat 2.8-35), while the ensemble in flow
+coordinates did, with seeds agreeing to 0.02-0.07 posterior sd. On a
+curved limb-darkening prior it ran 39-94x faster per second. On a
+near-Gaussian posterior it is 3-4x slower, and the report says so before
+you sample. Training costs minutes to an hour, mostly SMC. Memory is no
+higher than SMC's or the plain samplers'. `anvil.flow_evidence(target,
+flow)` gives ln Z by importance sampling: 84871.77-84871.79 against an
+oblate reference of 84871.8 +/- 0.1. See the flow-mode guide.
+
 ## Extending a run
 
 Short of effective samples? Extend the same chains rather than start over:

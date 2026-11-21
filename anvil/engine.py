@@ -90,6 +90,10 @@ class ResumeState:
     kernel: str
     kernel_ckpt: dict[str, float] = field(default_factory=dict)
     anvil_version: str = ""
+    #: the target's ``resume_tag`` when the state was written ("" for a
+    #: target without one): a :class:`~anvil.flow.FlowTarget` names its flow,
+    #: whose coordinates the chain state is in
+    target_tag: str = ""
 
     # -- validation --------------------------------------------------------
 
@@ -115,6 +119,15 @@ class ResumeState:
                 f"uses {type(kernel).__name__}: one kernel's frozen params "
                 f"mean nothing to another. To change kernels, start a fresh "
                 f"run (with warmup) from the saved positions instead.")
+        if target is not None:
+            tag = getattr(target, "resume_tag", "") or ""
+            if tag != (self.target_tag or ""):
+                was, now = self.target_tag or "untagged", tag or "untagged"
+                raise ValueError(
+                    f"resume state was written in other coordinates than "
+                    f"this target's (state: {was}; target: {now}). Positions "
+                    f"in one flow's coordinates mean nothing in another's; "
+                    f"start a fresh run, with warmup, instead.")
         t_dim = getattr(target, "dim", None)
         if t_dim is not None and int(t_dim) != self.dim:
             raise ValueError(
@@ -216,6 +229,7 @@ class ResumeState:
             kernel=self.kernel,
             kernel_ckpt=dict(self.kernel_ckpt),
             anvil_version=self.anvil_version,
+            target_tag=self.target_tag,
         )
 
     # -- persistence -------------------------------------------------------
@@ -234,6 +248,8 @@ class ResumeState:
             "n_chains": np.array(int(self.n_chains)),
             "dim": np.array(int(self.dim)),
         }
+        if self.target_tag:
+            out["target_tag"] = np.array(self.target_tag)
         for k, v in self.state.items():
             out[f"state__{k}"] = np.array(v)
         for k, v in self.params.items():
@@ -267,6 +283,7 @@ def load_state(path) -> ResumeState:
             iteration=int(z["iteration"]), seed=int(z["seed"]),
             n_chains=int(z["n_chains"]), dim=int(z["dim"]),
             kernel=str(z["kernel"]), anvil_version=str(z["anvil_version"]),
+            target_tag=str(z["target_tag"]) if "target_tag" in z else "",
         )
     rs.check()
     return rs
@@ -295,6 +312,8 @@ class Results:
     iters_consumed: int = 0
     kernel: str = ""
     kernel_ckpt: dict[str, float] = field(default_factory=dict)
+    #: the target's ``resume_tag`` (see :attr:`ResumeState.target_tag`)
+    target_tag: str = ""
 
     def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False):
         return self.backend.get_chain(discard, thin, flat)
@@ -315,6 +334,7 @@ class Results:
             kernel=self.kernel,
             kernel_ckpt=dict(self.kernel_ckpt),
             anvil_version=_anvil_version(),
+            target_tag=self.target_tag,
         )
 
     def save_state(self, path) -> None:
@@ -451,6 +471,14 @@ def run(
     draws round differently), each step is slower and evaluated eagerly,
     and ``results.extras["compile_refused"]`` records that it happened. Pass
     False to skip the attempt on a target known to be refused.
+
+    **A target in other coordinates** -- a :class:`~anvil.flow.FlowTarget`,
+    or any target with a ``to_base(u, log_prob)`` method -- is sampled in
+    its own coordinates and recorded in the base ones: each stored frame
+    goes through ``to_base`` first, so ``get_chain`` and ``get_log_prob``
+    read as if the base target had been sampled. The chain state and any
+    resume state stay in the sampled coordinates, tagged with the target's
+    ``resume_tag``, and a resume on a target with a different tag raises.
 
     ``archive`` (a :class:`~anvil.surrogate.TrainingArchive`) records
     every stored (u, log_prob) frame as future emulator training data —
@@ -693,10 +721,14 @@ def run(
     # `depth` iterations later, by which time the work is already done
     pending: deque = deque()
 
+    to_base = getattr(target, "to_base", None)
+
     def _flush_one(frame):
         t_i, u_dev, lp_dev = frame
         if (t_i + 1) % thin:
             return
+        if to_base is not None:
+            u_dev, lp_dev = to_base(u_dev, lp_dev)
         # np.array() forces evaluation, but for a pipelined frame the
         # iteration finished several steps ago, so it is a pure copy
         u_np, lp_np = np.array(u_dev), np.array(lp_dev)
@@ -798,4 +830,5 @@ def run(
         iters_consumed=iter0 + n_warmup + total_iters,
         kernel=type(kernel).__name__,
         kernel_ckpt=kernel.checkpoint(),
+        target_tag=getattr(target, "resume_tag", "") or "",
     )

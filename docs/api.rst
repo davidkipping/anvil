@@ -24,7 +24,13 @@ Evidence (optional)
 
 .. automodule:: anvil.evidence
    :members: smc, SMCResult, bridge_evidence, laplace_evidence,
-             EvidenceResult, TemperedLogDensity
+             flow_evidence, EvidenceResult, TemperedLogDensity
+
+Flow mode (optional)
+--------------------
+
+.. automodule:: anvil.flow
+   :members: train, refine, Flow, FlowTarget, FlowReport
 
 Kernels
 -------

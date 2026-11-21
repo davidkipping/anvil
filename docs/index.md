@@ -32,6 +32,9 @@ M2 Max.
 - **Evidence (optional)** — {func}`~anvil.smc`: ln Z by tempered sequential
   Monte Carlo, for comparing models. A separate call; sampling never
   computes it.
+- **Flow mode (optional)** — {mod}`anvil.flow`: for posteriors with curved
+  degeneracies, sample in the coordinates of a normalizing flow trained
+  from the prior. Exact, priors unchanged; off unless turned on.
 
 ## Answering the questions a run raises
 
@@ -47,6 +50,7 @@ this project out at least once:
 | {func}`~anvil.diagnostics.diagnose` | did it converge, and how many effective samples? |
 | {func}`~anvil.diagnostics.warmup_report` | was warmup long enough — or far longer than needed — or are some chains lost? |
 | {func}`~anvil.diagnostics.whitened_shape` | correlated, or curved? (predicts whether `dense=True` pays) |
+| {func}`anvil.flow.train` (optional) | curved: can a flow straighten it, and is it worth it? |
 | {func}`~anvil.precision.validate_precision` | is the float32 likelihood accurate enough to trust? |
 | {func}`~anvil.precision.certify` | how much did float32 bias the posterior, and what is it corrected? |
 
@@ -66,6 +70,7 @@ priors
 samplers
 optimize
 evidence
+flow
 joint
 api
 ```
