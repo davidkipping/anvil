@@ -270,6 +270,25 @@ higher than SMC's or the plain samplers'. `anvil.flow_evidence(target,
 flow)` gives ln Z by importance sampling: 84871.77-84871.79 against an
 oblate reference of 84871.8 +/- 0.1. See the flow-mode guide.
 
+## Saving results, with how they were made
+
+```python
+res.save("run.npz")                  # draws + metadata
+saved = anvil.load_results("run.npz")
+saved.metadata["kernel"], saved.metadata["environment"]["anvil"]
+```
+
+Every result records how it was made: the anvil, MLX and NumPy versions,
+the chip, the date, every argument of the call, the sampler's settings
+(each ensemble move and its weight, ChEES's options), and the target's
+parameters with their bounds and priors. A flow's file adds the call that
+trained it with all its settings, its report and its training draws;
+`smc`, `flow_evidence`, `bridge_evidence` and `laplace_evidence` record
+their arguments too, and each has `save()`. The files are plain `.npz` or
+JSON. The model function is recorded by name and the data not at all, so
+keep the script and the data with the results. See the reproducibility
+guide.
+
 ## Extending a run
 
 Short of effective samples? Extend the same chains rather than start over:

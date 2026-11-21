@@ -54,6 +54,11 @@ class Kernel:
         """Build the initial chain state (caches log_prob etc.)."""
         raise NotImplementedError
 
+    def describe(self) -> dict:
+        """The kernel's class and settings, as a saved result records them
+        (see :mod:`anvil.metadata`). Subclasses add their settings."""
+        return {"class": type(self).__name__}
+
     def step(
         self, key: mx.array, state: ChainState, params: dict[str, mx.array]
     ) -> tuple[ChainState, StepInfo]:

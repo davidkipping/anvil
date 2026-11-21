@@ -58,6 +58,7 @@ import math
 import os
 import time
 import warnings
+import dataclasses
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -136,6 +137,11 @@ class Flow:
         self.report: FlowReport | None = None
         #: draws in u that :meth:`start` picks from (set by :func:`train`)
         self.pool: np.ndarray | None = None
+        #: The record of how this flow was made (the call -- :func:`train`,
+        #: :func:`refine` or :meth:`fit` -- and its arguments, the versions
+        #: and machine, the target; see :mod:`anvil.metadata`), written by
+        #: :meth:`save`.
+        self.training: dict | None = None
 
     @staticmethod
     def _split(ia, ib):
@@ -285,6 +291,13 @@ class Flow:
                 break
         self.params = best_params
         mx.eval(self.params)
+        from .metadata import environment
+        self.training = {
+            "function": "anvil.flow.Flow.fit", "environment": environment(),
+            "arguments": {"max_steps": max_steps, "batch": batch, "lr": lr,
+                          "patience": patience, "check_every": check_every,
+                          "retries": retries, "seed": seed, "compile": bool(compile)},
+            "n_draws": int(len(x))}
         return {"gain_nats": base - best, "val_nll": best, "val_nll_whitened": base,
                 "steps": steps, "n_train": len(xt), "n_val": int(xv.shape[0]),
                 "n_far": n_far, "retries": attempt, "diverged": diverged,
@@ -373,6 +386,19 @@ class Flow:
             return self.to_latent(self.pool[pick])
         return mx.array(rng.standard_normal((n, self.dim)).astype(np.float32))
 
+    def describe(self) -> dict:
+        """Size and identity: what a saved result records about this flow."""
+        out = {"class": "Flow", "dim": self.dim, "n_layers": self.n_layers,
+               "hidden": self.hidden, "s_max": self.s_max, "n_params": self.n_params,
+               "fingerprint": self.fingerprint}
+        if self.training:
+            out["trained_by"] = {k: self.training.get(k) for k in ("function", "arguments")}
+        if self.report is not None:
+            out["report"] = {"gain_nats": self.report.gain_nats,
+                             "is_efficiency": self.report.is_efficiency,
+                             "warnings": self.report.warnings}
+        return out
+
     @property
     def fingerprint(self) -> str:
         """Hash of the flow's weights, the same for the same map."""
@@ -390,16 +416,25 @@ class Flow:
                 out[f"l{k}__{name}"] = np.array(v)
         return out
 
-    def save(self, path) -> None:
-        """Write the frozen flow to ``path`` (``.npz``, no pickle). The
-        report and pool are not saved."""
+    def save(self, path, pool: bool = True) -> None:
+        """Write the frozen flow to ``path`` (``.npz``, no pickle), with
+        ``metadata``: a JSON string holding the :attr:`report`, the
+        :attr:`training` record (the call that made it and its arguments,
+        versions, machine, target) and the versions at saving. ``pool``:
+        also write the training draws that :meth:`start` picks from (4
+        bytes per parameter per draw: 4 MB for :func:`train`'s 102,400 at
+        10 parameters), so a loaded flow starts where this one would."""
+        from .engine import _savez
+        from .metadata import FORMAT, dumps, environment
         out = self._arrays()
         out["config"] = np.array([self.dim, self.n_layers, self.hidden], dtype=np.int64)
         out["s_max"] = np.array(self.s_max)
-        path = os.fspath(path)
-        np.savez(path, **out)
-        if not path.endswith(".npz") and os.path.exists(path + ".npz"):
-            os.replace(path + ".npz", path)
+        out["metadata"] = np.array(dumps({
+            "format": FORMAT, "kind": "anvil.flow.Flow", "environment": environment(),
+            "flow": self.describe(), "training": self.training, "report": self.report}))
+        if pool and self.pool is not None:
+            out["pool"] = np.asarray(self.pool, dtype=np.float32)
+        _savez(path, out)
 
     @classmethod
     def load(cls, path) -> "Flow":
@@ -415,6 +450,13 @@ class Flow:
             f.params = [{name: mx.array(z[f"l{k}__{name}"])
                          for name in ("W1", "b1", "W2", "b2", "W3", "b3")}
                         for k in range(n_layers)]
+            if "pool" in z.files:
+                f.pool = np.array(z["pool"])
+            if "metadata" in z.files:                    # written since 0.14.0
+                import json
+                meta = json.loads(str(z["metadata"]))
+                f.training = meta.get("training")
+                f.report = FlowReport._from_json(meta.get("report"))
         return f
 
 
@@ -464,6 +506,11 @@ class FlowTarget(LogDensity):
         u, ld = self.flow.forward(z)
         return u, log_prob - ld
 
+    def describe(self) -> dict:
+        from .metadata import describe_target
+        return {**super().describe(), "flow": self.flow.describe(),
+                "target": describe_target(self.target)}
+
 
 @dataclass
 class FlowReport:
@@ -495,6 +542,14 @@ class FlowReport:
     smc: dict | None = None
     seconds: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+
+    @classmethod
+    def _from_json(cls, d):
+        """A report from its saved JSON (None stays None)."""
+        if not d:
+            return None
+        names = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
 
     def __str__(self) -> str:
         lines = [f"anvil flow: fit gain {self.gain_nats:.2f} nats over whitening, "
@@ -686,6 +741,17 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
     seconds["final fit"] = time.perf_counter() - t2
     flow.pool = pool[-1] if rounds else su
     flow.report = _make_report(target, flow, info, smc_facts, seconds, seed, compile_step)
+    from .metadata import describe_target, environment
+    flow.training = {
+        "function": "anvil.flow.train", "environment": environment(),
+        "arguments": {"rounds": rounds, "n_chains": n_chains, "round_warmup": round_warmup,
+                      "round_samples": round_samples, "n_layers": n_layers, "hidden": hidden,
+                      "seed": seed, "smc_kwargs": smc_kwargs, "fit_kwargs": fit_kwargs,
+                      "compile_step": compile_step},
+        "draws": "anvil.smc from the prior" if draws is None else
+                 f"supplied ({type(draws).__name__}, {len(su)} finite rows)",
+        "final_fit": flow.training, "target": describe_target(target),
+        "seconds": seconds}
     if progress:
         print(flow.report, flush=True)
     for w in flow.report.warnings:
@@ -706,5 +772,7 @@ def refine(target: LogDensity, draws, *, seed: int = 0, n_layers: int = 8,
     256,000 production draws took R-hat at 10,000 iterations from 1.024 to
     1.012, and 1.006 at 40,000; at 10,000 points it reached 1.013 and went
     no further."""
-    return train(target, draws=draws, rounds=0, seed=seed, n_layers=n_layers,
+    flow = train(target, draws=draws, rounds=0, seed=seed, n_layers=n_layers,
                  hidden=hidden, fit_kwargs=fit_kwargs, compile_step=compile_step)
+    flow.training["function"] = "anvil.flow.refine"
+    return flow

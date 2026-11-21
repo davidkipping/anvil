@@ -317,6 +317,10 @@ class Results:
     kernel_ckpt: dict[str, float] = field(default_factory=dict)
     #: the target's ``resume_tag`` (see :attr:`ResumeState.target_tag`)
     target_tag: str = ""
+    #: The record of how the run was made (versions, machine, date, every
+    #: ``run()`` argument, the kernel's and target's settings, wall time;
+    #: see :mod:`anvil.metadata`), written by :meth:`save`.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False):
         return self.backend.get_chain(discard, thin, flat)
@@ -344,6 +348,91 @@ class Results:
         """Persist enough to continue this run in another process
         (``.npz``, no pickle). See :func:`anvil.load_state`."""
         self.resume_state().save(path)
+
+    def save(self, path) -> None:
+        """Write the draws and how they were made to ``path`` (``.npz``, no
+        pickle): ``chain`` and ``log_prob`` (as ``get_chain()`` and
+        ``get_log_prob()``), ``accept_fraction``, the final positions and
+        adapted parameters, the diagnostics in ``extras``, and
+        ``metadata`` -- a JSON string with the versions, machine, date,
+        every ``run()`` argument, the kernel's and target's settings and
+        the wall time. :func:`anvil.load_results` reads it back; any
+        ``.npz`` reader can too.
+
+        The model function and the data are recorded by name only: keep the
+        script that built the target with the file. To continue the run,
+        use :meth:`save_state` as well."""
+        from .metadata import dumps
+        out: dict[str, np.ndarray] = {
+            "metadata": np.array(dumps(self.metadata)),
+            "chain": np.asarray(self.get_chain()),
+            "log_prob": np.asarray(self.get_log_prob()),
+            "accept_fraction": np.asarray(self.accept_fraction),
+        }
+        for k in ("u", "log_prob"):
+            if k in self.final_state:
+                out[f"final__{k}"] = np.array(self.final_state[k])
+        for k, v in self.final_params.items():
+            out[f"params__{k}"] = np.array(v)
+        for k, v in self.extras.items():
+            if isinstance(v, (bool, int, float, np.ndarray, np.integer, np.floating)):
+                out[f"extras__{k}"] = np.asarray(v)
+        _savez(path, out)
+
+
+@dataclass
+class SavedResults:
+    """A run read back by :func:`load_results`: the draws, with
+    ``get_chain`` / ``get_log_prob`` as on :class:`Results`, and
+    ``metadata``, the record of how they were made."""
+
+    chain: np.ndarray
+    log_prob: np.ndarray
+    accept_fraction: np.ndarray
+    metadata: dict[str, Any]
+    final_u: np.ndarray | None = None
+    final_params: dict[str, np.ndarray] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def names(self) -> list[str] | None:
+        """Parameter names, when the target recorded them."""
+        target = self.metadata.get("target", {})
+        while "parameters" not in target and "target" in target:
+            target = target["target"]                    # a flow target's base
+        params = target.get("parameters")
+        return [p["name"] for p in params] if params else None
+
+    def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False) -> np.ndarray:
+        out = self.chain[discard::thin]
+        return out.reshape(-1, out.shape[-1]) if flat else out
+
+    def get_log_prob(self, discard: int = 0, thin: int = 1, flat: bool = False) -> np.ndarray:
+        out = self.log_prob[discard::thin]
+        return out.reshape(-1) if flat else out
+
+
+def load_results(path) -> SavedResults:
+    """Read a run written by :meth:`Results.save`."""
+    import json
+    with np.load(os.fspath(path), allow_pickle=False) as z:
+        if "metadata" not in z.files or "chain" not in z.files:
+            raise ValueError(f"{os.fspath(path)} is not a run written by Results.save")
+        return SavedResults(
+            chain=z["chain"], log_prob=z["log_prob"], accept_fraction=z["accept_fraction"],
+            metadata=json.loads(str(z["metadata"])),
+            final_u=z["final__u"] if "final__u" in z.files else None,
+            final_params={k[len("params__"):]: z[k] for k in z.files
+                          if k.startswith("params__")},
+            extras={k[len("extras__"):]: z[k] for k in z.files if k.startswith("extras__")})
+
+
+def _savez(path, out: dict) -> None:
+    """``np.savez`` to exactly ``path``: it appends .npz to a bare name."""
+    path = os.fspath(path)
+    np.savez(path, **out)
+    if not path.endswith(".npz") and os.path.exists(path + ".npz"):
+        os.replace(path + ".npz", path)
 
 
 def _eager_log_prob(kernel, state, target) -> np.ndarray:
@@ -521,7 +610,21 @@ def run(
     bit-identical at any depth -- only the timing of evaluation changes,
     which the engine tests assert directly. Sampling only: warmup keeps its
     barrier because adaptation reads freshly-computed parameters on the
-    host, and pipelining it would mean adapting from stale ones."""
+    host, and pipelining it would mean adapting from stale ones.
+
+    The returned :class:`Results` carries ``metadata``: the versions,
+    machine and date, every argument of this call, the kernel's and the
+    target's settings (:mod:`anvil.metadata`), the wall time and the
+    diagnostics. :meth:`Results.save` writes it with the draws."""
+    from .metadata import FORMAT, describe_kernel, describe_target, environment
+    t_run = time.perf_counter()
+    env = environment()
+    run_args = {"n_warmup": n_warmup, "n_samples": n_samples, "thin": thin, "seed": seed,
+                "compile_step": compile_step, "pipeline": pipeline,
+                "reanchor_every": reanchor_every, "warmup_probes": warmup_probes,
+                "storage": type(storage).__name__ if storage is not None else "MemoryBackend",
+                "archive": archive is not None, "callback": callback is not None,
+                "resume": resume is not None}
     if u0 is not None:
         if not isinstance(u0, mx.array) or u0.dtype != mx.float32:
             # through NumPy for every other input, MLX arrays included: a
@@ -842,4 +945,20 @@ def run(
         kernel=type(kernel).__name__,
         kernel_ckpt=kernel.checkpoint(),
         target_tag=getattr(target, "resume_tag", "") or "",
+        metadata={
+            "format": FORMAT,
+            "kind": "anvil.run",
+            "environment": env,
+            # as passed; "resolved" holds what the run then used
+            "arguments": run_args,
+            "resolved": {"n_chains": n_chains, "dim": dim, "n_warmup": n_warmup,
+                         "n_samples": n_samples, "thin": thin, "seed": seed,
+                         "compile_step": compile_step, "pipeline_depth": depth,
+                         "resumed_from_iteration": iter0 if resume is not None else None,
+                         "iterations_consumed": iter0 + n_warmup + total_iters},
+            "kernel": describe_kernel(kernel),
+            "target": describe_target(target),
+            "target_tag": getattr(target, "resume_tag", "") or "",
+            "wall_time_s": time.perf_counter() - t_run,
+        },
     )

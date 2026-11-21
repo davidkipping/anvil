@@ -13,7 +13,8 @@ from . import evidence
 from .evidence import (EvidenceResult, SMCResult, TemperedLogDensity,
                        bridge_evidence, flow_evidence, laplace_evidence, smc)
 from . import flow
-from .engine import Results, ResumeState, load_state, run
+from .engine import Results, ResumeState, SavedResults, load_results, load_state, run
+from . import metadata
 from .kernels import ChEESHMC, DEMove, EnsembleKernel, StretchMove
 from .logdensity import FunctionLogDensity, LogDensity
 from .optimize import OptimizeResult, optimize
@@ -25,7 +26,7 @@ from .precision import (Certificate, PrecisionPolicy, certify,
 from .transforms import (JointLogDensity, ParamSpec, Transform,
                          TransformedLogDensity, joint)
 
-__version__ = "0.13.4"
+__version__ = "0.14.0"
 
 __all__ = [
     "ChEESHMC",
@@ -52,6 +53,7 @@ __all__ = [
     "Results",
     "ResumeState",
     "SMCResult",
+    "SavedResults",
     "StretchMove",
     "TemperedLogDensity",
     "Transform",
@@ -65,7 +67,9 @@ __all__ = [
     "flow_evidence",
     "joint",
     "laplace_evidence",
+    "load_results",
     "load_state",
+    "metadata",
     "optimize",
     "certify",
     "run",

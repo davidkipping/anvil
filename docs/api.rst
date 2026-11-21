@@ -11,7 +11,13 @@ Engine
 ------
 
 .. automodule:: anvil.engine
-   :members: run, Results, ResumeState, load_state
+   :members: run, Results, ResumeState, load_state, load_results, SavedResults
+
+Saved metadata
+--------------
+
+.. automodule:: anvil.metadata
+   :members: environment, describe_target, describe_kernel, jsonable, summary, record
 
 Optimization
 ------------

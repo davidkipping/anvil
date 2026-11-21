@@ -39,6 +39,12 @@ class LogDensity:
         return when the model fails" in the samplers guide."""
         raise NotImplementedError
 
+    def describe(self) -> dict:
+        """What a saved result records about this target (see
+        :mod:`anvil.metadata`). Subclasses add what they know."""
+        return {"class": type(self).__name__, "dim": int(self.dim),
+                "supports_grad": bool(self.supports_grad)}
+
     def log_prob_and_grad(self, u: mx.array) -> tuple[mx.array, mx.array]:
         """Per-chain value and gradient in one forward+backward pass.
 
@@ -61,6 +67,10 @@ class FunctionLogDensity(LogDensity):
 
     def log_prob(self, u: mx.array) -> mx.array:
         return self._fn(u)
+
+    def describe(self) -> dict:
+        from .metadata import jsonable
+        return {**super().describe(), "function": jsonable(self._fn)}
 
 
 class CountingLogDensity(LogDensity):
@@ -85,6 +95,10 @@ class CountingLogDensity(LogDensity):
     @property
     def resume_tag(self) -> str:
         return getattr(self.inner, "resume_tag", "") or ""
+
+    def describe(self) -> dict:
+        from .metadata import describe_target
+        return {**super().describe(), "inner": describe_target(self.inner)}
 
     def log_prob(self, u: mx.array) -> mx.array:
         self.n_calls += 1

@@ -345,6 +345,25 @@ class TransformedLogDensity(LogDensity):
         """The parameter names, ``transform.names``."""
         return self.transform.names
 
+    def describe(self) -> dict:
+        """Class, dimension, every parameter (name, bounds, u-space
+        scaling, reporting units, and the prior in force), the model
+        function's name and the declared normalising constant. The
+        function's code and the data are not recorded."""
+        from .metadata import jsonable
+        params = []
+        for spec, prior in zip(self.transform.specs, self.transform.priors):
+            params.append({"name": spec.name, "lo": spec.lo, "hi": spec.hi,
+                           "loc": spec.loc, "scale": spec.scale,
+                           "report_offset": spec.report_offset,
+                           "report_scale": spec.report_scale,
+                           "prior": prior, "prior_declared": spec.prior is not None})
+        out = {**super().describe(), "parameters": jsonable(params),
+               "proper": bool(self.is_proper), "model_log_prob": jsonable(self._fn),
+               "model_log_prob_hi": jsonable(self._fn_hi),
+               "model_log_norm": jsonable(self.model_log_norm)}
+        return out
+
     @property
     def model_log_prob(self) -> Callable[[mx.array], mx.array]:
         """The model-space function this target wraps -- the likelihood plus
@@ -471,6 +490,12 @@ class JointLogDensity(TransformedLogDensity):
 
     def member_columns(self, name: str) -> np.ndarray:
         return self._columns[name].copy()
+
+    def describe(self) -> dict:
+        from .metadata import jsonable
+        return {**super().describe(),
+                "members": {k: t.describe() for k, t in self.members.items()},
+                "member_columns": jsonable(self._columns), "shared": self.shared}
 
 
 def joint(members: dict[str, TransformedLogDensity],

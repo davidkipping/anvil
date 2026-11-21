@@ -53,6 +53,7 @@ import numpy as np
 from .compile import CompiledOrEager
 from .kernels.ensemble import DEMove, StretchMove
 from .logdensity import LogDensity
+from .metadata import record
 from .rng import KeyStream
 from .transforms import TransformedLogDensity
 
@@ -196,6 +197,49 @@ class SMCResult:
     stalled: int = 0
     ancestors: np.ndarray | None = None
     unsettled: int = 0
+    #: The record of how it was made (versions, machine, date, every
+    #: argument of the :func:`smc` call, the target; see :mod:`anvil.metadata`).
+    metadata: dict = field(default_factory=dict)
+
+    def save(self, path) -> None:
+        """Write to ``path`` (``.npz``, no pickle): the particles (``u``,
+        ``model``, ``physical``, ``log_likelihood``, ``ancestors``), the
+        per-group ``log_z_groups`` and per-stage ``betas``, and a JSON
+        ``summary`` (ln Z, its error, the stage path and flags) and
+        ``metadata``. :meth:`load` reads it back."""
+        from .engine import _savez
+        from .metadata import dumps
+        summary = {k: getattr(self, k) for k in (
+            "log_z", "log_z_se", "names", "moves", "accept", "decorrelation", "n_evals",
+            "wall_time", "precision", "stalled", "unsettled")}
+        out = {"summary": np.array(dumps(summary)), "metadata": np.array(dumps(self.metadata)),
+               "u": self.u, "model": self.model, "physical": self.physical,
+               "log_likelihood": self.log_likelihood,
+               "log_z_groups": np.asarray(self.log_z_groups),
+               "betas": np.array([np.asarray(b, dtype=np.float64) for b in self.betas])}
+        if self.ancestors is not None:
+            out["ancestors"] = self.ancestors
+        _savez(path, out)
+
+    @classmethod
+    def load(cls, path) -> "SMCResult":
+        """Read a result written by :meth:`save`."""
+        import json
+        import os
+        with np.load(os.fspath(path), allow_pickle=False) as z:
+            if "summary" not in z.files or "log_z_groups" not in z.files:
+                raise ValueError(f"{os.fspath(path)} is not an SMCResult written by save")
+            s = json.loads(str(z["summary"]))
+            return cls(
+                log_z=float(s["log_z"]), log_z_se=float(s["log_z_se"]),
+                log_z_groups=z["log_z_groups"], names=s["names"], u=z["u"],
+                model=z["model"], physical=z["physical"],
+                log_likelihood=z["log_likelihood"], betas=list(z["betas"]),
+                moves=s["moves"], accept=s["accept"], decorrelation=s["decorrelation"],
+                n_evals=s["n_evals"], wall_time=s["wall_time"], precision=s["precision"],
+                stalled=s["stalled"], unsettled=s["unsettled"],
+                ancestors=z["ancestors"] if "ancestors" in z.files else None,
+                metadata=json.loads(str(z["metadata"])))
 
     @property
     def n_stages(self) -> int:
@@ -416,6 +460,7 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
     ``progress``/``callback`` as in :func:`anvil.run`; the callback gets
     ``("smc", stage, info)``.
     """
+    _args = dict(locals())
     _require_proper(target)
     t0 = time.perf_counter()
     G = int(n_groups)
@@ -554,7 +599,8 @@ def smc(target: TransformedLogDensity, n_particles: int = 8192, *,
         physical=tr.to_physical(model), log_likelihood=LL, betas=betas,
         moves=moves, accept=accepts, decorrelation=decorr, n_evals=n_evals,
         wall_time=time.perf_counter() - t0, precision=precision,
-        stalled=stalled, unsettled=unsettled, ancestors=anc.reshape(-1))
+        stalled=stalled, unsettled=unsettled, ancestors=anc.reshape(-1),
+        metadata=record("anvil.smc", _args, target))
 
 
 # -- the cheap tier ------------------------------------------------------------
@@ -571,6 +617,28 @@ class EvidenceResult:
     method: str
     details: dict = field(default_factory=dict)
     wall_time: float = 0.0
+    #: The record of how it was made (versions, machine, date, every
+    #: argument of the call, the target; see :mod:`anvil.metadata`).
+    metadata: dict = field(default_factory=dict)
+
+    def save(self, path) -> None:
+        """Write to ``path`` as JSON: the estimate, its details and
+        ``metadata``. :meth:`load` reads it back."""
+        from .metadata import dumps
+        with open(path, "w") as fh:
+            fh.write(dumps({"log_z": self.log_z, "log_z_se": self.log_z_se,
+                            "method": self.method, "details": self.details,
+                            "wall_time": self.wall_time, "metadata": self.metadata}))
+
+    @classmethod
+    def load(cls, path) -> "EvidenceResult":
+        """Read a result written by :meth:`save`."""
+        import json
+        with open(path) as fh:
+            d = json.load(fh)
+        return cls(log_z=float(d["log_z"]), log_z_se=float(d["log_z_se"]),
+                   method=d["method"], details=d["details"],
+                   wall_time=float(d["wall_time"]), metadata=d["metadata"])
 
     def __str__(self) -> str:
         se = "" if not np.isfinite(self.log_z_se) else f" +/- {self.log_z_se:.4f}"
@@ -640,6 +708,7 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
     ``compile_step=False`` evaluates the target uncompiled, for one that
     leaves MLX inside ``log_prob``.
     """
+    _args = dict(locals())
     from .diagnostics import _ess_batched
     from .optimize import _Evaluator
 
@@ -752,7 +821,8 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
                  "n_posterior": int(n1), "n_proposal": n2, "nu": float(nu),
                  "tau": float(tau), "log_z_folds": (float(r1[0]), float(r2[0])),
                  "se_folds": (math.sqrt(r1[1]), math.sqrt(r2[1]))},
-        wall_time=time.perf_counter() - t0)
+        wall_time=time.perf_counter() - t0,
+        metadata=record("anvil.bridge_evidence", _args, target))
 
 
 def _flow_log_weights(target, flow, n, seed, max_rows, compile_step) -> np.ndarray:
@@ -804,6 +874,7 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
 
     ``compile_step=False`` evaluates the target uncompiled, for one that
     leaves MLX inside ``log_prob``."""
+    _args = dict(locals())
     _require_proper(target)
     if int(flow.dim) != int(target.dim):
         raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
@@ -826,7 +897,8 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
         log_z_se=float(math.sqrt(max(1.0 / ess - 1.0 / n, 0.0))),
         method="flow importance sampling",
         details={"efficiency": ess / n, "n": int(n)},
-        wall_time=time.perf_counter() - t0)
+        wall_time=time.perf_counter() - t0,
+        metadata=record("anvil.flow_evidence", _args, target))
 
 
 def laplace_evidence(target: TransformedLogDensity, opt=None, **optimize_kwargs) -> EvidenceResult:
@@ -838,6 +910,7 @@ def laplace_evidence(target: TransformedLogDensity, opt=None, **optimize_kwargs)
     low on a spherical transit fit, and undefined where the mode is on a
     bound or the curvature is not negative definite (it raises there).
     """
+    _args = dict(locals())
     from .optimize import optimize
 
     _require_proper(target)
@@ -855,4 +928,5 @@ def laplace_evidence(target: TransformedLogDensity, opt=None, **optimize_kwargs)
     return EvidenceResult(log_z=float(lz), log_z_se=math.nan, method="laplace",
                           details={"converged": bool(opt.converged),
                                    "log_density_at_mode": float(opt.log_value)},
-                          wall_time=time.perf_counter() - t0)
+                          wall_time=time.perf_counter() - t0,
+                          metadata=record("anvil.laplace_evidence", _args, target))

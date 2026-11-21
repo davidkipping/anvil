@@ -44,6 +44,9 @@ class RandomWalkMetropolis(Kernel):
         self.target = target
         self.initial_scale = initial_scale
 
+    def describe(self) -> dict:
+        return {**super().describe(), "initial_scale": self.initial_scale}
+
     def init(self, key: mx.array, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
         lp = target.log_prob(u0)

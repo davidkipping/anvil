@@ -133,6 +133,13 @@ class ChEESHMC(Kernel):
         self._last_h = 1.0
         self._compile_kernels()
 
+    def describe(self) -> dict:
+        return {**super().describe(), "step_size": self.eps0, "traj_length": self.T0,
+                "max_leapfrog": self.max_leapfrog, "target_accept": self.target_accept,
+                "divergence_threshold": self.div_threshold,
+                "precondition_after": self.precondition_after, "dense": self.dense,
+                "ridge": self.ridge}
+
     def _compile_kernels(self):
         # compile_step=False, or a refusal MLX has already handed us, means
         # the plain functions; otherwise compiled, with the fallback armed

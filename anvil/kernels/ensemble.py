@@ -40,6 +40,11 @@ class EnsembleMove:
     def propose(self, key: mx.array, S: mx.array, C: mx.array):
         raise NotImplementedError
 
+    def describe(self) -> dict:
+        """The move's class and its settings (its public attributes)."""
+        return {"class": type(self).__name__,
+                **{k: v for k, v in vars(self).items() if not k.startswith("_")}}
+
 
 class StretchMove(EnsembleMove):
     """Goodman & Weare (2010) stretch move, z ~ g(z) proportional to
@@ -117,6 +122,11 @@ class EnsembleKernel(Kernel):
         # the base implementation by name: a subclass override may read
         # attributes it assigns only after super().__init__() returns
         EnsembleKernel.retrace(self)
+
+    def describe(self) -> dict:
+        return {**super().describe(), "seed": self._seed,
+                "moves": [{**m.describe(), "weight": w}
+                          for (m, _), w in zip(self.moves, self._weights)]}
 
     def init(self, key, u0: mx.array, target: LogDensity) -> ChainState:
         self.target = target
