@@ -85,6 +85,35 @@ _FAR_MAX_FRAC = 0.01
 _NLL_ROWS = 1 << 15
 #: hold-out size below which a "diverged" verdict may be noise
 _SMALL_VAL = 100
+#: the most draws a flow keeps for start() (train()'s last round holds this many)
+_POOL_MAX = 102_400
+
+
+def _check_fit_args(*, max_steps, batch, lr, patience, check_every, retries) -> None:
+    for name, v in (("max_steps", max_steps), ("batch", batch), ("patience", patience),
+                    ("check_every", check_every)):
+        if not (isinstance(v, (int, np.integer)) and v >= 1):
+            raise ValueError(f"fit: {name} must be an integer >= 1, got {v!r}")
+    if not (isinstance(retries, (int, np.integer)) and retries >= 0):
+        raise ValueError(f"fit: retries must be an integer >= 0, got {retries!r}")
+    if not (isinstance(lr, (int, float, np.floating)) and math.isfinite(lr) and lr > 0):
+        raise ValueError(f"fit: lr must be a positive number, got {lr!r}")
+
+
+def _check_fit_kwargs(fit_kwargs: dict) -> None:
+    """``train``'s ``fit_kwargs``, checked before SMC rather than at the
+    first fit after it."""
+    import inspect
+    allowed = [p for p in inspect.signature(Flow.fit).parameters if p not in ("self", "draws")]
+    bad = sorted(set(fit_kwargs) - set(allowed))
+    if bad:
+        raise TypeError(f"fit_kwargs: unknown {', '.join(map(repr, bad))}; Flow.fit takes "
+                        f"{', '.join(allowed)}")
+    defaults = {p.name: p.default for p in inspect.signature(Flow.fit).parameters.values()
+                if p.name in allowed}
+    args = {**defaults, **fit_kwargs}
+    _check_fit_args(**{k: args[k] for k in ("max_steps", "batch", "lr", "patience",
+                                            "check_every", "retries")})
 
 
 class Flow:
@@ -107,6 +136,9 @@ class Flow:
         if dim < 2:
             raise ValueError("a coupling flow needs dim >= 2")
         rng = np.random.default_rng(seed)
+        #: The construction seed. It sets the untrained flow every fit starts
+        #: from, so it is saved, and a loaded flow refits as the original would.
+        self.seed = int(seed)
         self.dim, self.n_layers, self.hidden = int(dim), int(n_layers), int(hidden)
         self.s_max = float(s_max)
         self.mu = mx.zeros((dim,))
@@ -156,27 +188,74 @@ class Flow:
         out = h @ p["W3"] + p["b3"]
         return self.s_max * mx.tanh(out[:, :db] / self.s_max), out[:, db:]
 
+    def _plan(self):
+        """How each layer gets its halves ``(za, zb)``, in the order the
+        layers run, forward and inverse: ``None`` when they are the previous
+        layer's halves swapped (every other layer, as built), else the
+        indices into the previous layer's concatenated halves, with that
+        layer's inverse permutation folded in. Restoring the full order
+        between layers, as the plain loop does, is two gathers and a
+        concatenation per layer that only reorder; skipping them changes no
+        arithmetic, so the map is bit for bit the same (checked against the
+        plain loop at several sizes), and an ensemble iteration of 512
+        walkers on a 10,000-point transit fit lost about 2.4 of its 5.3 ms
+        of flow overhead. Cached on the splits, which ``load`` replaces."""
+        cached = getattr(self, "_plan_cache", None)
+        if cached is not None and cached[0] is self.splits:
+            return cached[1], cached[2]
+        sp = [(np.array(a), np.array(b), np.array(i)) for a, b, i in self.splits]
+
+        def step(k, prev):
+            ia, ib, _ = sp[k]
+            if prev is None:
+                return mx.array(ia), mx.array(ib)
+            pa, pb, pinv = sp[prev]
+            if np.array_equal(ia, pb) and np.array_equal(ib, pa):
+                return None
+            return mx.array(pinv[ia]), mx.array(pinv[ib])
+        n = len(sp)
+        fwd = [step(k, k - 1 if k else None) for k in range(n)]
+        inv = [step(k, k + 1 if k < n - 1 else None) for k in range(n - 1, -1, -1)]
+        self._plan_cache = (self.splits, fwd, inv)
+        return fwd, inv
+
     def forward(self, z: mx.array, params=None):
         """``z -> (u, log |det du/dz|)``, batched over rows."""
         params = self.params if params is None else params
+        plan, _ = self._plan()
         ld = mx.zeros(z.shape[:1])
-        for (ia, ib, inv), p in zip(self.splits, params):
-            za, zb = z[:, ia], z[:, ib]
+        za = zb = None
+        for k, ((_, ib, _), p, how) in enumerate(zip(self.splits, params, plan)):
+            if how is None:
+                za, zb = zb, za
+            else:
+                src = z if k == 0 else mx.concatenate([za, zb], axis=1)
+                za, zb = src[:, how[0]], src[:, how[1]]
             s, t = self._st(p, za, ib.shape[0])
-            z = mx.concatenate([za, zb * mx.exp(s) + t], axis=1)[:, inv]
+            zb = zb * mx.exp(s) + t
             ld = ld + mx.sum(s, axis=1)
+        z = mx.concatenate([za, zb], axis=1)[:, self.splits[-1][2]]
         return self.mu + z @ self.L.T, ld + self.logdet_L
 
     def inverse(self, u: mx.array, params=None):
         """``u -> (z, log |det dz/du|)``, batched over rows."""
         params = self.params if params is None else params
+        _, plan = self._plan()
         ld = mx.zeros(u.shape[:1])
         z = (u - self.mu) @ self.Linv.T
-        for (ia, ib, inv), p in zip(reversed(self.splits), reversed(params)):
-            za, zb = z[:, ia], z[:, ib]
-            s, t = self._st(p, za, ib.shape[0])
-            z = mx.concatenate([za, (zb - t) * mx.exp(-s)], axis=1)[:, inv]
+        za = zb = None
+        n = len(self.splits)
+        for j, how in enumerate(plan):
+            k = n - 1 - j
+            if how is None:
+                za, zb = zb, za
+            else:
+                src = z if j == 0 else mx.concatenate([za, zb], axis=1)
+                za, zb = src[:, how[0]], src[:, how[1]]
+            s, t = self._st(params[k], za, self.splits[k][1].shape[0])
+            zb = (zb - t) * mx.exp(-s)
             ld = ld - mx.sum(s, axis=1)
+        z = mx.concatenate([za, zb], axis=1)[:, self.splits[0][2]]
         return z, ld - self.logdet_L
 
     def log_q(self, u: mx.array, params=None) -> mx.array:
@@ -197,9 +276,10 @@ class Flow:
 
     # -- training ---------------------------------------------------------
     def _set_whitening(self, x: np.ndarray) -> None:
-        x = x.astype(np.float64)
+        x = x.astype(np.float64)                         # a copy, centred in place
         mu = x.mean(axis=0)
-        cov = np.atleast_2d(np.cov((x - mu).T))
+        x -= mu
+        cov = np.atleast_2d(np.cov(x.T))
         L = np.linalg.cholesky(cov + 1e-10 * np.trace(cov) / self.dim * np.eye(self.dim))
         self.mu = mx.array(mu.astype(np.float32))
         self.L = mx.array(L.astype(np.float32))
@@ -238,12 +318,15 @@ class Flow:
         as a separate mode would be. ``n_far`` counts the dropped rows.
 
         Fitting a flow clears its :attr:`report`, which described the
-        previous fit.
+        previous fit, and its :attr:`pool`, which held the previous
+        training's draws; the previous :attr:`training` record is kept
+        inside the new one, under ``"previous"``.
 
         ``compile``: the training step (gradient and Adam update) runs as
-        one compiled MLX graph, 1.6-1.9x faster (3,000 steps on 102,400
-        draws at 10 dimensions: 27-31 s uncompiled, 16-17 s compiled, M2
-        Max with the CPU otherwise busy). The same seed gives the same flow
+        one compiled MLX graph, each step queued before the last one's loss
+        is read: about 2.2x faster per step (the default settings on
+        102,400 draws at 10 dimensions: 9-17 s uncompiled, 4-8 s compiled,
+        M2 Max otherwise idle). The same seed gives the same flow
         on the same machine and versions. Compiled arithmetic can round
         differently in the last bit, so the weights are not bit for bit
         those of an uncompiled fit, or of flows fitted before anvil 0.13.4:
@@ -258,6 +341,8 @@ class Flow:
         Gaussian the draws are), ``val_nll``, ``steps``, ``n_train``,
         ``n_val``, ``n_far``, ``retries``, ``seconds``."""
         t0 = time.perf_counter()
+        _check_fit_args(max_steps=max_steps, batch=batch, lr=lr, patience=patience,
+                        check_every=check_every, retries=retries)
         x = _as_draws(draws, self.dim)
         x = x[np.all(np.isfinite(x), axis=1)]
         n_far = 0
@@ -277,6 +362,8 @@ class Flow:
         iv, it = order[:n_val], order[n_val:]
         xv = mx.array(np.repeat(rows[iv], counts[iv], axis=0))
         xt = np.repeat(rows[it], counts[it], axis=0)
+        n_x = len(x)
+        del x, rows, counts, order, iv, it               # a large refit's copies
         self._set_whitening(xt)
         init = self._init_params
         self.params = [dict(p) for p in init]           # the whitening alone
@@ -292,12 +379,15 @@ class Flow:
         self.params = best_params
         mx.eval(self.params)
         from .metadata import environment
+        # the pool was the previous training's draws, not this fit's: a
+        # refitted flow starts from its own distribution unless given one
+        self.pool = None
         self.training = {
             "function": "anvil.flow.Flow.fit", "environment": environment(),
             "arguments": {"max_steps": max_steps, "batch": batch, "lr": lr,
                           "patience": patience, "check_every": check_every,
                           "retries": retries, "seed": seed, "compile": bool(compile)},
-            "n_draws": int(len(x))}
+            "n_draws": int(n_x), "previous": self.training}
         return {"gain_nats": base - best, "val_nll": best, "val_nll_whitened": base,
                 "steps": steps, "n_train": len(xt), "n_val": int(xv.shape[0]),
                 "n_far": n_far, "retries": attempt, "diverged": diverged,
@@ -322,48 +412,81 @@ class Flow:
         def loss(params, u):
             return -mx.mean(self.log_q(u, params))
         vg = mx.value_and_grad(loss)
-        if compiled:
-            # the weights and Adam's state are the compiled step's inputs and
-            # outputs; captured instead, they would be frozen at their first
-            # values. The whitening is fixed for the whole fit, so it may be
-            # captured, and each fit (and retry) traces a fresh step.
-            opt.init({"p": self.params})
-            holder = {"params": self.params, "opt": opt.state}
-
-            @partial(mx.compile, inputs=holder, outputs=holder)
-            def step(u):
-                l, g = vg(holder["params"], u)
-                holder["params"] = opt.apply_gradients({"p": g}, {"p": holder["params"]})["p"]
-                return l
+        nb = min(batch, len(xt))
         best, best_params, bad, diverged = base, [dict(p) for p in self.params], 0, False
-        i = 0
-        for i in range(max_steps):
-            idx = rng.integers(0, len(xt), size=min(batch, len(xt)))
-            u = mx.array(xt[idx])
-            if compiled:
-                l = step(u)
-                self.params = holder["params"]
-                mx.eval(l, holder)
-            else:
-                l, g = vg(self.params, u)
+
+        def judge(i, params):
+            """The hold-out check after step i: (stop, diverged)."""
+            nonlocal best, best_params, bad
+            if (i + 1) % check_every:
+                return False, False
+            self.params = params
+            v = self._nll(xv)
+            if not math.isfinite(v) or v > base + _DIVERGED:
+                return True, True
+            if v < best - 1e-4:
+                best, bad = v, 0
+                best_params = [dict(p) for p in params]
+                return False, False
+            bad += 1
+            return bad >= patience, False
+
+        if not compiled:
+            i = 0
+            for i in range(max_steps):
+                idx = rng.integers(0, len(xt), size=nb)
+                l, g = vg(self.params, mx.array(xt[idx]))
                 # the optimizer wants a dict at the top of the tree
                 self.params = opt.apply_gradients({"p": g}, {"p": self.params})["p"]
                 mx.eval(l, self.params, opt.state)
-            if not math.isfinite(float(l.item())):
-                diverged = True
-                break
-            if (i + 1) % check_every == 0:
-                v = self._nll(xv)
-                if not math.isfinite(v) or v > base + _DIVERGED:
+                if not math.isfinite(float(l.item())):
                     diverged = True
                     break
-                if v < best - 1e-4:
-                    best, bad = v, 0
-                    best_params = [dict(p) for p in self.params]
-                else:
-                    bad += 1
-                    if bad >= patience:
-                        break
+                stop, diverged = judge(i, self.params)
+                if stop:
+                    break
+            return best, best_params, i + 1, diverged
+
+        # Compiled: the weights and Adam's state are the step's inputs and
+        # outputs; captured instead, they would be frozen at their first
+        # values. The whitening is fixed for the whole fit, so it may be
+        # captured, and each fit (and retry) traces a fresh step.
+        opt.init({"p": self.params})
+        holder = {"params": self.params, "opt": opt.state}
+
+        @partial(mx.compile, inputs=holder, outputs=holder)
+        def step(u):
+            l, g = vg(holder["params"], u)
+            holder["params"] = opt.apply_gradients({"p": g}, {"p": holder["params"]})["p"]
+            return l
+
+        # Pipelined: step i+1 is queued before step i's loss is read, so the
+        # GPU never waits for the host. Two details keep it bit for bit the
+        # serial loop: each call refills holder's containers in place, so
+        # step i's weights are copied out before step i+1 is queued; and if
+        # step i is the last, the batch drawn for step i+1 is given back to
+        # the rng, so a retry sees the stream the serial loop would leave.
+        l = step(mx.array(xt[rng.integers(0, len(xt), size=nb)]))
+        mx.async_eval(l, holder)
+        i = 0
+        while True:
+            params_i, l_i = [dict(p) for p in holder["params"]], l
+            more = i + 1 < max_steps
+            if more:
+                state = rng.bit_generator.state
+                l = step(mx.array(xt[rng.integers(0, len(xt), size=nb)]))
+                mx.async_eval(l, holder)
+            if not math.isfinite(float(l_i.item())):
+                stop, diverged = True, True
+            else:
+                stop, diverged = judge(i, params_i)
+            if stop or not more:
+                if more:
+                    rng.bit_generator.state = state
+                break
+            i += 1
+        mx.eval(holder)
+        self.params = params_i
         return best, best_params, i + 1, diverged
 
     # -- use --------------------------------------------------------------
@@ -429,6 +552,7 @@ class Flow:
         out = self._arrays()
         out["config"] = np.array([self.dim, self.n_layers, self.hidden], dtype=np.int64)
         out["s_max"] = np.array(self.s_max)
+        out["init_seed"] = np.array(self.seed, dtype=np.int64)
         out["metadata"] = np.array(dumps({
             "format": FORMAT, "kind": "anvil.flow.Flow", "environment": environment(),
             "flow": self.describe(), "training": self.training, "report": self.report}))
@@ -443,7 +567,8 @@ class Flow:
             if "config" not in z.files or "l0__W1" not in z.files:
                 raise ValueError(f"{os.fspath(path)} is not a flow written by Flow.save")
             dim, n_layers, hidden = (int(v) for v in z["config"])
-            f = cls(dim, n_layers, hidden, float(z["s_max"]))
+            seed = int(z["init_seed"]) if "init_seed" in z.files else 0   # since 0.14.1
+            f = cls(dim, n_layers, hidden, float(z["s_max"]), seed=seed)
             f.mu, f.L, f.Linv = mx.array(z["mu"]), mx.array(z["L"]), mx.array(z["Linv"])
             f.logdet_L = float(z["logdet_L"])
             f.splits = [cls._split(z[f"l{k}__ia"], z[f"l{k}__ib"]) for k in range(n_layers)]
@@ -453,8 +578,8 @@ class Flow:
             if "pool" in z.files:
                 f.pool = np.array(z["pool"])
             if "metadata" in z.files:                    # written since 0.14.0
-                import json
-                meta = json.loads(str(z["metadata"]))
+                from .metadata import loads
+                meta = loads(str(z["metadata"]))
                 f.training = meta.get("training")
                 f.report = FlowReport._from_json(meta.get("report"))
         return f
@@ -614,7 +739,7 @@ def _make_report(target, flow, info, smc_facts, seconds, seed, compile_step):
         warn.append(f"small fit gain: the flow gains only {gain:.2f} nats over a linear "
                     f"map, so the posterior is close to Gaussian already. A plain sampler "
                     f"(dense ChEES or the ensemble) will be faster unless the likelihood "
-                    f"is expensive: evaluating the flow adds about 1.5 ms to an ensemble "
+                    f"is expensive: evaluating the flow adds 0.3-0.9 ms to an ensemble "
                     f"iteration of 512 walkers, which an expensive likelihood can repay if "
                     f"the flow cuts the iterations per effective sample; compare the two "
                     f"on a short run")
@@ -687,6 +812,7 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
         raise ValueError(f"n_chains={n_chains} < 2*dim={2 * d}: each half of the "
                          f"ensemble must span the parameter space")
     fit_kwargs = dict(fit_kwargs or {})
+    _check_fit_kwargs(fit_kwargs)
     seconds: dict[str, float] = {}
     smc_facts = None
     t0 = time.perf_counter()
@@ -714,8 +840,8 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
     t1 = time.perf_counter()
     for k in range(1, rounds + 1):
         flow = Flow(d, n_layers, hidden, seed=100 * seed + k)
-        info = flow.fit(np.concatenate(pool[-2:]), seed=100 * seed + k,
-                        **{"max_steps": 3000, **fit_kwargs})
+        info = flow.fit(np.concatenate(pool[-2:]),
+                        **{"seed": 100 * seed + k, "max_steps": 3000, **fit_kwargs})
         ft = flow.wrap(target)
         kern = EnsembleKernel(ft, moves=[(StretchMove(), 0.5), (DEMove(), 0.5)])
         res = run(kern, ft, flow.to_latent(u_last), n_warmup=round_warmup,
@@ -735,11 +861,18 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
         seconds["rounds"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    train_draws = np.concatenate(pool[-2:])
+    train_draws = pool[0] if len(pool) == 1 else np.concatenate(pool[-2:])
     flow = Flow(d, n_layers, hidden, seed=100 * seed + 99)
-    info = flow.fit(train_draws, seed=100 * seed + 99, **fit_kwargs)
+    info = flow.fit(train_draws, **{"seed": 100 * seed + 99, **fit_kwargs})
+    del train_draws
     seconds["final fit"] = time.perf_counter() - t2
-    flow.pool = pool[-1] if rounds else su
+    # the draws start() picks from: the last round's (512 walkers x 200
+    # kept), or for refine a random subset of that size of the draws given,
+    # so a 4-million-draw refit does not keep (and save) 160 MB of them
+    last = pool[-1]
+    if len(last) > _POOL_MAX:
+        last = last[np.sort(rng.choice(len(last), _POOL_MAX, replace=False))]
+    flow.pool = last
     flow.report = _make_report(target, flow, info, smc_facts, seconds, seed, compile_step)
     from .metadata import describe_target, environment
     flow.training = {

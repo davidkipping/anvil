@@ -63,36 +63,66 @@ def _name_of(fn) -> str:
     return f"{mod}.{name}" if mod else name
 
 
+#: arrays with more elements than this are recorded by shape and dtype
+_MAX_LISTED = 256
+_NON_FINITE = {"inf": math.inf, "-inf": -math.inf, "nan": math.nan}
+
+
 def jsonable(obj):
     """``obj`` as plain JSON types: NumPy scalars and small arrays to
-    numbers and lists, non-finite floats to strings ("inf", "nan"),
-    dataclasses to dicts, anything else to its ``repr``."""
+    numbers and lists (arrays over 256 elements by shape and dtype),
+    non-finite floats to the strings "inf", "-inf" and "nan" (strict JSON
+    has no tokens for them; :func:`loads` turns them back), dataclasses to
+    dicts, anything else to its ``repr``. A callable -- a model function,
+    even one that is a dataclass or an ``mlx.nn.Module`` holding data -- is
+    recorded by its name only."""
     if obj is None or isinstance(obj, (bool, str)):
         return obj
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, (int, np.integer)):
         return int(obj)
     if isinstance(obj, (float, np.floating)):
         f = float(obj)
         return f if math.isfinite(f) else repr(f)
-    if isinstance(obj, mx.array):
+    if isinstance(obj, (np.ndarray, mx.array)):
+        if obj.size > _MAX_LISTED:
+            return {"array": list(obj.shape), "dtype": str(obj.dtype)}
         obj = np.array(obj)
-    if isinstance(obj, np.ndarray):
         return [jsonable(v) for v in obj.tolist()] if obj.ndim else jsonable(obj.item())
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    # before the dataclass and dict branches: a callable model's fields are
+    # its data, which a record must not copy
+    if callable(obj):
+        return _name_of(obj)
+    if dataclasses.is_dataclass(obj):
         return {"class": type(obj).__name__,
                 **{f.name: jsonable(getattr(obj, f.name)) for f in dataclasses.fields(obj)}}
     if isinstance(obj, dict):
         return {str(k): jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [jsonable(v) for v in obj]
-    if callable(obj):
-        return _name_of(obj)
     return repr(obj)
 
 
 def dumps(meta: dict) -> str:
     """``meta`` as a JSON string, through :func:`jsonable`."""
     return json.dumps(jsonable(meta), indent=1, sort_keys=False)
+
+
+def _decode(obj):
+    if isinstance(obj, str):
+        return _NON_FINITE.get(obj, obj)
+    if isinstance(obj, dict):
+        return {k: _decode(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode(v) for v in obj]
+    return obj
+
+
+def loads(text: str):
+    """Read what :func:`dumps` wrote, with "inf", "-inf" and "nan" back as
+    floats."""
+    return _decode(json.loads(text))
 
 
 def _described(obj, fallback: dict) -> dict:
@@ -123,18 +153,19 @@ def summary(value):
     """A call argument as a saved result records it: small values as
     themselves, arrays by shape, objects that describe themselves by their
     description, results and other objects by class."""
-    if value is None or isinstance(value, (bool, int, float, str, np.integer, np.floating)):
+    if value is None or isinstance(value, (bool, int, float, str, np.integer, np.floating,
+                                           np.bool_)):
         return jsonable(value)
     if isinstance(value, (np.ndarray, mx.array)):
         return {"array": list(value.shape), "dtype": str(value.dtype)}
     if callable(getattr(value, "describe", None)) and not isinstance(value, type):
         return _described(value, {"class": type(value).__name__})
+    if callable(value):                                  # before dict: an nn.Module is one
+        return _name_of(value)
     if isinstance(value, dict):
         return {str(k): summary(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [summary(v) for v in value] if len(value) <= 16 else {"list": len(value)}
-    if callable(value):
-        return _name_of(value)
     meta = getattr(value, "metadata", None)
     if isinstance(meta, dict) and meta:                  # a saved-able result
         return {"class": type(value).__name__, "kind": meta.get("kind"),

@@ -17,7 +17,7 @@ Saved metadata
 --------------
 
 .. automodule:: anvil.metadata
-   :members: environment, describe_target, describe_kernel, jsonable, summary, record
+   :members: environment, describe_target, describe_kernel, jsonable, dumps, loads, summary, record
 
 Optimization
 ------------

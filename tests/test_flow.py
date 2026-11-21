@@ -365,7 +365,7 @@ def test_run_mcmc_none_continues_the_previous_run(banana_flow):
     whole = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
     c = whole.run_mcmc(None, 60, warmup=20).get_chain()
     np.testing.assert_array_equal(np.concatenate([c1, c2]), c)
-    with pytest.raises(ValueError, match="n_warmup must be 0"):
+    with pytest.raises(ValueError, match="cannot warm up again"):
         s.run_mcmc(None, 10, warmup=5)
 
 
@@ -490,3 +490,127 @@ def test_compiled_fit_retries_after_a_divergence():
     again = Flow(2, **SMALL).fit(d, max_steps=200, lr=50.0, retries=1, check_every=10,
                                  compile=False)
     assert again["retries"] == info["retries"] and again["diverged"] == info["diverged"]
+
+
+# -- review fixes (0.14.1) -------------------------------------------------------------
+
+def _plain_forward(f, z):
+    # the map as the plain loop computes it, restoring the full order between
+    # layers: the reference the gather-skipping plan must match bit for bit
+    ld = mx.zeros(z.shape[:1])
+    for (ia, ib, inv), p in zip(f.splits, f.params):
+        za, zb = z[:, ia], z[:, ib]
+        s, t = f._st(p, za, ib.shape[0])
+        z = mx.concatenate([za, zb * mx.exp(s) + t], axis=1)[:, inv]
+        ld = ld + mx.sum(s, axis=1)
+    return f.mu + z @ f.L.T, ld + f.logdet_L
+
+
+@pytest.mark.parametrize("dim,n_layers", [(2, 1), (3, 3), (7, 8)])
+def test_the_layer_plan_is_the_plain_map_bit_for_bit(dim, n_layers):
+    f = Flow(dim, n_layers=n_layers, hidden=16, seed=dim)
+    rng = np.random.default_rng(dim)
+    for p in f.params:
+        p["W3"] = mx.array(0.4 * rng.standard_normal(p["W3"].shape).astype(np.float32))
+        p["b3"] = mx.array(0.4 * rng.standard_normal(p["b3"].shape).astype(np.float32))
+    z = mx.array(rng.standard_normal((65, dim)).astype(np.float32))
+    u, ld = f.forward(z)
+    ur, ldr = _plain_forward(f, z)
+    np.testing.assert_array_equal(np.array(u), np.array(ur))
+    np.testing.assert_array_equal(np.array(ld), np.array(ldr))
+    zz, _ = f.inverse(u)
+    np.testing.assert_allclose(np.array(zz), np.array(z), atol=1e-4)
+
+
+def test_fit_kwargs_are_checked_before_smc(monkeypatch):
+    def no_smc(*a, **k):
+        raise AssertionError("smc ran before fit_kwargs were checked")
+    monkeypatch.setattr(anvil.evidence, "smc", no_smc)
+    with pytest.raises(TypeError, match="unknown 'max_step'"):
+        train(_banana(), fit_kwargs={"max_step": 100})
+    with pytest.raises(ValueError, match="batch"):
+        train(_banana(), fit_kwargs={"batch": 0})
+    with pytest.raises(ValueError, match="lr"):
+        train(_banana(), fit_kwargs={"lr": -1.0})
+
+
+def test_a_seed_in_fit_kwargs_is_used():
+    # it used to collide with train's own: "got multiple values for 'seed'"
+    d = _banana_draws(5000, seed=8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        a = refine(_banana(), d, fit_kwargs=dict(max_steps=100, seed=5), **SMALL)
+        b = refine(_banana(), d, fit_kwargs=dict(max_steps=100, seed=6), **SMALL)
+    assert a.training["final_fit"]["arguments"]["seed"] == 5
+    assert a.fingerprint != b.fingerprint
+
+
+def test_a_manual_refit_clears_the_pool_and_keeps_the_record(banana_flow):
+    import copy
+    f = copy.deepcopy(banana_flow[0])
+    f.pool = _banana_draws(500)
+    f.training = {"function": "anvil.flow.train", "arguments": {"rounds": 4}}
+    f.fit(_banana_draws(3000, seed=9) + 5.0, max_steps=50)
+    assert f.pool is None and f.report is None
+    assert f.training["function"] == "anvil.flow.Flow.fit"
+    assert f.training["previous"]["arguments"]["rounds"] == 4
+
+
+def test_a_loaded_flow_refits_as_the_original_would(tmp_path):
+    d = _banana_draws(3000, seed=10)
+    f = Flow(2, **SMALL, seed=7)
+    f.fit(d, max_steps=50)
+    f.save(tmp_path / "f.npz")
+    g = Flow.load(tmp_path / "f.npz")
+    f.fit(d, max_steps=50, seed=3)
+    g.fit(d, max_steps=50, seed=3)
+    assert f.fingerprint == g.fingerprint
+
+
+def test_refine_keeps_a_bounded_pool():
+    from anvil.flow import _POOL_MAX
+    rng = np.random.default_rng(0)
+    x = 1 + rng.standard_normal(_POOL_MAX + 5000)
+    d = np.stack([x, x ** 2 + SY * rng.standard_normal(len(x))], axis=1).astype(np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        f = refine(_banana(), d, fit_kwargs=dict(max_steps=20), **SMALL)
+    assert f.pool.shape == (_POOL_MAX, 2)
+
+
+def test_flow_evidence_refuses_a_flow_target(banana_flow):
+    f, _ = banana_flow
+    with pytest.raises(TypeError, match="not FlowTarget"):
+        anvil.flow_evidence(_banana(), f.wrap(_banana()), n=1000)
+
+
+def test_ensemble_sampler_says_how_to_warm_up_again_and_warns_on_a_new_flow(banana_flow):
+    import copy
+    f, _ = banana_flow
+    s = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
+    s.run_mcmc(None, 10, warmup=10)
+    with pytest.raises(ValueError, match="get_chain"):
+        s.run_mcmc(None, 10, warmup=5)
+    g = copy.deepcopy(f)
+    g.params[0]["b3"] = g.params[0]["b3"] + 0.01               # another flow
+    g.pool = f.pool if f.pool is not None else _banana_draws(500)
+    s.flow = g
+    with pytest.warns(RuntimeWarning, match="flow changed"):
+        s.run_mcmc(None, 5)
+
+
+def test_a_sampler_run_resumes_in_another_session_through_run(banana_flow, tmp_path):
+    # the recipe in docs/flow.md: same moves and seed continue the chain bit for bit
+    f, _ = banana_flow
+    s = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
+    first = s.run_mcmc(None, 20, warmup=20)
+    first.save_state(tmp_path / "state.npz")
+    f.save(tmp_path / "flow.npz")
+    g = Flow.load(tmp_path / "flow.npz")
+    ft = g.wrap(_banana())
+    kernel = EnsembleKernel(ft, moves=[(StretchMove(), 0.5), (DEMove(), 0.5)], seed=0)
+    more = anvil.run(kernel, ft, resume=anvil.load_state(tmp_path / "state.npz"),
+                     n_samples=20)
+    whole = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
+    c = whole.run_mcmc(None, 40, warmup=20).get_chain()
+    np.testing.assert_array_equal(np.concatenate([first.get_chain(), more.get_chain()]), c)

@@ -84,10 +84,12 @@ resume with a different flow, or with the unwrapped target, raises.
 3. **A final fit, then frozen.** The flow is whitening followed by 8 affine
    coupling layers of width 64, about 40,000 parameters at 10 dimensions.
    It is trained by maximum likelihood with a 10% hold-out and early
-   stopping, in 10-35 s on the GPU. A fit can never come back worse than
+   stopping: 4-8 s on the GPU for 102,400 draws at 10 dimensions (2,600-5,300
+   steps, M-series GPU, anvil 0.14.1). A fit can never come back worse than
    whitening alone: the whitening is its first checkpoint, and a fit that
    diverges is retried at a lower learning rate. Each training step runs as
-   one compiled graph, 1.6-1.9x faster than step by step;
+   one compiled graph, queued before the previous step's loss is read,
+   about 2.2x faster per step than step by step (1.5 ms against 3.3 ms);
    `fit_kwargs={"compile": False}` reproduces the uncompiled fit exactly
    (the two differ in the last bit of the weights). Repeated draws (a chain's
    rejected proposals) keep their weight, with every copy on the same side
@@ -95,6 +97,9 @@ resume with a different flow, or with the unwrapped target, raises.
    robust standard deviations out, and under 1% of them) are left out,
    because a handful of lost walkers would otherwise set the whitening and
    pull the fit towards themselves; the report says when that happened.
+   A genuinely heavy-tailed posterior can trip it too (about 0.9% of a
+   Cauchy marginal lies that far out); the sampling stays exact, and only
+   the flow's fit to those tails is affected.
 4. **The report.** Read it before sampling.
 
 ## Reading the report
@@ -117,7 +122,7 @@ anvil flow: fit gain 12.75 nats over whitening, importance efficiency 0.491, 184
 is then close to Gaussian after a linear map, and with a cheap likelihood a
 plain sampler (dense ChEES, or the ensemble) is faster. On a spherical
 transit fit with near-Gaussian posteriors, plain samplers ran 3-4x faster
-than the ensemble in flow coordinates, which pays about 1.5 ms per iteration
+than the ensemble in flow coordinates, which pays 0.3-0.9 ms per iteration
 for evaluating the flow. With an expensive likelihood a small gain can
 still pay: on two-mode Gaussian mixtures (2 and 6 dimensions, modes 6-10 sd
 apart), fit gains of 0.5-0.9 nats gave the ensemble in flow coordinates
@@ -191,9 +196,12 @@ sample:
 - **Spherical hybrid2.** The flow is pure overhead, and the report warns of
   a small fit gain before you sample.
 
-**Per-iteration overhead.** Evaluating the flow adds about 1.5 ms to each
-ensemble iteration of 512 walkers. That is what makes the near-Gaussian
-fit slower (22 s against 6 s for the same run at 10,000 points). It is
+**Per-iteration overhead.** Evaluating the flow adds 0.3-0.9 ms to each
+ensemble iteration of 512 walkers (anvil 0.14.1, 10,000 points, on an
+otherwise idle machine): 0.9 ms on the hybrid2 fit (1.8 ms per iteration
+against 0.9 ms plain), 0.3 ms on hybrid4 (2.0 against 1.7 ms), where more of
+it overlaps the likelihood. That is what makes the near-Gaussian fit slower
+(19 s against 10 s for 10,500 iterations). It is
 negligible next to an expensive likelihood: the oblate fit costs 20-66 ms
 per batched evaluation.
 
@@ -282,11 +290,36 @@ rather than by resuming the old one; `run` refuses a resume across flows.
   A resume state is usable only with the exact flow that wrote it: `run`
   checks the flow's fingerprint and refuses any other.
   `EnsembleSampler(flow=True)` keeps its flow in memory only, as
-  `sampler.flow`; save that.
-- **`save` writes the map alone.** A loaded flow has no `report` and no
-  `pool`, so `flow.start(n)` draws from the flow's own distribution instead
-  of the training draws. Give the run warmup.
-- Fitting a flow again (`flow.fit(...)`) clears its `report`.
+  `sampler.flow`; save that. `EnsembleSampler` itself continues only
+  within a session (`run_mcmc(None, n)`); in a new one, resume through
+  `anvil.run` with the same moves and seed, which continues the chain bit
+  for bit:
+
+  ```python
+  res.save_state("state.npz"); sampler.flow.save("flow.npz")    # session 1
+  flow = anvil.flow.Flow.load("flow.npz")                       # session 2
+  ft = flow.wrap(target)
+  kernel = anvil.EnsembleKernel(ft, moves=[(anvil.StretchMove(), 0.5), (anvil.DEMove(), 0.5)],
+                                seed=0)                         # the sampler's seed
+  more = anvil.run(kernel, ft, resume=anvil.load_state("state.npz"), n_samples=2000)
+  ```
+
+  The resume check compares the kernel's class, not its moves: a kernel
+  with other moves continues as a different chain.
+- **`save` writes the map, the report, the training record and the
+  training draws (`pool`).** A loaded flow then starts where the original
+  would. A flow without a pool -- saved with `save(pool=False)`, written
+  before anvil 0.14.0, or refitted with `flow.fit(...)` -- starts from its
+  own distribution, so give its run warmup.
+- Fitting a flow again (`flow.fit(...)`) clears its `report` and `pool`,
+  which described the previous training, and keeps the previous training
+  record inside the new one.
+- `refine` keeps a random 102,400 of the draws it was given (the number
+  `train` keeps) as the pool, so a refit on millions of draws does not
+  carry them all into memory and the saved file.
+- **Final positions of a saved run.** `anvil.load_results(...).final_u` is
+  in the target's own coordinates, like the chain; `final_z` holds the
+  flow's latent positions, which is what a resume continues from.
 
 ## Evidence
 

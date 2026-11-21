@@ -224,12 +224,13 @@ class SMCResult:
     @classmethod
     def load(cls, path) -> "SMCResult":
         """Read a result written by :meth:`save`."""
-        import json
         import os
+
+        from .metadata import loads
         with np.load(os.fspath(path), allow_pickle=False) as z:
             if "summary" not in z.files or "log_z_groups" not in z.files:
                 raise ValueError(f"{os.fspath(path)} is not an SMCResult written by save")
-            s = json.loads(str(z["summary"]))
+            s = loads(str(z["summary"]))
             return cls(
                 log_z=float(s["log_z"]), log_z_se=float(s["log_z_se"]),
                 log_z_groups=z["log_z_groups"], names=s["names"], u=z["u"],
@@ -239,7 +240,7 @@ class SMCResult:
                 n_evals=s["n_evals"], wall_time=s["wall_time"], precision=s["precision"],
                 stalled=s["stalled"], unsettled=s["unsettled"],
                 ancestors=z["ancestors"] if "ancestors" in z.files else None,
-                metadata=json.loads(str(z["metadata"])))
+                metadata=loads(str(z["metadata"])))
 
     @property
     def n_stages(self) -> int:
@@ -625,7 +626,7 @@ class EvidenceResult:
         """Write to ``path`` as JSON: the estimate, its details and
         ``metadata``. :meth:`load` reads it back."""
         from .metadata import dumps
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(dumps({"log_z": self.log_z, "log_z_se": self.log_z_se,
                             "method": self.method, "details": self.details,
                             "wall_time": self.wall_time, "metadata": self.metadata}))
@@ -633,9 +634,12 @@ class EvidenceResult:
     @classmethod
     def load(cls, path) -> "EvidenceResult":
         """Read a result written by :meth:`save`."""
-        import json
-        with open(path) as fh:
-            d = json.load(fh)
+        from .metadata import loads
+        with open(path, encoding="utf-8") as fh:
+            try:
+                d = loads(fh.read())
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError(f"{path} is not an EvidenceResult written by save") from exc
         return cls(log_z=float(d["log_z"]), log_z_se=float(d["log_z_se"]),
                    method=d["method"], details=d["details"],
                    wall_time=float(d["wall_time"]), metadata=d["metadata"])
@@ -832,11 +836,34 @@ def _flow_log_weights(target, flow, n, seed, max_rows, compile_step) -> np.ndarr
 
     ev = _Evaluator(target.log_prob, compile_step=bool(compile_step),
                     max_rows=max_rows, name="the flow importance-sampling target")
-    keys = mx.random.split(mx.random.key(seed), -(-n // max_rows))
-    lw = []
-    for i, s in enumerate(range(0, n, max_rows)):
-        u, logq = flow.sample(min(max_rows, n - s), key=keys[i])
-        lw.append(ev.value(np.array(u)) - np.array(logq, dtype=np.float64))
+    starts = list(range(0, n, max_rows))
+    keys = mx.random.split(mx.random.key(seed), len(starts))
+
+    def draws(i):
+        m = min(max_rows, n - starts[i])
+        u, logq = flow.sample(m, key=keys[i])
+        mx.async_eval(u, logq)
+        return m, u, logq
+
+    # The next block's flow draws are queued while this block's target
+    # values are read back: 1.6-3x faster on cheap targets, the same
+    # weights bit for bit (the target sees the same padded float32 rows as
+    # through _Evaluator.value). The synchronize lets a block's buffers go
+    # before the next target block is allocated: without it the peak
+    # doubled in about half the calls (167 against 84 MB at 10,000 points).
+    lw, nxt = [], draws(0)
+    for i in range(len(starts)):
+        m, u, logq = nxt
+        size = min(1 << max(0, (m - 1).bit_length()), max_rows)   # as _Evaluator pads
+        if size > m:
+            u = mx.concatenate([u, mx.repeat(u[:1], size - m, axis=0)])
+        v = ev._f(u)
+        mx.async_eval(v)
+        if i + 1 < len(starts):
+            nxt = draws(i + 1)
+        v = np.array(v, dtype=np.float64)[:m]
+        mx.synchronize()
+        lw.append(v - np.array(logq, dtype=np.float64))
     lw = np.concatenate(lw)
     return np.where(np.isfinite(lw), lw, -np.inf)
 
@@ -876,6 +903,10 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
     leaves MLX inside ``log_prob``."""
     _args = dict(locals())
     _require_proper(target)
+    from .flow import Flow
+    if not isinstance(flow, Flow):
+        raise TypeError(f"flow= takes an anvil.flow.Flow (the proposal), not "
+                        f"{type(flow).__name__}; pass the flow you wrapped, not the FlowTarget")
     if int(flow.dim) != int(target.dim):
         raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
     if n < 100:

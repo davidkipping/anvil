@@ -7,6 +7,7 @@ acceptance bookkeeping. One loop serves every kernel.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import time
@@ -321,6 +322,11 @@ class Results:
     #: ``run()`` argument, the kernel's and target's settings, wall time;
     #: see :mod:`anvil.metadata`), written by :meth:`save`.
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: The final positions and log-probabilities in the target's own
+    #: coordinates, ``{"u": ..., "log_prob": ...}``, for a target sampled in
+    #: other ones (a flow target), whose ``final_state`` holds the sampled
+    #: (latent) ones. None otherwise.
+    final_base: dict[str, np.ndarray] | None = None
 
     def get_chain(self, discard: int = 0, thin: int = 1, flat: bool = False):
         return self.backend.get_chain(discard, thin, flat)
@@ -352,16 +358,19 @@ class Results:
     def save(self, path) -> None:
         """Write the draws and how they were made to ``path`` (``.npz``, no
         pickle): ``chain`` and ``log_prob`` (as ``get_chain()`` and
-        ``get_log_prob()``), ``accept_fraction``, the final positions and
-        adapted parameters, the diagnostics in ``extras``, and
-        ``metadata`` -- a JSON string with the versions, machine, date,
-        every ``run()`` argument, the kernel's and target's settings and
-        the wall time. :func:`anvil.load_results` reads it back; any
-        ``.npz`` reader can too.
+        ``get_log_prob()``), ``accept_fraction``, the final positions
+        (``final__u``, in the target's own coordinates like the chain; a
+        flow run's latent positions are ``final__z``) and adapted
+        parameters, the diagnostics in ``extras``, and ``metadata`` -- a
+        JSON string with the versions, machine, date, every ``run()``
+        argument (the starting positions by shape and hash), the kernel's
+        and target's settings and the wall time. :func:`anvil.load_results`
+        reads it back; any ``.npz`` reader can too.
 
-        The model function and the data are recorded by name only: keep the
-        script that built the target with the file. To continue the run,
-        use :meth:`save_state` as well."""
+        The model function and the data are recorded by name only, and the
+        starting positions only by hash: keep the script that built the
+        target, the data and the start with the file. To continue the run,
+        use :meth:`save_state` as well (and, in flow mode, the flow)."""
         from .metadata import dumps
         out: dict[str, np.ndarray] = {
             "metadata": np.array(dumps(self.metadata)),
@@ -369,9 +378,16 @@ class Results:
             "log_prob": np.asarray(self.get_log_prob()),
             "accept_fraction": np.asarray(self.accept_fraction),
         }
-        for k in ("u", "log_prob"):
-            if k in self.final_state:
-                out[f"final__{k}"] = np.array(self.final_state[k])
+        # final__u is in the target's own coordinates, as the chain is; a
+        # flow run's latent positions are final__z
+        if self.final_base is not None:
+            out["final__u"] = np.asarray(self.final_base["u"])
+            out["final__log_prob"] = np.asarray(self.final_base["log_prob"])
+            out["final__z"] = np.array(self.final_state["u"])
+        else:
+            for k in ("u", "log_prob"):
+                if k in self.final_state:
+                    out[f"final__{k}"] = np.array(self.final_state[k])
         for k, v in self.final_params.items():
             out[f"params__{k}"] = np.array(v)
         for k, v in self.extras.items():
@@ -390,9 +406,13 @@ class SavedResults:
     log_prob: np.ndarray
     accept_fraction: np.ndarray
     metadata: dict[str, Any]
+    #: final positions, in the target's own coordinates (as the chain)
     final_u: np.ndarray | None = None
     final_params: dict[str, np.ndarray] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
+    #: for a run in a flow's coordinates, the final latent positions (what a
+    #: resume continues from); None otherwise
+    final_z: np.ndarray | None = None
 
     @property
     def names(self) -> list[str] | None:
@@ -414,14 +434,15 @@ class SavedResults:
 
 def load_results(path) -> SavedResults:
     """Read a run written by :meth:`Results.save`."""
-    import json
+    from .metadata import loads
     with np.load(os.fspath(path), allow_pickle=False) as z:
         if "metadata" not in z.files or "chain" not in z.files:
             raise ValueError(f"{os.fspath(path)} is not a run written by Results.save")
         return SavedResults(
             chain=z["chain"], log_prob=z["log_prob"], accept_fraction=z["accept_fraction"],
-            metadata=json.loads(str(z["metadata"])),
+            metadata=loads(str(z["metadata"])),
             final_u=z["final__u"] if "final__u" in z.files else None,
+            final_z=z["final__z"] if "final__z" in z.files else None,
             final_params={k[len("params__"):]: z[k] for k in z.files
                           if k.startswith("params__")},
             extras={k[len("extras__"):]: z[k] for k in z.files if k.startswith("extras__")})
@@ -448,6 +469,16 @@ def _eager_log_prob(kernel, state, target) -> np.ndarray:
     except NotImplementedError:
         return np.array(state["log_prob"])
     return np.array(fresh["log_prob"])
+
+
+def _final_base(target, state):
+    """Final positions and log-probabilities in the target's own
+    coordinates, for a target sampled in other ones (``to_base``)."""
+    to_base = getattr(target, "to_base", None)
+    if to_base is None or "log_prob" not in state:
+        return None
+    u, lp = to_base(state["u"], state["log_prob"])
+    return {"u": np.array(u), "log_prob": np.array(lp)}
 
 
 def _lost_at_end(kernel, state, target) -> np.ndarray:
@@ -658,6 +689,10 @@ def run(
             raise TypeError(
                 "run() needs initial positions u0, unless resume= is given")
         n_chains, dim = u0.shape
+        # the starting positions are not in the record, so identify them:
+        # reproducing the run needs the same ones
+        run_args["u0"] = {"shape": [int(n_chains), int(dim)],
+                          "sha256": hashlib.sha256(np.array(u0).tobytes()).hexdigest()[:16]}
         n_warmup = 500 if n_warmup is None else int(n_warmup)
         seed = 0 if seed is None else int(seed)
         keys = KeyStream(seed)
@@ -945,6 +980,7 @@ def run(
         kernel=type(kernel).__name__,
         kernel_ckpt=kernel.checkpoint(),
         target_tag=getattr(target, "resume_tag", "") or "",
+        final_base=_final_base(target, state),
         metadata={
             "format": FORMAT,
             "kind": "anvil.run",
@@ -953,7 +989,9 @@ def run(
             "arguments": run_args,
             "resolved": {"n_chains": n_chains, "dim": dim, "n_warmup": n_warmup,
                          "n_samples": n_samples, "thin": thin, "seed": seed,
-                         "compile_step": compile_step, "pipeline_depth": depth,
+                         "compile_step": compile_step,
+                         "compile_refused": bool(kernel.compile_refused),
+                         "pipeline_depth": depth,
                          "resumed_from_iteration": iter0 if resume is not None else None,
                          "iterations_consumed": iter0 + n_warmup + total_iters},
             "kernel": describe_kernel(kernel),

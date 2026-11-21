@@ -67,7 +67,7 @@ def test_a_run_saves_its_draws_and_how_it_was_made(tmp_path):
     assert moves[0]["a"] == 2.5 and moves[0]["weight"] == 0.75
     p = m["target"]["parameters"]
     assert p[0]["prior"] == {"class": "Gaussian", "mu": 1.0, "sigma": 1.0}
-    assert p[0]["lo"] == "-inf" and m["target"]["model_log_prob"].endswith("_banana_ll")
+    assert p[0]["lo"] == -math.inf and m["target"]["model_log_prob"].endswith("_banana_ll")
     # plain .npz plus JSON: readable without anvil
     with np.load(tmp_path / "run", allow_pickle=False) as z:
         assert json.loads(str(z["metadata"]))["arguments"]["seed"] == 7
@@ -127,7 +127,8 @@ def test_evidence_results_record_their_call(small_flow, tmp_path):
     back = anvil.SMCResult.load(tmp_path / "smc.npz")
     assert back.log_z == r.log_z and math.isnan(back.log_z_se)
     np.testing.assert_array_equal(back.u, r.u)
-    assert back.metadata == json.loads(json.dumps(jsonable(r.metadata)))
+    from anvil.metadata import dumps, loads
+    assert back.metadata == loads(dumps(r.metadata))
     ev = anvil.flow_evidence(t, small_flow, n=4096, seed=3)
     assert ev.metadata["arguments"]["flow"]["fingerprint"] == small_flow.fingerprint
     ev.save(tmp_path / "ev.json")
@@ -160,3 +161,74 @@ def test_a_broken_describe_does_not_fail_a_run():
     t = Odd(lambda u: -0.5 * mx.sum(u * u, axis=1), 2)
     res = anvil.run(anvil.EnsembleKernel(t), t, _start(), n_warmup=5, n_samples=5)
     assert res.metadata["target"]["describe_error"] == "RuntimeError: no"
+
+
+# -- review fixes (0.14.1) -----------------------------------------------------------
+
+def test_a_callable_model_holding_data_is_recorded_by_name(tmp_path):
+    # a dataclass with __call__ (or an nn.Module, a dict) used to have its
+    # fields -- its data -- written into the metadata in full
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Model:
+        y: mx.array
+
+        def __call__(self, v):
+            return -0.5 * mx.sum(v * v, axis=1) + 0.0 * mx.sum(self.y)
+    model = Model(mx.zeros((100_000,)))
+    specs = [ParamSpec("a", prior=Gaussian(0.0, 1.0)), ParamSpec("b", prior=Gaussian(0.0, 1.0))]
+    t = TransformedLogDensity(model, Transform(specs))
+    res = anvil.run(anvil.EnsembleKernel(t), t, _start(), n_warmup=2, n_samples=2)
+    assert isinstance(res.metadata["target"]["model_log_prob"], str)
+    res.save(tmp_path / "r.npz")
+    assert (tmp_path / "r.npz").stat().st_size < 200_000
+    assert jsonable(np.zeros(1000)) == {"array": [1000], "dtype": "float64"}
+
+
+def test_non_finite_numbers_survive_a_save(small_flow, tmp_path):
+    import copy
+    f = copy.copy(small_flow)
+    f.report = dataclasses_replace(small_flow.report, gain_nats=math.nan,
+                                   smc={"log_z": -math.inf, "stalled": 0, "n_stages": 1})
+    f.save(tmp_path / "f.npz")
+    g = Flow.load(tmp_path / "f.npz")
+    assert math.isnan(g.report.gain_nats) and g.report.smc["log_z"] == -math.inf
+    str(g.report)                                         # used to raise on a string
+    ev = anvil.EvidenceResult(1.0, math.nan, "x", details={"a": math.inf, "t": (1.0, -math.inf)})
+    ev.save(tmp_path / "e.json")
+    back = anvil.EvidenceResult.load(tmp_path / "e.json")
+    assert back.details["a"] == math.inf and back.details["t"][1] == -math.inf
+    with pytest.raises(ValueError, match="not an EvidenceResult"):
+        anvil.EvidenceResult.load(tmp_path / "f.npz")
+
+
+def dataclasses_replace(obj, **kw):
+    import dataclasses
+    return dataclasses.replace(obj, **kw)
+
+
+def test_saved_final_positions_are_in_the_targets_coordinates(small_flow, tmp_path):
+    f = small_flow
+    ft = f.wrap(_banana())
+    res = anvil.run(anvil.EnsembleKernel(ft), ft, f.start(32), n_warmup=10, n_samples=10)
+    res.save(tmp_path / "r.npz")
+    back = anvil.load_results(tmp_path / "r.npz")
+    np.testing.assert_allclose(back.final_u, res.get_chain()[-1], rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(back.final_z, np.array(res.final_state["u"]))
+    plain = anvil.run(anvil.EnsembleKernel(_banana()), _banana(), _start(), n_warmup=2,
+                      n_samples=2)
+    plain.save(tmp_path / "p.npz")
+    assert anvil.load_results(tmp_path / "p.npz").final_z is None
+
+
+def test_the_start_and_a_compile_refusal_are_recorded():
+    t = _banana()
+    u0 = _start()
+    a = anvil.run(anvil.EnsembleKernel(t), t, u0, n_warmup=2, n_samples=2)
+    b = anvil.run(anvil.EnsembleKernel(t), t, u0.copy(), n_warmup=2, n_samples=2)
+    c = anvil.run(anvil.EnsembleKernel(t), t, _start(seed=1), n_warmup=2, n_samples=2)
+    assert a.metadata["arguments"]["u0"]["shape"] == [32, 2]
+    assert a.metadata["arguments"]["u0"]["sha256"] == b.metadata["arguments"]["u0"]["sha256"]
+    assert a.metadata["arguments"]["u0"]["sha256"] != c.metadata["arguments"]["u0"]["sha256"]
+    assert a.metadata["resolved"]["compile_refused"] is False

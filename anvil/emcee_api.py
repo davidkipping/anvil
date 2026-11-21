@@ -50,9 +50,11 @@ class EnsembleSampler:
     it. ``flow=`` a trained :class:`~anvil.flow.Flow` uses that one. The
     default moves become stretch and differential evolution, half each
     (the mix measured), and ``initial_state`` may be None to start from
-    the flow's training draws (from the flow's own distribution for a
-    flow without them, such as one read by ``Flow.load``); a later
-    ``run_mcmc(None, ...)`` continues the previous run. ``kernel=`` cannot
+    the flow's training draws (saved with the flow by ``Flow.save``; a
+    flow without them -- ``save(pool=False)``, a file from before 0.14.0,
+    or one refitted with ``Flow.fit`` -- starts from its own distribution,
+    and needs warmup); a later ``run_mcmc(None, ...)`` continues the
+    previous run. ``kernel=`` cannot
     be combined with a flow: a kernel is built on the target it samples.
     For control over training (``rounds``, ``smc_kwargs``, ...) call
     :func:`anvil.flow.train` yourself and pass ``flow=`` the result."""
@@ -188,14 +190,21 @@ class EnsembleSampler:
                 # continue, as emcee does: restarting from the training draws
                 # with the same seed would replay the first run draw for draw
                 resume = last
+                if warmup:
+                    raise ValueError(
+                        "run_mcmc(None, ...) continues the previous run, which cannot "
+                        "warm up again (its draws would no longer be one Markov chain); "
+                        "for a fresh run with warmup, start from the last positions: "
+                        "run_mcmc(sampler.get_chain()[-1], nsteps, warmup=...)")
             else:
                 p0 = self.flow.start(self.nwalkers, seed=self.seed)
-                if self.flow.pool is None and warmup == 0:
-                    warnings.warn(
-                        "this flow has no training draws (pool), so the walkers start "
-                        "from the flow's own distribution, and with warmup=0 the way "
-                        "from there to the posterior is recorded; pass warmup=",
-                        RuntimeWarning, stacklevel=2)
+                if warmup == 0 and (self.flow.pool is None or last is not None):
+                    why = ("this flow has no training draws (pool), so the walkers start "
+                           "from the flow's own distribution" if self.flow.pool is None else
+                           "the flow changed since the last run, so this is a new chain "
+                           "from the flow's training draws")
+                    warnings.warn(f"{why}, and with warmup=0 its way to the posterior "
+                                  f"is recorded; pass warmup=", RuntimeWarning, stacklevel=2)
         else:
             p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
             if self.flow is not None:
