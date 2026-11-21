@@ -386,9 +386,11 @@ class FlowReport:
 
     ``gain_nats``: the hold-out log-likelihood of the flow minus that of
     the whitening alone. Near zero, the posterior is already close to
-    Gaussian after a linear map and a plain sampler (dense ChEES, or the
-    ensemble) will be faster than one in flow coordinates; ``worthwhile``
-    is False below 1 nat. ``is_efficiency``: the effective sample size of
+    Gaussian after a linear map. With a cheap likelihood a plain sampler
+    (dense ChEES, or the ensemble) is then faster than one in flow
+    coordinates, which pay for evaluating the flow; with an expensive one
+    the flow can still win per evaluation. ``worthwhile`` is False below
+    1 nat. ``is_efficiency``: the effective sample size of
     importance weights target/flow, as a fraction of the draws -- the one
     diagnostic that tracked the flow's quality in every test. It cannot see
     posterior mass the training draws never reached. ``warnings``: each
@@ -450,9 +452,13 @@ def _make_report(target, flow, info, smc_facts, seconds, seed, compile_step):
         warn.append(f"training diverged at every learning rate tried; this flow is the "
                     f"best checkpoint, gain {gain:.2f} nats")
     if not worthwhile:
-        warn.append(f"no flow needed: the fit gains only {gain:.2f} nats over a linear "
-                    f"map, so the posterior is close to Gaussian already and a plain "
-                    f"sampler (dense ChEES or the ensemble) will be faster")
+        warn.append(f"small fit gain: the flow gains only {gain:.2f} nats over a linear "
+                    f"map, so the posterior is close to Gaussian already. A plain sampler "
+                    f"(dense ChEES or the ensemble) will be faster unless the likelihood "
+                    f"is expensive: evaluating the flow adds about 1.5 ms to an ensemble "
+                    f"iteration of 512 walkers, which an expensive likelihood can repay if "
+                    f"the flow cuts the iterations per effective sample; compare the two "
+                    f"on a short run")
     if eff < _EFF_POOR:
         warn.append(f"importance efficiency {eff:.4f}: the flow fits the posterior poorly "
                     f"somewhere; expect slow mixing there, and do not trust flow_evidence")

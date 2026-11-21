@@ -84,11 +84,17 @@ anvil flow: fit gain 12.75 nats over whitening, importance efficiency 0.491, 184
 | fit gain | hold-out log-likelihood of the flow minus that of a linear map | 0.02-0.11 nats on a near-Gaussian transit posterior; 5-6 on a curved limb-darkening prior; 12-14 on oblate fits |
 | importance efficiency | effective sample size of the weights target/flow, as a fraction of the draws | 0.8-0.99 when the flow was excellent; 0.03-0.32 on oblate fits that still sampled well |
 
-**"No flow needed"** appears when the fit gain is under 1 nat. The posterior
-is then close to Gaussian after a linear map, and a plain sampler (dense
-ChEES, or the ensemble) is faster. On a spherical transit fit with
-near-Gaussian posteriors, plain samplers ran 2-4x faster than the ensemble
-in flow coordinates, which pays for evaluating the flow.
+**"Small fit gain"** appears when the fit gain is under 1 nat. The posterior
+is then close to Gaussian after a linear map, and with a cheap likelihood a
+plain sampler (dense ChEES, or the ensemble) is faster. On a spherical
+transit fit with near-Gaussian posteriors, plain samplers ran 2-4x faster
+than the ensemble in flow coordinates, which pays about 1.5 ms per iteration
+for evaluating the flow. With an expensive likelihood a small gain can
+still pay: on two-mode Gaussian mixtures (2 and 6 dimensions, modes 6-10 sd
+apart), fit gains of 0.5-0.9 nats gave the ensemble in flow coordinates
+1.5-3.4x the effective samples per iteration of the plain ensemble, with
+2-5x the mode switches. Those toys cost almost nothing to evaluate, so
+there the flow was 3-5x slower per second. Compare the two on a short run.
 
 The importance efficiency was the one number that tracked the flow's
 quality through every test. It cannot see posterior mass the training draws
@@ -153,8 +159,8 @@ sample:
 - **Oblate, 10,000 points.** Training took about 2,300 s, of which SMC was
   2,080 s; 10,000 effective samples then took 230 s. No plain sampler
   converged in any run tried, including ChEES runs of 9-51 minutes.
-- **Spherical hybrid2.** The flow is pure overhead, and the report says
-  "no flow needed" before you sample.
+- **Spherical hybrid2.** The flow is pure overhead, and the report warns of
+  a small fit gain before you sample.
 
 **Per-iteration overhead.** Evaluating the flow adds about 1.5 ms to each
 ensemble iteration of 512 walkers. That is what makes the near-Gaussian

@@ -249,7 +249,7 @@ cheap checks. See the evidence guide for the measurements.
 
 ```python
 flow = anvil.flow.train(target)                # SMC from the prior, refinement, a frozen flow
-print(flow.report)                             # says "no flow needed" when it isn't
+print(flow.report)                             # warns when the flow gains little
 ft = flow.wrap(target)
 res = anvil.run(anvil.EnsembleKernel(ft), ft, flow.start(512), n_warmup=500, n_samples=2000)
 res.get_chain()                                # in the target's own coordinates

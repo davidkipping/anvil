@@ -197,7 +197,7 @@ def test_train_from_the_prior_reports_a_curved_posterior():
     assert "fit gain" in str(r)
 
 
-def test_report_says_no_flow_needed_for_a_gaussian():
+def test_report_warns_of_a_small_gain_for_a_gaussian():
     # strongly correlated but Gaussian: whitening alone removes it
     A = np.array([[1.0, 0.0], [0.9, 0.3]])
     Ainv_T = mx.array(np.linalg.inv(A).T.astype(np.float32))
@@ -205,7 +205,7 @@ def test_report_says_no_flow_needed_for_a_gaussian():
     t = TransformedLogDensity(lambda v: -0.5 * mx.sum((v @ Ainv_T) ** 2, axis=1),
                               Transform(specs))
     draws = (np.random.default_rng(0).standard_normal((20_000, 2)) @ A.T).astype(np.float32)
-    with pytest.warns(RuntimeWarning, match="no flow needed"):
+    with pytest.warns(RuntimeWarning, match="small fit gain"):
         f = refine(t, draws, fit_kwargs=dict(max_steps=1000), **SMALL)
     assert not f.report.worthwhile and f.report.gain_nats < 1.0
 
