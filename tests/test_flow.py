@@ -462,3 +462,31 @@ def test_small_input_errors_say_what_is_wrong(banana_flow, tmp_path):
     g.fit(_banana_draws(1000), max_steps=1)
     assert g.report is None
 
+
+
+# -- compiled fit (0.13.4) -------------------------------------------------------------
+
+def test_compiled_fit_is_repeatable_and_matches_the_uncompiled_one():
+    d = _banana_draws(5000, seed=6)
+    a = Flow(2, **SMALL, seed=5)
+    ia = a.fit(d, max_steps=300, seed=5)
+    b = Flow(2, **SMALL, seed=5)
+    ib = b.fit(d, max_steps=300, seed=5)
+    assert a.fingerprint == b.fingerprint                 # same seed, same flow
+    c = Flow(2, **SMALL, seed=5)
+    ic = c.fit(d, max_steps=300, seed=5, compile=False)
+    assert ic["steps"] == ia["steps"] and ic["retries"] == ia["retries"]
+    assert abs(ic["val_nll"] - ia["val_nll"]) < 1e-3     # rounding, not a different fit
+    for k, v in a._arrays().items():
+        np.testing.assert_allclose(v, c._arrays()[k], atol=1e-4)
+
+
+def test_compiled_fit_retries_after_a_divergence():
+    # weights and Adam state are compile inputs: a retry traces a fresh step
+    # from the untrained flow rather than replaying a frozen one
+    d = _banana_draws(2000, seed=7)
+    info = Flow(2, **SMALL).fit(d, max_steps=200, lr=50.0, retries=1, check_every=10)
+    assert info["retries"] == 1 and info["diverged"]      # lr=50 diverges both times
+    again = Flow(2, **SMALL).fit(d, max_steps=200, lr=50.0, retries=1, check_every=10,
+                                 compile=False)
+    assert again["retries"] == info["retries"] and again["diverged"] == info["diverged"]

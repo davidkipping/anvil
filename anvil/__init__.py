@@ -25,7 +25,7 @@ from .precision import (Certificate, PrecisionPolicy, certify,
 from .transforms import (JointLogDensity, ParamSpec, Transform,
                          TransformedLogDensity, joint)
 
-__version__ = "0.13.3"
+__version__ = "0.13.4"
 
 __all__ = [
     "ChEESHMC",

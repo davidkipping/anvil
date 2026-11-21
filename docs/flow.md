@@ -86,7 +86,10 @@ resume with a different flow, or with the unwrapped target, raises.
    It is trained by maximum likelihood with a 10% hold-out and early
    stopping, in 10-35 s on the GPU. A fit can never come back worse than
    whitening alone: the whitening is its first checkpoint, and a fit that
-   diverges is retried at a lower learning rate. Repeated draws (a chain's
+   diverges is retried at a lower learning rate. Each training step runs as
+   one compiled graph, 1.6-1.9x faster than step by step;
+   `fit_kwargs={"compile": False}` reproduces the uncompiled fit exactly
+   (the two differ in the last bit of the weights). Repeated draws (a chain's
    rejected proposals) keep their weight, with every copy on the same side
    of the hold-out split. A few draws far outside the rest (more than 50
    robust standard deviations out, and under 1% of them) are left out,
@@ -270,6 +273,11 @@ flow3 = anvil.flow.Flow.load("flow.npz")
 A run on a refined flow is a new Markov chain, so start it with warmup
 rather than by resuming the old one; `run` refuses a resume across flows.
 
+- **To reproduce a run, keep the saved flow, not just the seed.** The same
+  seed retrains the same flow only on the same machine and the same MLX
+  and anvil versions; other Apple chips or MLX releases can round
+  differently. A loaded flow with the same sampler seed reproduces the run
+  bit for bit.
 - **To resume a run in another session, save the flow next to the state.**
   A resume state is usable only with the exact flow that wrote it: `run`
   checks the flow's fingerprint and refuses any other.

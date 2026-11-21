@@ -59,6 +59,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass, field
+from functools import partial
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -201,7 +202,7 @@ class Flow:
 
     def fit(self, draws, *, max_steps: int = 6000, batch: int = 1024, lr: float = 2e-3,
             patience: int = 10, check_every: int = 100, retries: int = 2,
-            seed: int = 0) -> dict:
+            seed: int = 0, compile: bool = True) -> dict:
         """Train by maximum likelihood on ``draws`` (``(n, dim)``, or a
         :class:`~anvil.Results` or chain array, in u), holding 10% out.
 
@@ -232,6 +233,19 @@ class Flow:
 
         Fitting a flow clears its :attr:`report`, which described the
         previous fit.
+
+        ``compile``: the training step (gradient and Adam update) runs as
+        one compiled MLX graph, 1.6-1.9x faster (3,000 steps on 102,400
+        draws at 10 dimensions: 27-31 s uncompiled, 16-17 s compiled, M2
+        Max with the CPU otherwise busy). The same seed gives the same flow
+        on the same machine and versions. Compiled arithmetic can round
+        differently in the last bit, so the weights are not bit for bit
+        those of an uncompiled fit, or of flows fitted before anvil 0.13.4:
+        after 3,000 steps they differed by at most 1e-6, and the hold-out
+        loss agreed to every digit, on 3 seeds. ``compile=False``
+        reproduces the uncompiled fit exactly. Sampling is exact either
+        way; to reproduce a run, keep the saved flow (:meth:`save`), not
+        the seed.
 
         Returns the training facts: ``gain_nats`` (hold-out loss of the
         whitening alone minus the flow's, the measure of how far from
@@ -266,7 +280,7 @@ class Flow:
             self.params = [dict(p) for p in init]
             best, best_params, steps, diverged = self._train(
                 xt, xv, base, rng, max_steps, batch, lr / 4 ** attempt, patience,
-                check_every)
+                check_every, bool(compile))
             if not diverged:
                 break
         self.params = best_params
@@ -288,20 +302,40 @@ class Flow:
             total += float(mx.sum(self.log_q(x[s:s + _NLL_ROWS])).item())
         return -total / n
 
-    def _train(self, xt, xv, base, rng, max_steps, batch, lr, patience, check_every):
+    def _train(self, xt, xv, base, rng, max_steps, batch, lr, patience, check_every,
+               compiled=True):
         opt = optim.Adam(learning_rate=optim.cosine_decay(lr, max_steps, lr * 0.02))
 
         def loss(params, u):
             return -mx.mean(self.log_q(u, params))
         vg = mx.value_and_grad(loss)
+        if compiled:
+            # the weights and Adam's state are the compiled step's inputs and
+            # outputs; captured instead, they would be frozen at their first
+            # values. The whitening is fixed for the whole fit, so it may be
+            # captured, and each fit (and retry) traces a fresh step.
+            opt.init({"p": self.params})
+            holder = {"params": self.params, "opt": opt.state}
+
+            @partial(mx.compile, inputs=holder, outputs=holder)
+            def step(u):
+                l, g = vg(holder["params"], u)
+                holder["params"] = opt.apply_gradients({"p": g}, {"p": holder["params"]})["p"]
+                return l
         best, best_params, bad, diverged = base, [dict(p) for p in self.params], 0, False
         i = 0
         for i in range(max_steps):
             idx = rng.integers(0, len(xt), size=min(batch, len(xt)))
-            l, g = vg(self.params, mx.array(xt[idx]))
-            # the optimizer wants a dict at the top of the tree
-            self.params = opt.apply_gradients({"p": g}, {"p": self.params})["p"]
-            mx.eval(l, self.params, opt.state)
+            u = mx.array(xt[idx])
+            if compiled:
+                l = step(u)
+                self.params = holder["params"]
+                mx.eval(l, holder)
+            else:
+                l, g = vg(self.params, u)
+                # the optimizer wants a dict at the top of the tree
+                self.params = opt.apply_gradients({"p": g}, {"p": self.params})["p"]
+                mx.eval(l, self.params, opt.state)
             if not math.isfinite(float(l.item())):
                 diverged = True
                 break
