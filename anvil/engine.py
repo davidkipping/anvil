@@ -723,12 +723,19 @@ def run(
 
     to_base = getattr(target, "to_base", None)
 
+    def _frame(t_i, st):
+        """A stored frame's device arrays, mapped to base coordinates when
+        the target has them -- built here, before the iteration is
+        evaluated, so the map joins the same (possibly pipelined) graph."""
+        u_dev, lp_dev = st["u"], st["log_prob"]
+        if to_base is not None and (t_i + 1) % thin == 0:
+            u_dev, lp_dev = to_base(u_dev, lp_dev)
+        return t_i, u_dev, lp_dev
+
     def _flush_one(frame):
         t_i, u_dev, lp_dev = frame
         if (t_i + 1) % thin:
             return
-        if to_base is not None:
-            u_dev, lp_dev = to_base(u_dev, lp_dev)
         # np.array() forces evaluation, but for a pipelined frame the
         # iteration finished several steps ago, so it is a pure copy
         u_np, lp_np = np.array(u_dev), np.array(lp_dev)
@@ -755,16 +762,17 @@ def run(
             _drain()
             mx.eval(*state.values(), accept_sum, divergent_sum)
             state = reanchor(state)
+        frame = _frame(t, state)
         if depth:
             # keep the queue moving without blocking on it
-            mx.async_eval(*state.values(), accept_sum, divergent_sum)
-            pending.append((t, state["u"], state["log_prob"]))
+            mx.async_eval(*state.values(), accept_sum, divergent_sum, *frame[1:])
+            pending.append(frame)
             if len(pending) > depth:
                 _flush_one(pending.popleft())
         else:
             # evaluate every iteration to bound lazy-graph growth
-            mx.eval(*state.values(), accept_sum, divergent_sum)
-            _flush_one((t, state["u"], state["log_prob"]))
+            mx.eval(*state.values(), accept_sum, divergent_sum, *frame[1:])
+            _flush_one(frame)
         if auto and t + 1 == min(_PIPELINE_PROBE, total_iters):
             # decide once, from measured cost: pipelining trades peak
             # memory for latency, and only pays when latency dominates

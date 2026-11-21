@@ -26,7 +26,8 @@ class LogDensity:
     # draws should be recorded in (anvil.flow.FlowTarget is the built-in one):
     # ``to_base(u, log_prob) -> (u_base, log_prob_base)`` maps stored frames,
     # and ``resume_tag`` (a string) names the coordinates, so that run()
-    # refuses to resume a state written in different ones.
+    # refuses to resume a state written in different ones. A target that wraps
+    # another should forward both, as CountingLogDensity does.
 
     def log_prob(self, u: mx.array) -> mx.array:
         """Batched log density: (n_chains, dim) -> (n_chains,).
@@ -76,6 +77,14 @@ class CountingLogDensity(LogDensity):
         self.n_calls = 0
         self.n_evals = 0
         self.n_grad_calls = 0
+        # a wrapped target in other coordinates keeps them: run() records
+        # through to_base and checks resume_tag (anvil.flow.FlowTarget)
+        if hasattr(inner, "to_base"):
+            self.to_base = inner.to_base
+
+    @property
+    def resume_tag(self) -> str:
+        return getattr(self.inner, "resume_tag", "") or ""
 
     def log_prob(self, u: mx.array) -> mx.array:
         self.n_calls += 1

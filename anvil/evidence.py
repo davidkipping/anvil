@@ -755,6 +755,22 @@ def bridge_evidence(target: TransformedLogDensity, draws, *, nu: float = 5.0,
         wall_time=time.perf_counter() - t0)
 
 
+def _flow_log_weights(target, flow, n, seed, max_rows, compile_step) -> np.ndarray:
+    """log target - log flow at ``n`` flow draws, evaluated ``max_rows`` at
+    a time; non-finite as -inf. Shared by flow_evidence and the flow report."""
+    from .optimize import _Evaluator
+
+    ev = _Evaluator(target.log_prob, compile_step=bool(compile_step),
+                    max_rows=max_rows, name="the flow importance-sampling target")
+    keys = mx.random.split(mx.random.key(seed), -(-n // max_rows))
+    lw = []
+    for i, s in enumerate(range(0, n, max_rows)):
+        u, logq = flow.sample(min(max_rows, n - s), key=keys[i])
+        lw.append(ev.value(np.array(u)) - np.array(logq, dtype=np.float64))
+    lw = np.concatenate(lw)
+    return np.where(np.isfinite(lw), lw, -np.inf)
+
+
 def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed: int = 0,
                   max_rows: int = 1 << 10, compile_step: bool = True) -> EvidenceResult:
     """ln Z by importance sampling, with a trained :class:`~anvil.flow.Flow`
@@ -781,21 +797,11 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
 
     ``compile_step=False`` evaluates the target uncompiled, for one that
     leaves MLX inside ``log_prob``."""
-    from .optimize import _Evaluator
-
     _require_proper(target)
     if int(flow.dim) != int(target.dim):
         raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
     t0 = time.perf_counter()
-    ev = _Evaluator(target.log_prob, compile_step=bool(compile_step),
-                    max_rows=max_rows, name="the flow-evidence target")
-    keys = mx.random.split(mx.random.key(seed), -(-n // max_rows))
-    lw = []
-    for i, s in enumerate(range(0, n, max_rows)):
-        u, logq = flow.sample(min(max_rows, n - s), key=keys[i])
-        lw.append(ev.value(np.array(u)) - np.array(logq, dtype=np.float64))
-    lw = np.concatenate(lw)
-    lw = np.where(np.isfinite(lw), lw, -np.inf)
+    lw = _flow_log_weights(target, flow, n, seed, max_rows, compile_step)
     lz = _logmeanexp(lw)
     if not np.isfinite(lz):
         raise ValueError("flow_evidence: the target is -inf at every flow draw")

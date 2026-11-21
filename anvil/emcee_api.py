@@ -146,20 +146,29 @@ class EnsembleSampler:
         (it is mapped into the flow's), and may be None to start from the
         flow's training draws: ``run_mcmc(None, nsteps, warmup=...)``; ``flow=True`` trains the flow here first.
         """
+        if initial_state is not None:
+            # checked before any training: flow=True trains for minutes to
+            # an hour, and a wrong shape found after it would waste that
+            shape = np.shape(initial_state)
+            if shape != (self.nwalkers, self.ndim):
+                raise ValueError(
+                    f"initial_state must have shape ({self.nwalkers}, {self.ndim}), "
+                    f"got {tuple(shape)}")
+        elif self.flow is None and not self._train_flow:
+            raise TypeError("run_mcmc() needs initial_state (it may be None "
+                            "only in flow mode)")
         if self._train_flow and self.flow is None:
             from .flow import train
             self.flow = train(self.target, n_chains=self.nwalkers, seed=self.seed,
-                              progress=progress)
+                              progress=progress,
+                              compile_step=True if compile_step is None else compile_step)
             print(self.flow.report, flush=True)
         sampled = self._sampled_target()
         if initial_state is None:
-            if self.flow is None:
-                raise TypeError("run_mcmc() needs initial_state (it may be None "
-                                "only in flow mode)")
             p0 = self.flow.start(self.nwalkers, seed=self.seed)
         else:
             p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
-            if self.flow is not None and p0.shape == (self.nwalkers, self.ndim):
+            if self.flow is not None:
                 p0 = self.flow.to_latent(p0)
         if p0.shape != (self.nwalkers, self.ndim):
             raise ValueError(
@@ -228,17 +237,10 @@ class HMCSampler(EnsembleSampler):
         if "flow" in kernel_kwargs:
             raise TypeError("HMCSampler has no flow mode; use EnsembleSampler(flow=...), "
                             "or wrap the target yourself (anvil.flow)")
-        if target is not None:
-            self.target = target
-            self.nwalkers, self.ndim, self.seed = int(nwalkers), int(ndim), seed
-            self._moves, self._results = None, None
-        else:
-            super().__init__(nwalkers, ndim, log_prob_fn, seed=seed)
-        self._kernel_kwargs = kernel_kwargs
-        self._kernel = None
         # flow mode is the ensemble sampler's: ChEES trailed it 20-40x in
         # flow coordinates on the oblate fit (anvil.flow docstring)
-        self.flow, self._train_flow = None, False
+        super().__init__(nwalkers, ndim, log_prob_fn, target=target, seed=seed)
+        self._kernel_kwargs = kernel_kwargs
 
     def _make_kernel(self, target: LogDensity | None = None) -> Kernel:
         return ChEESHMC(self.target if target is None else target, **self._kernel_kwargs)

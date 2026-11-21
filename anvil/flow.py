@@ -121,6 +121,8 @@ class Flow:
                 "W2": w(hidden, hidden), "b2": mx.zeros((hidden,)),
                 "W3": mx.zeros((hidden, 2 * db)), "b3": mx.zeros((2 * db,)),
             })
+        # what every fit starts from: zero last layers, so the whitening alone
+        self._init_params = [dict(p) for p in self.params]
         #: the :class:`FlowReport` from :func:`train` or :func:`refine`
         self.report: FlowReport | None = None
         #: draws in u that :meth:`start` picks from (set by :func:`train`)
@@ -202,7 +204,14 @@ class Flow:
         fit can never come back worse than whitening. A fit that diverges
         (a non-finite loss, or a hold-out loss 1 nat above the whitening's)
         is retried from scratch at a quarter of the learning rate, up to
-        ``retries`` times.
+        ``retries`` times. Every fit starts from the untrained flow, so
+        fitting a flow again replaces what it learned before; a
+        :class:`FlowTarget` made from it earlier then has a different
+        :attr:`~FlowTarget.resume_tag`, and resuming its runs raises.
+
+        Exact duplicate rows (SMC particles that share an ancestor) are
+        dropped first: a hold-out row with a copy in the training set
+        makes the hold-out loss track the training loss.
 
         Returns the training facts: ``gain_nats`` (hold-out loss of the
         whitening alone minus the flow's, the measure of how far from
@@ -211,6 +220,7 @@ class Flow:
         t0 = time.perf_counter()
         x = _as_draws(draws, self.dim)
         x = x[np.all(np.isfinite(x), axis=1)]
+        x = np.unique(x, axis=0)
         if len(x) < 20:
             raise ValueError(f"fit needs at least 20 finite draws, got {len(x)}")
         rng = np.random.default_rng(seed)
@@ -218,7 +228,8 @@ class Flow:
         n_val = max(len(x) // 10, 1)
         xv, xt = mx.array(x[:n_val]), x[n_val:]
         self._set_whitening(xt)
-        init = [dict(p) for p in self.params]
+        init = self._init_params
+        self.params = [dict(p) for p in init]           # the whitening alone
         base = float(-mx.mean(self.log_q(xv)).item())
 
         for attempt in range(retries + 1):
@@ -348,9 +359,13 @@ class FlowTarget(LogDensity):
         self.target, self.flow = target, flow
         self.dim = flow.dim
         self.supports_grad = getattr(target, "supports_grad", True)
-        #: identifies the flow, so a run cannot resume in another flow's
-        #: coordinates
-        self.resume_tag = f"flow:{flow.fingerprint}"
+
+    @property
+    def resume_tag(self) -> str:
+        """Identifies the flow's current weights, so a run cannot resume
+        in another flow's coordinates (computed on each call: a flow
+        fitted again after wrapping gets a new tag)."""
+        return f"flow:{self.flow.fingerprint}"
 
     def log_prob(self, z: mx.array) -> mx.array:
         u, ld = self.flow.forward(z)
@@ -418,22 +433,15 @@ def _as_draws(draws, dim: int) -> np.ndarray:
     return a.reshape(-1, dim)
 
 
-def _importance_efficiency(target, flow, n, seed, block=1024):
-    # blocks of 1024 rows: peak memory is rows x data size (see flow_evidence)
-    u, logq = flow.sample(n, seed=seed)
-    lp = np.concatenate([np.array(target.log_prob(u[i:i + block]), dtype=np.float64)
-                         for i in range(0, n, block)])
-    lw = lp - np.array(logq, dtype=np.float64)
-    lw = np.where(np.isfinite(lw), lw, -np.inf)
-    if not np.isfinite(lw.max()):
-        return 0.0
-    w = np.exp(lw - lw.max())
-    return float(w.sum() ** 2 / (w * w).sum() / n)
+def _make_report(target, flow, info, smc_facts, seconds, seed, compile_step):
+    from .evidence import _flow_log_weights
 
-
-def _make_report(target, flow, info, smc_facts, seconds, seed):
     t0 = time.perf_counter()
-    eff = _importance_efficiency(target, flow, 16384, seed + 7)
+    lw = _flow_log_weights(target, flow, 16384, seed + 7, 1 << 10, compile_step)
+    eff = 0.0
+    if np.isfinite(lw.max()):
+        w = np.exp(lw - lw.max())
+        eff = float(w.sum() ** 2 / (w * w).sum() / lw.size)
     seconds = {**seconds, "report": time.perf_counter() - t0}
     gain = float(info["gain_nats"])
     warn = []
@@ -460,7 +468,8 @@ def _make_report(target, flow, info, smc_facts, seconds, seed):
 def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 512,
           round_warmup: int = 200, round_samples: int = 1000, n_layers: int = 8,
           hidden: int = 64, seed: int = 0, smc_kwargs: dict | None = None,
-          fit_kwargs: dict | None = None, progress: bool = False) -> Flow:
+          fit_kwargs: dict | None = None, progress: bool = False,
+          compile_step: bool = True) -> Flow:
     """Train a frozen flow for ``target``. Returns it with
     :attr:`Flow.report` and :attr:`Flow.pool` set.
 
@@ -484,6 +493,10 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
         ft = flow.wrap(target)
         res = anvil.run(anvil.EnsembleKernel(ft, moves=...), ft, flow.start(512))
 
+    ``compile_step=False`` evaluates the target uncompiled throughout (SMC,
+    the refinement runs, the report), for one that leaves MLX inside
+    ``log_prob``.
+
     Costs, measured on a 10-parameter oblate transit fit (10,000 points,
     66 ms per batched gradient): SMC 2,080 s, the four rounds 210 s. SMC is
     most of it; with ``draws`` supplied it is skipped.
@@ -504,7 +517,8 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
                 "flow training starts from the prior through anvil.smc, which needs a "
                 "TransformedLogDensity with proper priors; give it one, or pass draws= "
                 "that start from the prior")
-        r = smc(target, **{"seed": seed, "progress": progress, **(smc_kwargs or {})})
+        r = smc(target, **{"seed": seed, "progress": progress, "compile_step": compile_step,
+                           **(smc_kwargs or {})})
         smc_facts = {"log_z": float(r.log_z), "stalled": int(r.stalled),
                      "n_stages": int(r.n_stages)}
         su = np.asarray(r.u, dtype=np.float32)
@@ -526,7 +540,8 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
         ft = flow.wrap(target)
         kern = EnsembleKernel(ft, moves=[(StretchMove(), 0.5), (DEMove(), 0.5)])
         res = run(kern, ft, flow.to_latent(u_last), n_warmup=round_warmup,
-                  n_samples=round_samples // 5, thin=5, seed=1000 * seed + k)
+                  n_samples=round_samples // 5, thin=5, seed=1000 * seed + k,
+                  compile_step=compile_step)
         chain = res.get_chain()                          # in u, via FlowTarget.to_base
         pool.append(chain.reshape(-1, d))
         rounds_drawn.append(chain)
@@ -543,7 +558,7 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
     info = flow.fit(train_draws, seed=100 * seed + 99, **fit_kwargs)
     seconds["final fit"] = time.perf_counter() - t2
     flow.pool = pool[-1] if rounds else su
-    flow.report = _make_report(target, flow, info, smc_facts, seconds, seed)
+    flow.report = _make_report(target, flow, info, smc_facts, seconds, seed, compile_step)
     if progress:
         print(flow.report, flush=True)
     for w in flow.report.warnings:
@@ -552,7 +567,8 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
 
 
 def refine(target: LogDensity, draws, *, seed: int = 0, n_layers: int = 8,
-           hidden: int = 64, fit_kwargs: dict | None = None) -> Flow:
+           hidden: int = 64, fit_kwargs: dict | None = None,
+           compile_step: bool = True) -> Flow:
     """One more flow, fitted to the draws of a production run (a
     :class:`~anvil.Results` from a run in flow coordinates, whose chain is
     in u). Returns the new frozen flow, with a fresh report.
@@ -564,4 +580,4 @@ def refine(target: LogDensity, draws, *, seed: int = 0, n_layers: int = 8,
     1.012, and 1.006 at 40,000; at 10,000 points it reached 1.013 and went
     no further."""
     return train(target, draws=draws, rounds=0, seed=seed, n_layers=n_layers,
-                 hidden=hidden, fit_kwargs=fit_kwargs)
+                 hidden=hidden, fit_kwargs=fit_kwargs, compile_step=compile_step)

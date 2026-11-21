@@ -256,3 +256,84 @@ def test_ensemble_sampler_flow_arguments_are_checked(banana_flow):
     assert s.flow is None and s.get_chain().shape == (20, 64, 2)
     with pytest.raises(TypeError, match="no flow mode"):
         anvil.HMCSampler(64, 2, fn, flow=True)
+
+
+# -- review fixes (0.13.1) -----------------------------------------------------------
+
+def test_refitting_a_wrapped_flow_changes_its_resume_tag():
+    # resume_tag is read from the flow's weights on each call, so a flow fitted
+    # again after wrapping cannot resume the old map's latent positions
+    t = _banana()
+    f = Flow(2, **SMALL, seed=2)
+    f.fit(_banana_draws(5000, seed=1), max_steps=200, seed=1)
+    ft = f.wrap(t)
+    res = anvil.run(EnsembleKernel(ft), ft, f.start(64), n_warmup=5, n_samples=5)
+    f.fit(_banana_draws(5000, seed=2), max_steps=200, seed=2)
+    with pytest.raises(ValueError, match="other coordinates"):
+        anvil.run(EnsembleKernel(ft), ft, resume=res, n_samples=5)
+
+
+def test_a_second_fit_starts_from_the_untrained_flow():
+    d1, d2 = _banana_draws(5000, seed=1), _banana_draws(5000, seed=2)
+    f = Flow(2, **SMALL, seed=4)
+    f.fit(d1, max_steps=300, seed=0)
+    again = f.fit(d2, max_steps=300, seed=0)
+    fresh = Flow(2, **SMALL, seed=4)
+    first = fresh.fit(d2, max_steps=300, seed=0)
+    assert f.fingerprint == fresh.fingerprint
+    assert again["gain_nats"] == first["gain_nats"]
+
+
+def test_fit_drops_duplicate_rows():
+    d = _banana_draws(2000, seed=3)
+    info = Flow(2, **SMALL).fit(np.concatenate([d] * 5), max_steps=100)
+    assert info["n_train"] == 2000 - 2000 // 10
+
+
+def test_counting_wrapper_keeps_flow_coordinates(banana_flow):
+    from anvil.logdensity import CountingLogDensity
+    f, _ = banana_flow
+    t = _banana()
+    ct = CountingLogDensity(f.wrap(t))
+    assert ct.resume_tag == f.wrap(t).resume_tag
+    res = anvil.run(EnsembleKernel(ct), ct, f.start(64), n_warmup=5, n_samples=5)
+    lp = np.array(t.log_prob(mx.array(res.get_chain()[-1])))
+    np.testing.assert_allclose(res.get_log_prob()[-1], lp, rtol=1e-4, atol=1e-3)
+
+
+def test_pipelined_and_blocking_recording_agree_in_flow_coordinates(banana_flow):
+    f, _ = banana_flow
+    ft = f.wrap(_banana())
+    runs = [anvil.run(EnsembleKernel(ft), ft, f.start(64), n_warmup=5, n_samples=20,
+                      thin=2, seed=3, pipeline=p) for p in (0, 2)]
+    np.testing.assert_array_equal(runs[0].get_chain(), runs[1].get_chain())
+    np.testing.assert_array_equal(runs[0].get_log_prob(), runs[1].get_log_prob())
+
+
+def test_run_mcmc_checks_the_shape_before_training(monkeypatch):
+    def no_training(*a, **k):
+        raise AssertionError("trained before checking initial_state")
+    monkeypatch.setattr(anvil.flow, "train", no_training)
+    s = anvil.EnsembleSampler(64, 2, target=_banana(), flow=True)
+    with pytest.raises(ValueError, match="initial_state must have shape"):
+        s.run_mcmc(np.zeros((64, 3)), 10)
+
+
+def test_train_passes_compile_step_through(monkeypatch):
+    seen = []
+    real_smc = anvil.evidence.smc
+
+    def spy(*a, **k):
+        seen.append(k.get("compile_step"))
+        return real_smc(*a, **k)
+    monkeypatch.setattr(anvil.evidence, "smc", spy)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        train(_banana(), rounds=0, smc_kwargs=dict(n_particles=1024),
+              fit_kwargs=dict(max_steps=100), compile_step=False, **SMALL)
+    assert seen == [False]
+
+
+def test_hmc_sampler_checks_the_target_dimension():
+    with pytest.raises(ValueError, match="ndim"):
+        anvil.HMCSampler(64, 3, target=_banana())
