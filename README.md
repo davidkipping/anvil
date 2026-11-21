@@ -251,7 +251,8 @@ cheap checks. See the evidence guide for the measurements.
 flow = anvil.flow.train(target)                # SMC from the prior, refinement, a frozen flow
 print(flow.report)                             # warns when the flow gains little
 ft = flow.wrap(target)
-res = anvil.run(anvil.EnsembleKernel(ft), ft, flow.start(512), n_warmup=500, n_samples=2000)
+moves = [(anvil.StretchMove(), 0.5), (anvil.DEMove(), 0.5)]   # the mix measured
+res = anvil.run(anvil.EnsembleKernel(ft, moves=moves), ft, flow.start(512), n_warmup=500, n_samples=2000)
 res.get_chain()                                # in the target's own coordinates
 # or: anvil.EnsembleSampler(512, ndim, target=target, flow=True)
 ```

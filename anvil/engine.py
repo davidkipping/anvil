@@ -145,7 +145,10 @@ class ResumeState:
     def with_positions(self, u, target: LogDensity, kernel=None
                        ) -> "ResumeState":
         """A copy of this state with the chains moved to ``u``
-        ((n_chains, dim), unconstrained space), every cached per-chain
+        ((n_chains, dim), in the sampled target's coordinates: unconstrained
+        space, or the flow's latent coordinates for a state written by a
+        :class:`~anvil.flow.FlowTarget` run, whose ``get_chain`` reads in
+        u -- map draws back with ``flow.to_latent``), every cached per-chain
         quantity the kernel keeps recomputed there, and everything else --
         frozen params, iteration, seed, kernel -- unchanged.
 

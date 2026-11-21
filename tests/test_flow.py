@@ -284,10 +284,22 @@ def test_a_second_fit_starts_from_the_untrained_flow():
     assert again["gain_nats"] == first["gain_nats"]
 
 
-def test_fit_drops_duplicate_rows():
+def test_fit_keeps_repeated_rows_on_one_side_of_the_split():
+    # a chain's repeated rows are rejections and carry weight (0.13.1 dropped
+    # them, which biased the fit); copies stay together, so the hold-out is
+    # never scored on rows the flow was trained on
     d = _banana_draws(2000, seed=3)
     info = Flow(2, **SMALL).fit(np.concatenate([d] * 5), max_steps=100)
-    assert info["n_train"] == 2000 - 2000 // 10
+    assert info["n_val"] == 5 * (2000 // 10)
+    assert info["n_train"] == 5 * (2000 - 2000 // 10)
+    # the whitening sees the weights: cluster a, 9 copies per row, at 0;
+    # cluster b, one copy, at 5
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((1000, 2)).astype(np.float32)
+    b = (5.0 + rng.standard_normal((1000, 2))).astype(np.float32)
+    f = Flow(2, **SMALL)
+    f.fit(np.concatenate([np.repeat(a, 9, axis=0), b]), max_steps=1)
+    assert abs(float(np.array(f.mu)[0]) - 0.5) < 0.15     # 2.5 without the weights
 
 
 def test_counting_wrapper_keeps_flow_coordinates(banana_flow):
@@ -337,3 +349,116 @@ def test_train_passes_compile_step_through(monkeypatch):
 def test_hmc_sampler_checks_the_target_dimension():
     with pytest.raises(ValueError, match="ndim"):
         anvil.HMCSampler(64, 3, target=_banana())
+
+
+# -- review fixes (0.13.3) -----------------------------------------------------------
+
+def test_run_mcmc_none_continues_the_previous_run(banana_flow):
+    # a second run_mcmc(None, n) used to restart from the pool with the same
+    # seed and replay the first run draw for draw
+    f, _ = banana_flow
+    s = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
+    c1 = s.run_mcmc(None, 30, warmup=20).get_chain()
+    c2 = s.run_mcmc(None, 30).get_chain()
+    assert not np.array_equal(c1, c2)
+    # one Markov chain: the two segments are the uninterrupted run
+    whole = anvil.EnsembleSampler(64, 2, target=_banana(), flow=f, seed=0)
+    c = whole.run_mcmc(None, 60, warmup=20).get_chain()
+    np.testing.assert_array_equal(np.concatenate([c1, c2]), c)
+    with pytest.raises(ValueError, match="n_warmup must be 0"):
+        s.run_mcmc(None, 10, warmup=5)
+
+
+def test_a_flow_without_a_pool_warns_when_started_without_warmup(banana_flow, tmp_path):
+    f, _ = banana_flow
+    f.save(tmp_path / "f.npz")
+    loaded = Flow.load(tmp_path / "f.npz")
+    assert loaded.pool is None
+    s = anvil.EnsembleSampler(64, 2, target=_banana(), flow=loaded)
+    with pytest.warns(RuntimeWarning, match="no training draws"):
+        s.run_mcmc(None, 5)
+
+
+def test_far_out_rows_are_left_out_of_the_fit():
+    # five lost walkers in 20,000 rows took the gain from 2.6 to 8.5 nats and
+    # wrecked the fit to the real draws
+    d = _banana_draws(20_000, seed=5)
+    bad = np.concatenate([d, np.full((5, 2), 1e6, dtype=np.float32)])
+    clean = Flow(2, **SMALL, seed=1).fit(d, max_steps=300, seed=1)
+    info = Flow(2, **SMALL, seed=1).fit(bad, max_steps=300, seed=1)
+    assert info["n_far"] == 5
+    assert abs(info["gain_nats"] - clean["gain_nats"]) < 1e-6
+    # more than 1% of the rows is a feature (a mode), not lost walkers
+    mode = np.concatenate([d, d[:2000] + 1e4])
+    assert Flow(2, **SMALL).fit(mode, max_steps=1)["n_far"] == 0
+
+
+def test_lost_chains_are_left_out_of_training_draws():
+    from anvil.flow import _as_draws
+
+    class Fake:
+        extras = {"lost_chains": np.array([1])}
+
+        def get_chain(self):
+            c = np.zeros((4, 3, 2), dtype=np.float32)
+            c[:, 1] = 1e30
+            return c
+    a = _as_draws(Fake(), 2)
+    assert a.shape == (8, 2) and np.all(a == 0)
+
+
+def test_flow_target_refuses_an_overflowed_image():
+    # a target that reports failure as a finite value: the ensemble's guard
+    # sees z only, so the flow target has to catch an image at infinity
+    f = _perturbed_flow(2)
+    fl = anvil.FunctionLogDensity(
+        lambda u: mx.where(mx.all(mx.isfinite(u), axis=1), -0.5 * mx.sum(u * u, axis=1),
+                           -1e4), 2)
+    lp = np.array(f.wrap(fl).log_prob(mx.array([[1e36, 0.5], [0.1, 0.2]])))
+    assert lp[0] == -np.inf and np.isfinite(lp[1])
+
+
+def test_flow_over_a_flow_is_refused(banana_flow):
+    f, _ = banana_flow
+    ft = f.wrap(_banana())
+    with pytest.raises(ValueError, match="already in other coordinates"):
+        f.wrap(ft)
+    with pytest.raises(ValueError, match="original target"):
+        refine(ft, _banana_draws(1000))
+
+
+def test_configuration_errors_are_caught_before_smc(monkeypatch):
+    def no_smc(*a, **k):
+        raise AssertionError("smc ran before the configuration was checked")
+    monkeypatch.setattr(anvil.evidence, "smc", no_smc)
+    t = _banana()
+    with pytest.raises(ValueError, match="even"):
+        train(t, n_chains=33)
+    with pytest.raises(ValueError, match="2\\*dim"):
+        train(t, n_chains=2)
+    with pytest.raises(ValueError, match="rounds"):
+        train(t, rounds=-1)
+    t1 = TransformedLogDensity(lambda v: -0.5 * v[:, 0] ** 2,
+                               Transform([ParamSpec("x", prior=Gaussian(0.0, 1.0))]))
+    with pytest.raises(ValueError, match="dim >= 2"):
+        train(t1)
+    with pytest.raises(ValueError, match="ndim >= 2"):
+        anvil.EnsembleSampler(8, 1, target=t1, flow=True)
+    with pytest.raises(ValueError, match="2\\*ndim"):
+        anvil.EnsembleSampler(2, 2, target=t, flow=True)
+
+
+def test_small_input_errors_say_what_is_wrong(banana_flow, tmp_path):
+    f, _ = banana_flow
+    with pytest.raises(ValueError, match="no finite draws"):
+        refine(_banana(), np.full((100, 2), np.nan, dtype=np.float32))
+    with pytest.raises(ValueError, match="n >= 100"):
+        anvil.flow_evidence(_banana(), f, n=1)
+    np.savez(tmp_path / "other.npz", u=np.zeros(3))
+    with pytest.raises(ValueError, match="not a flow"):
+        Flow.load(tmp_path / "other.npz")
+    g = Flow(2, **SMALL)
+    g.report = "stale"
+    g.fit(_banana_draws(1000), max_steps=1)
+    assert g.report is None
+

@@ -24,7 +24,25 @@ Or, in the emcee-style interface:
 sampler = anvil.EnsembleSampler(512, ndim, target=target, flow=True)
 sampler.run_mcmc(None, 2000, warmup=500)       # trains the flow first, prints its report
 sampler.get_chain()
+sampler.run_mcmc(None, 2000)                   # continues the same chain
 ```
+
+`EnsembleSampler(flow=True)` trains with the defaults. For control over
+training (`rounds`, `smc_kwargs`, the flow's size), call
+{func}`anvil.flow.train` yourself and pass `flow=` the result.
+
+**Which coordinates.** Two sets of positions are in play, and both are
+unbounded, so a position given in the wrong one is accepted without
+complaint:
+
+- **The flow's latent coordinates:** what {func}`~anvil.run` takes as starting
+  positions for a {class}`~anvil.flow.FlowTarget`, and what the chain state
+  holds (`Results.final_state`, a resume state,
+  `ResumeState.with_positions`). Start from `flow.start(n)`, or map positions
+  in with `flow.to_latent(u)`.
+- **The target's own coordinates:** what `get_chain()` returns, what
+  `flow.pool` holds, and what `EnsembleSampler.run_mcmc(initial_state)` takes
+  (it maps the start in itself).
 
 ## Why it is exact
 
@@ -60,12 +78,20 @@ resume with a different flow, or with the unwrapped target, raises.
    latest draws. The ensemble then runs 200 + 1,000 iterations in its
    coordinates, and the next fit uses the last two rounds' draws. This moves
    the training set from SMC's particles towards the posterior itself.
+   Walkers that a round flags as lost (`Results.extras["lost_chains"]`) are
+   left out of the training draws and restart the next round from good
+   ones.
 3. **A final fit, then frozen.** The flow is whitening followed by 8 affine
    coupling layers of width 64, about 40,000 parameters at 10 dimensions.
    It is trained by maximum likelihood with a 10% hold-out and early
    stopping, in 10-35 s on the GPU. A fit can never come back worse than
    whitening alone: the whitening is its first checkpoint, and a fit that
-   diverges is retried at a lower learning rate.
+   diverges is retried at a lower learning rate. Repeated draws (a chain's
+   rejected proposals) keep their weight, with every copy on the same side
+   of the hold-out split. A few draws far outside the rest (more than 50
+   robust standard deviations out, and under 1% of them) are left out,
+   because a handful of lost walkers would otherwise set the whitening and
+   pull the fit towards themselves; the report says when that happened.
 4. **The report.** Read it before sampling.
 
 ## Reading the report
@@ -87,7 +113,7 @@ anvil flow: fit gain 12.75 nats over whitening, importance efficiency 0.491, 184
 **"Small fit gain"** appears when the fit gain is under 1 nat. The posterior
 is then close to Gaussian after a linear map, and with a cheap likelihood a
 plain sampler (dense ChEES, or the ensemble) is faster. On a spherical
-transit fit with near-Gaussian posteriors, plain samplers ran 2-4x faster
+transit fit with near-Gaussian posteriors, plain samplers ran 3-4x faster
 than the ensemble in flow coordinates, which pays about 1.5 ms per iteration
 for evaluating the flow. With an expensive likelihood a small gain can
 still pay: on two-mode Gaussian mixtures (2 and 6 dimensions, modes 6-10 sd
@@ -183,6 +209,7 @@ hybrid4 fit at 10,000 points with 512 walkers
 | `smc` alone | 316 MB |
 | `train()` overall (SMC, rounds, fit, report) | 316 MB |
 | fitting a flow on 102,400 draws | 58 MB |
+| fitting a flow on 4 million draws (`refine` on a long run) | 330 MB |
 | `flow_evidence`, 262,144 draws | 79 MB |
 
 Flow mode adds no memory pressure of its own:
@@ -190,7 +217,13 @@ Flow mode adds no memory pressure of its own:
 - The flow is 40,000 parameters (156 kB).
 - Sampling in flow coordinates costs what sampling did before.
 - `train()` peaks at SMC's level.
-- The training draws held on the host are a few MB.
+- The training draws are held on the host, at 4 bytes per parameter per
+  draw: 4 MB for `train()`'s 102,400 draws at 10 parameters, 160 MB for a
+  refit on 4 million production draws. A fit scores its hold-out 32,768
+  rows at a time, so its GPU-side peak levels off: 128 MB at `train()`'s
+  204,800 draws, 219 MB at 1 million, 330 MB at 4 million. Scored in one
+  piece, as before 0.13.3, the hold-out of 4 million draws alone took
+  2.3 GB.
 
 The two importance-sampling steps (the report's efficiency and
 `flow_evidence`) evaluate the likelihood 1,024 draws at a time. Their peak
@@ -237,6 +270,16 @@ flow3 = anvil.flow.Flow.load("flow.npz")
 A run on a refined flow is a new Markov chain, so start it with warmup
 rather than by resuming the old one; `run` refuses a resume across flows.
 
+- **To resume a run in another session, save the flow next to the state.**
+  A resume state is usable only with the exact flow that wrote it: `run`
+  checks the flow's fingerprint and refuses any other.
+  `EnsembleSampler(flow=True)` keeps its flow in memory only, as
+  `sampler.flow`; save that.
+- **`save` writes the map alone.** A loaded flow has no `report` and no
+  `pool`, so `flow.start(n)` draws from the flow's own distribution instead
+  of the training draws. Give the run warmup.
+- Fitting a flow again (`flow.fit(...)`) clears its `report`.
+
 ## Evidence
 
 {func}`~anvil.flow_evidence` is importance sampling with the flow as the
@@ -249,6 +292,16 @@ an independent reference of 84871.8 +/- 0.1. Default SMC there was
 error comes from the effective sample size and can read somewhat small: on
 a test banana, one seed in three landed 2.9 standard errors from the
 closed form, though only 0.003 nats from it.
+
+**Use the flow trained for this target.** A flow reused after the model or
+the data changed can be narrower than the new posterior somewhere. The
+importance weights then have a heavy tail, and ln Z comes out low with an
+error bar that is too small, at an efficiency that can still look normal.
+Nothing in the estimate flags it: on a banana, a flow reused for a
+likelihood three times wider gave efficiency 0.04 (inside the range of
+good oblate flows) and ln Z 0.07-0.15 low, 1-7 standard errors. A
+Pareto-tail check on the weights (PSIS k) was tried and rejected: it read
+0.67-0.72 on a near-perfect flow and 0.57-0.65 on that biased one.
 
 ## Hardware
 

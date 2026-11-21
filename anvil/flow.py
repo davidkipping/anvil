@@ -38,10 +38,10 @@ Measured (research notes in the repository; 512 walkers, M2 Max):
   and a run four times longer took the 2,000-point fit to R-hat 1.006; the
   10,000-point fit stayed at 1.013.
 * Spherical hybrid4 (curved limb-darkening prior): flow samplers at R-hat
-  1.002-1.004 against 1.09-1.48 plain, at 30-90x the effective samples per
+  1.002-1.004 against 1.09-1.48 plain, at 39-94x the effective samples per
   second.
 * Spherical hybrid2 (near-Gaussian posterior): no gain. Plain samplers were
-  2-4x faster; the report's fit gain (0.1 nats, against 5-14 on the curved
+  3-4x faster; the report's fit gain (0.1 nats, against 5-14 on the curved
   targets) says so before any sampling.
 * ChEES works on a :class:`FlowTarget`, but on the oblate fit it trailed the
   ensemble 20-40x: a few walkers in badly mapped tails set its shared step
@@ -75,6 +75,14 @@ _GAIN_WORTHWHILE = 1.0
 _EFF_POOR = 0.01
 #: a validation loss this far above the whitened one (nats) is a diverged fit
 _DIVERGED = 1.0
+#: training rows this many robust sd from the median are lost walkers ...
+_FAR_SD = 50.0
+#: ... when they are fewer than this fraction of the rows (more is a mode)
+_FAR_MAX_FRAC = 0.01
+#: hold-out rows scored at a time
+_NLL_ROWS = 1 << 15
+#: hold-out size below which a "diverged" verdict may be noise
+_SMALL_VAL = 100
 
 
 class Flow:
@@ -209,28 +217,50 @@ class Flow:
         :class:`FlowTarget` made from it earlier then has a different
         :attr:`~FlowTarget.resume_tag`, and resuming its runs raises.
 
-        Exact duplicate rows (SMC particles that share an ancestor) are
-        dropped first: a hold-out row with a copy in the training set
-        makes the hold-out loss track the training loss.
+        Repeated rows are kept: in a Markov chain they are rejected
+        proposals, and they carry posterior weight. All copies of a row go
+        to the same side of the hold-out split, so the hold-out loss is not
+        scored on rows the flow was trained on (SMC particles that share an
+        ancestor are copies too).
+
+        Rows further than 50 robust standard deviations (median absolute
+        deviation) from the median in some coordinate are dropped when they
+        are under 1% of the draws: walkers lost far outside the posterior,
+        which would otherwise set the whitening and draw the fit to
+        themselves while raising its gain. More of them than that are kept,
+        as a separate mode would be. ``n_far`` counts the dropped rows.
+
+        Fitting a flow clears its :attr:`report`, which described the
+        previous fit.
 
         Returns the training facts: ``gain_nats`` (hold-out loss of the
         whitening alone minus the flow's, the measure of how far from
         Gaussian the draws are), ``val_nll``, ``steps``, ``n_train``,
-        ``retries``, ``seconds``."""
+        ``n_val``, ``n_far``, ``retries``, ``seconds``."""
         t0 = time.perf_counter()
         x = _as_draws(draws, self.dim)
         x = x[np.all(np.isfinite(x), axis=1)]
-        x = np.unique(x, axis=0)
-        if len(x) < 20:
-            raise ValueError(f"fit needs at least 20 finite draws, got {len(x)}")
+        n_far = 0
+        if len(x):
+            med = np.median(x, axis=0)
+            scale = 1.4826 * np.median(np.abs(x - med), axis=0)
+            far = np.any((np.abs(x - med) > _FAR_SD * scale) & (scale > 0), axis=1)
+            if 0 < far.sum() < _FAR_MAX_FRAC * len(x):
+                x, n_far = x[~far], int(far.sum())
+        rows, counts = np.unique(x, axis=0, return_counts=True)
+        if len(rows) < 20:
+            raise ValueError(f"fit needs at least 20 distinct finite draws, got {len(rows)}")
+        self.report = None
         rng = np.random.default_rng(seed)
-        x = x[rng.permutation(len(x))]
-        n_val = max(len(x) // 10, 1)
-        xv, xt = mx.array(x[:n_val]), x[n_val:]
+        order = rng.permutation(len(rows))
+        n_val = max(len(rows) // 10, 1)
+        iv, it = order[:n_val], order[n_val:]
+        xv = mx.array(np.repeat(rows[iv], counts[iv], axis=0))
+        xt = np.repeat(rows[it], counts[it], axis=0)
         self._set_whitening(xt)
         init = self._init_params
         self.params = [dict(p) for p in init]           # the whitening alone
-        base = float(-mx.mean(self.log_q(xv)).item())
+        base = self._nll(xv)
 
         for attempt in range(retries + 1):
             self.params = [dict(p) for p in init]
@@ -242,9 +272,21 @@ class Flow:
         self.params = best_params
         mx.eval(self.params)
         return {"gain_nats": base - best, "val_nll": best, "val_nll_whitened": base,
-                "steps": steps, "n_train": len(xt), "retries": attempt,
-                "diverged": diverged, "seconds": time.perf_counter() - t0,
-                "n_params": self.n_params}
+                "steps": steps, "n_train": len(xt), "n_val": int(xv.shape[0]),
+                "n_far": n_far, "retries": attempt, "diverged": diverged,
+                "seconds": time.perf_counter() - t0, "n_params": self.n_params}
+
+    def _nll(self, x: mx.array) -> float:
+        """Mean negative log q over ``x``, in blocks: scored in one piece,
+        4 million hold-out rows took 2.3 GB; in blocks, about 230 MB. Up to
+        one block, the sum is exactly what it was before blocking."""
+        n = int(x.shape[0])
+        if n <= _NLL_ROWS:
+            return float(-mx.mean(self.log_q(x)).item())
+        total = 0.0
+        for s in range(0, n, _NLL_ROWS):
+            total += float(mx.sum(self.log_q(x[s:s + _NLL_ROWS])).item())
+        return -total / n
 
     def _train(self, xt, xv, base, rng, max_steps, batch, lr, patience, check_every):
         opt = optim.Adam(learning_rate=optim.cosine_decay(lr, max_steps, lr * 0.02))
@@ -264,7 +306,7 @@ class Flow:
                 diverged = True
                 break
             if (i + 1) % check_every == 0:
-                v = float(-mx.mean(self.log_q(xv)).item())
+                v = self._nll(xv)
                 if not math.isfinite(v) or v > base + _DIVERGED:
                     diverged = True
                     break
@@ -329,6 +371,8 @@ class Flow:
     def load(cls, path) -> "Flow":
         """Read a flow written by :meth:`save`."""
         with np.load(os.fspath(path), allow_pickle=False) as z:
+            if "config" not in z.files or "l0__W1" not in z.files:
+                raise ValueError(f"{os.fspath(path)} is not a flow written by Flow.save")
             dim, n_layers, hidden = (int(v) for v in z["config"])
             f = cls(dim, n_layers, hidden, float(z["s_max"]))
             f.mu, f.L, f.Linv = mx.array(z["mu"]), mx.array(z["L"]), mx.array(z["Linv"])
@@ -354,6 +398,11 @@ class FlowTarget(LogDensity):
     one (:attr:`resume_tag`)."""
 
     def __init__(self, target: LogDensity, flow: Flow):
+        if hasattr(target, "to_base"):
+            raise ValueError(
+                "the target is already in other coordinates (a FlowTarget?); wrap the "
+                "original target: a flow over a flow would record draws in the inner "
+                "flow's coordinates")
         if int(target.dim) != flow.dim:
             raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
         self.target, self.flow = target, flow
@@ -370,7 +419,10 @@ class FlowTarget(LogDensity):
     def log_prob(self, z: mx.array) -> mx.array:
         u, ld = self.flow.forward(z)
         lp = self.target.log_prob(u) + ld
-        return mx.where(mx.isnan(lp), -mx.inf, lp)
+        # an image that overflowed is outside the support, whatever the
+        # target says there: the ensemble's finiteness check sees z, not u
+        ok = mx.all(mx.isfinite(u), axis=1) & ~mx.isnan(lp)
+        return mx.where(ok, lp, -mx.inf)
 
     def to_base(self, z: mx.array, log_prob: mx.array):
         """Positions and their recorded log-probabilities, mapped to the
@@ -424,9 +476,19 @@ class FlowReport:
         return "\n".join(lines)
 
 
+def _good_chain(res) -> tuple[np.ndarray, np.ndarray]:
+    """A run's chain without the chains it flagged as lost (in
+    ``extras["lost_chains"]``), and those chains' indices."""
+    chain = res.get_chain()
+    lost = np.asarray(getattr(res, "extras", {}).get("lost_chains", []), dtype=int)
+    if lost.size and lost.size < chain.shape[1]:
+        return np.delete(chain, lost, axis=1), lost
+    return chain, np.zeros(0, dtype=int)
+
+
 def _as_draws(draws, dim: int) -> np.ndarray:
     if hasattr(draws, "get_chain"):
-        draws = draws.get_chain()
+        draws = _good_chain(draws)[0]
     elif hasattr(draws, "u") and not isinstance(draws, np.ndarray):
         draws = draws.u                                  # an SMCResult
     a = np.asarray(draws, dtype=np.float32)
@@ -449,8 +511,16 @@ def _make_report(target, flow, info, smc_facts, seconds, seed, compile_step):
     warn = []
     worthwhile = gain >= _GAIN_WORTHWHILE
     if info.get("diverged"):
-        warn.append(f"training diverged at every learning rate tried; this flow is the "
-                    f"best checkpoint, gain {gain:.2f} nats")
+        msg = (f"training diverged at every learning rate tried; this flow is the "
+               f"best checkpoint, gain {gain:.2f} nats")
+        if info.get("n_val", _SMALL_VAL) < _SMALL_VAL:
+            msg += (f". The hold-out has only {info['n_val']} rows, too few to judge a "
+                    f"fit by: give it more distinct draws")
+        warn.append(msg)
+    if info.get("n_far"):
+        warn.append(f"{info['n_far']} training draws more than {_FAR_SD:.0f} robust sd from "
+                    f"the median were left out of the fit (walkers lost far outside the "
+                    f"posterior?)")
     if not worthwhile:
         warn.append(f"small fit gain: the flow gains only {gain:.2f} nats over a linear "
                     f"map, so the posterior is close to Gaussian already. A plain sampler "
@@ -513,6 +583,20 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
     from .transforms import TransformedLogDensity
 
     d = int(target.dim)
+    # every check that needs no draws comes first: SMC can take an hour,
+    # and a configuration error found after it would waste that
+    if hasattr(target, "to_base"):
+        raise ValueError("train() takes the original target, not one already in a "
+                         "flow's coordinates (a FlowTarget): pass the target you wrapped")
+    if d < 2:
+        raise ValueError("a coupling flow needs dim >= 2")
+    if rounds < 0:
+        raise ValueError(f"rounds must be >= 0, got {rounds}")
+    if rounds and n_chains % 2:
+        raise ValueError("n_chains must be even (ensemble moves split the walkers in two)")
+    if rounds and n_chains < 2 * d:
+        raise ValueError(f"n_chains={n_chains} < 2*dim={2 * d}: each half of the "
+                         f"ensemble must span the parameter space")
     fit_kwargs = dict(fit_kwargs or {})
     seconds: dict[str, float] = {}
     smc_facts = None
@@ -532,12 +616,12 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
     else:
         su = _as_draws(draws, d)
     su = su[np.all(np.isfinite(su), axis=1)]
-    if n_chains % 2:
-        raise ValueError("n_chains must be even (ensemble moves split the walkers in two)")
+    if not len(su):
+        raise ValueError("no finite draws to train on")
 
     rng = np.random.default_rng(seed)
     u_last = su[rng.choice(len(su), n_chains, replace=n_chains > len(su))]
-    pool, rounds_drawn = [su], []
+    pool = [su]
     t1 = time.perf_counter()
     for k in range(1, rounds + 1):
         flow = Flow(d, n_layers, hidden, seed=100 * seed + k)
@@ -548,10 +632,13 @@ def train(target: LogDensity, *, draws=None, rounds: int = 4, n_chains: int = 51
         res = run(kern, ft, flow.to_latent(u_last), n_warmup=round_warmup,
                   n_samples=round_samples // 5, thin=5, seed=1000 * seed + k,
                   compile_step=compile_step)
-        chain = res.get_chain()                          # in u, via FlowTarget.to_base
+        # in u, via FlowTarget.to_base; walkers the run flagged as lost are
+        # left out of the training draws and restarted from good ones
+        chain, lost = _good_chain(res)
         pool.append(chain.reshape(-1, d))
-        rounds_drawn.append(chain)
-        u_last = chain[-1]
+        u_last = res.get_chain()[-1].copy()
+        if lost.size:
+            u_last[lost] = chain[-1][rng.choice(chain.shape[1], lost.size)]
         if progress:
             print(f"[flow] round {k}/{rounds}: fit gain {info['gain_nats']:.2f} nats, "
                   f"accept {float(np.mean(res.accept_fraction)):.2f}", flush=True)

@@ -779,9 +779,16 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
 
     ``details["efficiency"]`` is the effective sample size as a fraction of
     ``n``. A warning fires below 0.01, where the error bar is no longer
-    trustworthy. Importance sampling cannot see posterior mass the flow puts
-    almost nothing on, so the flow should come from :func:`anvil.flow.train`
-    (training that starts from the prior).
+    trustworthy. Use the flow trained for this target: one reused after
+    the model or the data changed can be narrower than the new posterior
+    somewhere, and then ln Z comes out low with an error bar that is too
+    small, at an efficiency that need not look poor (on a banana, a flow
+    reused for a likelihood three times wider gave efficiency 0.04 and
+    ln Z 0.07-0.15 low). The tail shape of the weights (Pareto smoothed
+    importance sampling's k) did not tell such a flow from a good one
+    reliably enough to warn on. Importance sampling cannot see posterior
+    mass the flow puts almost nothing on, so the flow should come from
+    :func:`anvil.flow.train` (training that starts from the prior).
 
     Measured on transit fits (10,000 points; references from an
     independent calculation): oblate, 3 seeds 84871.773-84871.788 (se
@@ -800,6 +807,8 @@ def flow_evidence(target: TransformedLogDensity, flow, *, n: int = 262144, seed:
     _require_proper(target)
     if int(flow.dim) != int(target.dim):
         raise ValueError(f"the flow has dim {flow.dim}, the target {target.dim}")
+    if n < 100:
+        raise ValueError(f"flow_evidence needs n >= 100 draws for an error bar, got {n}")
     t0 = time.perf_counter()
     lw = _flow_log_weights(target, flow, n, seed, max_rows, compile_step)
     lz = _logmeanexp(lw)

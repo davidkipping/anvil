@@ -50,8 +50,12 @@ class EnsembleSampler:
     it. ``flow=`` a trained :class:`~anvil.flow.Flow` uses that one. The
     default moves become stretch and differential evolution, half each
     (the mix measured), and ``initial_state`` may be None to start from
-    the flow's training draws. ``kernel=`` cannot be combined with a flow:
-    a kernel is built on the target it samples."""
+    the flow's training draws (from the flow's own distribution for a
+    flow without them, such as one read by ``Flow.load``); a later
+    ``run_mcmc(None, ...)`` continues the previous run. ``kernel=`` cannot
+    be combined with a flow: a kernel is built on the target it samples.
+    For control over training (``rounds``, ``smc_kwargs``, ...) call
+    :func:`anvil.flow.train` yourself and pass ``flow=`` the result."""
 
     def __init__(
         self,
@@ -104,13 +108,20 @@ class EnsembleSampler:
                     "flow=True trains the flow from the prior (anvil.smc), so it needs "
                     "target= a TransformedLogDensity with proper priors; or pass flow= a "
                     "Flow trained with anvil.flow.train(..., draws=...)")
-            if self.nwalkers % 2:
-                raise ValueError("ensemble moves require an even number of walkers")
+            if self.ndim < 2:
+                raise ValueError("a coupling flow needs ndim >= 2")
             #: the flow in use (trained at the first run_mcmc for flow=True)
             self.flow, self._train_flow = None, True
         else:
             raise TypeError(f"flow= takes True, False or an anvil.flow.Flow, "
                             f"not {type(flow).__name__}")
+        # checked here, not at the first run_mcmc: flow=True trains first,
+        # for minutes to an hour
+        if self.nwalkers % 2:
+            raise ValueError("ensemble moves require an even number of walkers")
+        if self.nwalkers < 2 * self.ndim:
+            raise ValueError(f"nwalkers={self.nwalkers} < 2*ndim={2 * self.ndim}: each "
+                             f"half of the ensemble must span the parameter space")
 
     def _sampled_target(self) -> LogDensity:
         return self.target if self.flow is None else self.flow.wrap(self.target)
@@ -143,8 +154,12 @@ class EnsembleSampler:
         step uncompiled, for a ``log_prob`` that leaves MLX).
 
         In flow mode ``initial_state`` is in the target's own coordinates
-        (it is mapped into the flow's), and may be None to start from the
-        flow's training draws: ``run_mcmc(None, nsteps, warmup=...)``; ``flow=True`` trains the flow here first.
+        (it is mapped into the flow's), and may be None. ``flow=True``
+        trains the flow at the first call. With None, the first run starts
+        from the flow's training draws: ``run_mcmc(None, nsteps,
+        warmup=...)``. A later call with None continues the previous run
+        where it stopped, as one Markov chain (frozen, so ``warmup`` must
+        be 0), and ``get_chain`` then holds the new segment.
         """
         if initial_state is not None:
             # checked before any training: flow=True trains for minutes to
@@ -164,19 +179,32 @@ class EnsembleSampler:
                               compile_step=True if compile_step is None else compile_step)
             print(self.flow.report, flush=True)
         sampled = self._sampled_target()
+        if warmup is None:
+            warmup = nsteps if tune else 0
+        resume, p0 = None, None
         if initial_state is None:
-            p0 = self.flow.start(self.nwalkers, seed=self.seed)
+            last = self._results
+            if last is not None and last.target_tag == getattr(sampled, "resume_tag", ""):
+                # continue, as emcee does: restarting from the training draws
+                # with the same seed would replay the first run draw for draw
+                resume = last
+            else:
+                p0 = self.flow.start(self.nwalkers, seed=self.seed)
+                if self.flow.pool is None and warmup == 0:
+                    warnings.warn(
+                        "this flow has no training draws (pool), so the walkers start "
+                        "from the flow's own distribution, and with warmup=0 the way "
+                        "from there to the posterior is recorded; pass warmup=",
+                        RuntimeWarning, stacklevel=2)
         else:
             p0 = mx.array(np.asarray(initial_state, dtype=np.float32))
             if self.flow is not None:
                 p0 = self.flow.to_latent(p0)
-        if p0.shape != (self.nwalkers, self.ndim):
+        if p0 is not None and p0.shape != (self.nwalkers, self.ndim):
             raise ValueError(
                 f"initial_state must have shape ({self.nwalkers}, {self.ndim}), "
                 f"got {tuple(p0.shape)}"
             )
-        if warmup is None:
-            warmup = nsteps if tune else 0
         if warmup == 0 and isinstance(self, HMCSampler):
             warnings.warn(
                 "HMCSampler.run_mcmc with no warmup: ChEES adapts its step "
@@ -191,9 +219,10 @@ class EnsembleSampler:
             n_warmup=warmup,
             n_samples=nsteps,
             thin=thin_by,
-            seed=self.seed,
+            seed=None if resume is not None else self.seed,
             progress=progress,
             compile_step=compile_step,
+            resume=resume,
         )
         return self._results
 
